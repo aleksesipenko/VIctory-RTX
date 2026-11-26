@@ -1286,12 +1286,18 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// When a snapshot buffer was last taken from or given back to [`POOL`]
+/// (`crate::host::moment`), for [`let_go_idle_snapshots`].
+/// Provenance (GPL-3.0): TaynanGT/Vice-Tay PR #41 (`a857333`).
+static POOL_USED: AtomicU64 = AtomicU64::new(0);
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
         .iter()
@@ -1327,6 +1333,7 @@ fn snapshots_kept() -> usize {
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
@@ -1341,6 +1348,48 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+const POOL_PRESSURED_KEPT: usize = 32 << 20;
+
+/// Releases idle or pressured snapshot pool buffers (`TaynanGT/Vice-Tay #41`).
+fn let_go_idle_snapshots() {
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let pressured = crate::residency::pressured();
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
+        let Some(most) = snapshots_to_keep(idle, pressured) else { return };
+        trim_pool(&mut pool, most)
+    };
+    drop(gone);
+}
+
+fn snapshots_to_keep(idle: bool, pressured: bool) -> Option<usize> {
+    if idle {
+        Some(0)
+    } else if pressured {
+        Some(POOL_PRESSURED_KEPT)
+    } else {
+        None
+    }
+}
+
+fn trim_pool(pool: &mut Vec<Vec<u8>>, most: usize) -> Vec<Vec<u8>> {
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut total = 0usize;
+    let mut keep = 0;
+    for v in pool.iter().rev() {
+        total = total.saturating_add(v.capacity());
+        if total > most {
+            break;
+        }
+        keep += 1;
+    }
+    let first_kept = pool.len() - keep;
+    let kept = pool.split_off(first_kept);
+    std::mem::replace(pool, kept)
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3016,6 +3065,8 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    // Before the windows: their table may be empty while the snapshot pool is not.
+    let_go_idle_snapshots();
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let mut keep = u64::MAX;

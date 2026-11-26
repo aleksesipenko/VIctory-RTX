@@ -135,6 +135,9 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
+    if (at & 15) + 5 > 16 {
+        return false;
+    }
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
@@ -146,7 +149,7 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
         return false;
     };
-    if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
+    if *used + body.len() > STUBS_LEN {
         return false;
     }
     // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
@@ -350,6 +353,33 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     Some(to.min(end))
 }
 
+/// Zeroes the 64-byte line at `line` with ordinary stores when `writable()` refused
+/// a committed or reserved address (e.g. a `PAGE_READONLY` write-watch guard in
+/// `watch.rs`). Provenance (GPL-3.0): fxceless/victory-fork #1380 — prevents hard
+/// `STATUS_ILLEGAL_INSTRUCTION` (`0xc000001d`) crashes on Intel CPUs without `CLZERO`.
+///
+/// # Safety
+/// The title owns the line being zeroed.
+unsafe fn zero_through_fault(line: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let found = unsafe { VirtualQuery(line as *const _, &mut m, size_of_val(&m)) } != 0;
+    ASKED.fetch_add(1, Relaxed);
+    if !found || (m.State != MEM_COMMIT && m.State != MEM_RESERVE) {
+        return false;
+    }
+    let words = line as *mut u64;
+    for i in 0..8 {
+        // SAFETY: title memory; any access fault is handled by the runtime's
+        // VEH chain (e.g. watch.rs opening a guarded block) or terminates as a
+        // normal store would.
+        unsafe { words.add(i).write_volatile(0) };
+    }
+    true
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
 /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
 /// see it).
@@ -425,11 +455,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
             let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) {
-                return 0; // the real instruction faults there too
+            if writable(line, 64) {
+                // SAFETY: the 64-byte line is committed and writable.
+                unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+            } else if !unsafe { zero_through_fault(line) } {
+                return 0; // free memory: the real instruction faults there too
             }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
@@ -466,9 +497,13 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
                 at = to;
             }
-            let done = (at - first) / 64;
+            let mut done = (at - first) / 64;
             if done == 0 {
-                return 0;
+                // SAFETY: first line of the loop; fault into write-watch guards if committed/reserved.
+                if !unsafe { zero_through_fault(first) } {
+                    return 0;
+                }
+                done = 1;
             }
             ZEROED.fetch_add((done * 64) as u64, Relaxed);
             ctx.Rax = ctx.Rax.wrapping_add((done * 64) as u64);
@@ -649,5 +684,86 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+    }
+
+    #[test]
+    fn clzero_on_guarded_or_uncommitted_lines_faults_into_handlers() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            VirtualProtect,
+        };
+        const PAGES: usize = 3;
+        static BASE: AtomicUsize = AtomicUsize::new(0);
+        static OPENED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn open(info: *mut EXCEPTION_POINTERS) -> i32 {
+            let r = unsafe { &*(*info).ExceptionRecord };
+            let base = BASE.load(Relaxed);
+            if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+                || r.NumberParameters < 2
+                || r.ExceptionInformation[0] != 1
+                || !(base..base + PAGES * 0x1000).contains(&r.ExceptionInformation[1])
+            {
+                return 0;
+            }
+            let page = r.ExceptionInformation[1] & !0xfff;
+            let mut old = 0;
+            unsafe {
+                assert!(!VirtualAlloc(page as _, 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+                VirtualProtect(page as _, 0x1000, PAGE_READWRITE, &mut old);
+            }
+            OPENED.fetch_add(1, Relaxed);
+            -1
+        }
+        let (base, handler) = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), PAGES * 0x1000, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            assert!(!VirtualAlloc(base as _, 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::write_bytes(base as *mut u8, 0xAA, 0x1000);
+            let mut old = 0;
+            VirtualProtect(base as _, 0x1000, PAGE_READONLY, &mut old);
+            BASE.store(base, Relaxed);
+            (base, AddVectoredExceptionHandler(1, Some(open)))
+        };
+        assert!(!handler.is_null());
+        let run = |code: &[u8], rax: usize, r10: usize| {
+            let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+            ctx.Rip = code.as_ptr() as u64;
+            ctx.Rax = rax as u64;
+            ctx.R10 = r10 as u64;
+            let r = unsafe { emulate(&mut ctx) };
+            (r, ctx.Rip - code.as_ptr() as u64, ctx.Rax as usize)
+        };
+        let page = |p: usize| unsafe { std::slice::from_raw_parts((base + p * 0x1000) as *const u8, 0x1000) };
+        let lone = [0x0F, 0x01, 0xFC, 0x90];
+        assert_eq!(run(&lone, base + 0x45, 0), (CONTINUE_EXECUTION, 3, base + 0x45));
+        assert_eq!(OPENED.load(Relaxed), 1);
+        assert!(page(0)[0x40..0x80].iter().all(|&b| b == 0));
+        assert!(page(0)[..0x40].iter().chain(&page(0)[0x80..]).all(|&b| b == 0xAA));
+        assert_eq!(run(&lone, base + 0x1080, 0).0, CONTINUE_EXECUTION);
+        assert_eq!(OPENED.load(Relaxed), 2);
+        assert!(page(1)[0x80..0xC0].iter().all(|&b| b == 0));
+        // Place loop across a 16-byte boundary so `patch_clzero` leaves the loop
+        // unpatched and exercises the direct emulated `ClzeroLoop` fault path
+        // without touching the global RWX stub table.
+        let mut lp_buf = [0x90u8; 48];
+        let lp_off = (12usize.wrapping_sub(lp_buf.as_ptr() as usize)) & 15;
+        let lp_bytes = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4, 0x90];
+        lp_buf[lp_off..lp_off + lp_bytes.len()].copy_from_slice(&lp_bytes);
+        let lp = &lp_buf[lp_off..lp_off + lp_bytes.len()];
+        let (start, end) = (base + 0x2000, base + 0x2400);
+        assert_eq!(run(lp, start, end), (CONTINUE_EXECUTION, 0, start + 64));
+        assert_eq!(OPENED.load(Relaxed), 3);
+        assert_eq!(run(lp, start + 64, end), (CONTINUE_EXECUTION, 12, end));
+        assert!(page(2)[..0x400].iter().all(|&b| b == 0));
+        unsafe {
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(base as _, 0, MEM_RELEASE);
+        }
+        assert_eq!(run(&lone, base + 0x40, 0).0, 0);
     }
 }

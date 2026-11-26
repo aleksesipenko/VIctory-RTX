@@ -385,9 +385,18 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. A staging buffer that holds nothing
 /// yet is filled with what is there all the same ([`fill_unlocked`]): a list
 /// has recorded the upload from it by then.
-fn no_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+/// `VICTORY_TEXTURE_NO_WAIT=2` (`voidopcode/vilocity 6804c16`, GPL-3.0) reads
+/// through the kernel first too, but if that read cannot take the texture whole
+/// (a page not mapped yet while streaming in), falls back to waiting for the
+/// mapping lock so streaming textures never stick at zeros without incurring
+/// 140-700 ms loading-screen lock waits.
+fn no_wait() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_TEXTURE_NO_WAIT").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -821,7 +830,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
-    if no_wait() && fill_unlocked() {
+    if no_wait() != 0 && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
             _ => mapped_bytes(staging.memory, staging.read),
@@ -1331,16 +1340,25 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let _mapped = match no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
+            1 => {
+                let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                    return self.refresh_unlocked(last, size);
+                };
+                mapped
+            }
+            // Through the kernel if readable whole, else wait for the mapping lock.
+            2 => match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None => match self.refresh_unlocked(last, size) {
+                    0 => waited(2, crate::watch::title_memory_reading),
+                    read => return read,
+                },
+            },
+            _ => waited(2, crate::watch::title_memory_reading),
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
