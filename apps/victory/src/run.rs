@@ -108,10 +108,12 @@ pub fn run(
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
-        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
-            && let Some(real) = dll.export("ffxDispatch")
-        {
-            victory_hle::modules::ffx::set_real_dispatch(real);
+        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER) {
+            for sym in ["ffxCreateContext", "ffxDestroyContext", "ffxQuery", "ffxDispatch"] {
+                if let Some(real) = dll.export(sym) {
+                    victory_hle::modules::ffx::set_real(sym, real);
+                }
+            }
         }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
@@ -176,12 +178,13 @@ pub fn run(
     struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver, bool);
     impl victory_loader::ImportResolver for TakeDispatch<'_> {
         fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
-            let ours = self.1
+            if self.1
                 && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
-                && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
-            if ours {
+                && let victory_pe::ImportSymbol::Name { name, .. } = symbol
+                && let Some(address) = victory_hle::modules::ffx::resolve(name)
+            {
                 return victory_loader::Resolution::Found {
-                    address: victory_hle::modules::ffx::dispatch_address(),
+                    address,
                     provenance: victory_loader::Provenance::Hle,
                 };
             }
@@ -190,7 +193,7 @@ pub fn run(
     }
     let take = std::env::var_os("VICTORY_UPSCALE").is_some_and(|v| v == "stretch" || v == "dlss");
     if take {
-        println!("upscale        the title's ffxDispatch is ours (VICTORY_UPSCALE=stretch|dlss)");
+        println!("upscale        the title's FidelityFX upscale API is ours (VICTORY_UPSCALE=stretch|dlss)");
     }
     show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take), policy)?);
     if execute {
