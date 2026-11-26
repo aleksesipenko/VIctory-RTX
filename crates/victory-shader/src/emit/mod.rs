@@ -122,7 +122,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -500,11 +500,13 @@ pub fn emit(
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
         // Where the wave operations are the allocation idiom
-        // ([`lower::wave_local`]) that is exact. Other programs are taken
-        // the same way last of all, each half-wave giving its own results
-        // (approximate: a tile-wide result becomes two half-tile ones);
-        // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        // ([`lower::wave_local`]) that is exact. Other programs are refused
+        // (as with `VICTORY_WAVE_LOCAL=idiom`); `VICTORY_WAVE_LOCAL=any`
+        // takes them the same way last of all (approximate: each half-wave
+        // gives its own results). Off by default (from Rubenpannen/VIctory-RTX5070
+        // b696f73): compute 2561af9577c47289 hung NVIDIA GPUs (DXGI_ERROR_DEVICE_HUNG)
+        // 15 s after first dispatch when lowered per-half.
+        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "any");
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
