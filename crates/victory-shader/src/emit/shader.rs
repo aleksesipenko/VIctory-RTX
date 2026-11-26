@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -29,6 +29,13 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
 /// running the full bindless heap buffer sweep (from codec-d/cool_fox f4b48ad).
 pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// Ordered RT acceleration structure inputs in space 1. A shader declares
+/// only the prefix corresponding to the TLAS inputs it actually traces.
+pub const SLOT_TLAS_0: u8 = 251;
+pub const SLOT_TLAS_1: u8 = 250;
+pub const SLOT_TLAS_2: u8 = 249;
+pub(super) const TLAS_SLOTS: [u8; 3] = [SLOT_TLAS_0, SLOT_TLAS_1, SLOT_TLAS_2];
+
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -123,6 +130,7 @@ pub(crate) mod flags {
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
+    pub const RAYTRACING_1_1: u64 = 1 << 25;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
@@ -354,6 +362,15 @@ impl Shader {
         self.m.call(block, f, all)
     }
 
+    /// Integer NaN test: some drivers fold unordered float compares away.
+    pub fn is_nan_f32(&mut self, c: usize, f: V) -> V {
+        let bits = self.m.cast(c, Cast::Bitcast, f, self.t.i32);
+        let mask = self.m.i32(0x7FFF_FFFF);
+        let abs = self.m.bin(c, Bin::And, bits, mask);
+        let inf = self.m.i32(0x7F80_0000);
+        self.m.cmp(c, pred::IUGT, abs, inf)
+    }
+
     /// The handle of the user-data constant buffer, made in the entry block.
     pub fn user_data_handle(&mut self) -> V {
         let bind = [
@@ -401,7 +418,7 @@ impl Shader {
         h
     }
 
-    /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
+    /// The root SRV at `slot`: a TLAS at a reserved RTAS register, a raw buffer elsewhere.
     pub fn root_srv_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
             return h;
@@ -419,8 +436,13 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11, 0);
-        self.flags |= flags::RAW_BUFFERS;
+        let shape = if TLAS_SLOTS.contains(&slot) {
+            16 // RTAccelerationStructure
+        } else {
+            self.flags |= flags::RAW_BUFFERS;
+            11 // ByteAddressBuffer
+        };
+        let h = self.annotate(block, h, shape, 0);
         self.root_srvs.push((slot, h));
         h
     }
@@ -676,13 +698,23 @@ impl Shader {
             }
             let mut srvs = None;
             if !self.root_srvs.is_empty() {
-                let ty = self
-                    .m
-                    .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
-                let p = self.m.ptr(ty);
-                let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                    let (name, shape, properties) = if TLAS_SLOTS.contains(&slot) {
+                        // DXC's resource element type tag (0), I32 (4).
+                        let tag = i32c(&mut self, 0);
+                        let elem = i32c(&mut self, 4);
+                        (
+                            "struct.RaytracingAccelerationStructure",
+                            16,
+                            Some(self.m.md_node(vec![Some(tag), Some(elem)])),
+                        )
+                    } else {
+                        ("struct.ByteAddressBuffer", 11, None)
+                    };
+                    let ty = self.m.named_struct(name, vec![self.t.i32]);
+                    let p = self.m.ptr(ty);
+                    let u = self.m.undef(p);
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -690,16 +722,16 @@ impl Shader {
                         Some(i32c(&mut self, ROOT_CBV_SPACE)),
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
-                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, shape)),
                         Some(i32c(&mut self, 0)),
-                        None,
+                        properties,
                     ];
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
-                        dxil_kind: 11,
+                        dxil_kind: shape,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
@@ -961,6 +993,9 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
+        }
+        if self.flags & flags::RAYTRACING_1_1 != 0 {
+            features |= 0x10_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);

@@ -25,7 +25,8 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use crate::emit::shader::Shader;
+use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
@@ -41,7 +42,7 @@ thread_local! {
 
 /// Where the instruction's node is.
 #[derive(Clone, Copy)]
-enum NodeAt {
+pub(in crate::emit) enum NodeAt {
     /// At this byte of a raw buffer of the host.
     Buffer { handle: V, byte: V },
     /// In title memory: the raw view of the host copy holding the node's
@@ -52,11 +53,11 @@ enum NodeAt {
 }
 
 /// The ray operands, as floats.
-struct Ray {
-    extent: V,
-    origin: [V; 3],
-    direction: [V; 3],
-    inverse: [V; 3],
+pub(in crate::emit) struct Ray {
+    pub extent: V,
+    pub origin: [V; 3],
+    pub direction: [V; 3],
+    pub inverse: [V; 3],
 }
 
 /// `VICTORY_BVH_MISS=1` (off by default, from trustno1-coder/VIctory-NVIDIA 24a479d):
@@ -210,7 +211,7 @@ impl<'a> Lower<'a> {
         let triangle = if bvh_miss() {
             bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
         } else {
-            self.bvh_triangle(at, kind, &ray)
+            self.node_code().triangle(at, kind, &ray)
         };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
@@ -291,41 +292,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `count` dwords of 64 bytes of a node from their byte `base` + `offset`
-    /// (`base` computed, `offset` fixed), read four at a time.
-    fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        let (handle, start_byte) = match at {
-            NodeAt::Buffer { handle, byte } | NodeAt::Memory { handle, byte, .. } => (handle, byte),
-        };
-        let mut out = Vec::with_capacity(count as usize);
-        for start in (0..count).step_by(4) {
-            let n = (count - start).min(4);
-            let node_byte = offset + 4 * start;
-            let mut byte = start_byte;
-            let c = self.cur;
-            if let Some(b) = base {
-                byte = self.s.m.bin(c, Bin::Add, byte, b);
-            }
-            let k = self.s.m.i32(node_byte);
-            let byte = self.s.m.bin(c, Bin::Add, byte, k);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[handle, byte, undef, mask, align],
-            );
-            for k in 0..n {
-                let f = self.s.m.extract(c, r, k);
-                out.push(self.as_int(f));
-            }
-        }
-        out
-    }
-
     /// The node's title address, [`bvh::node_address`]: the descriptor's
     /// base (dword 0 and the low byte of dword 1, in 256-byte units) plus
     /// `(pointer >> 3) << 6`.
@@ -350,7 +316,7 @@ impl<'a> Lower<'a> {
     /// current block and leaves `self.cur` at the block it ends in.
     fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
         let head = self.cur;
-        let children = self.bvh_node_words(at, None, 0, 4);
+        let children = self.node_code().bvh_node_words(at, None, 0, 4);
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -361,9 +327,9 @@ impl<'a> Lower<'a> {
         // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let mut words = self.bvh_node_words(at, None, 16, 12);
+        let mut words = self.node_code().bvh_node_words(at, None, 16, 12);
         let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
+        words.extend(self.node_code().bvh_node_words(second, None, 0, 12));
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         // (The look for the second half goes on in another block.)
         let wide_block = self.cur;
@@ -371,7 +337,7 @@ impl<'a> Lower<'a> {
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let words = self.node_code().bvh_node_words(at, None, 16, 12);
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
@@ -414,6 +380,88 @@ impl<'a> Lower<'a> {
                 .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
             coords.push(phi);
         }
+        self.node_code()
+            .box_hits(&coords, &children, ray, there, sort)
+    }
+
+    fn node_code(&mut self) -> NodeCode<'_> {
+        NodeCode {
+            s: &mut self.s,
+            cur: self.cur,
+        }
+    }
+}
+
+/// The same node arithmetic for a translated guest instruction and for the
+/// narrow replay's BVH4 walk. Page resolution stays in the guest lowerer.
+pub(in crate::emit) struct NodeCode<'a> {
+    pub s: &'a mut Shader,
+    pub cur: usize,
+}
+
+impl NodeCode<'_> {
+    fn as_float(&mut self, v: V) -> V {
+        self.s.m.cast(self.cur, Cast::Bitcast, v, self.s.t.f32)
+    }
+
+    fn as_int(&mut self, v: V) -> V {
+        self.s.m.cast(self.cur, Cast::Bitcast, v, self.s.t.i32)
+    }
+
+    fn binary(&mut self, op: u32, a: V, b: V) -> V {
+        self.s.op(
+            self.cur,
+            "binary.f32",
+            Attr::ReadNone,
+            self.s.t.f32,
+            op,
+            &[a, b],
+        )
+    }
+
+    /// `count` dwords of 64 bytes of a node from their byte `base` + `offset`
+    /// (`base` computed, `offset` fixed), read four at a time.
+    fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
+        let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let (handle, start_byte) = match at {
+            NodeAt::Buffer { handle, byte } | NodeAt::Memory { handle, byte, .. } => (handle, byte),
+        };
+        let mut out = Vec::with_capacity(count as usize);
+        for start in (0..count).step_by(4) {
+            let n = (count - start).min(4);
+            let node_byte = offset + 4 * start;
+            let mut byte = start_byte;
+            let c = self.cur;
+            if let Some(b) = base {
+                byte = self.s.m.bin(c, Bin::Add, byte, b);
+            }
+            let k = self.s.m.i32(node_byte);
+            let byte = self.s.m.bin(c, Bin::Add, byte, k);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[handle, byte, undef, mask, align],
+            );
+            for k in 0..n {
+                let f = self.s.m.extract(c, r, k);
+                out.push(self.as_int(f));
+            }
+        }
+        out
+    }
+
+    pub fn box_hits(
+        &mut self,
+        coords: &[V],
+        children: &[V],
+        ray: &Ray,
+        there: Option<[V; 4]>,
+        sort: bool,
+    ) -> [V; 4] {
         // The inverse direction held finite ([`bvh::boxes`]).
         let (most, least) = (
             self.s.m.f32(f32::MAX.to_bits()),
@@ -423,7 +471,7 @@ impl<'a> Lower<'a> {
             let x = self.binary(35, x, least);
             self.binary(36, x, most)
         });
-        let c = join;
+        let c = self.cur;
         let (none, infinity, fzero) = (
             self.s.m.i32(bvh::NONE),
             self.s.m.f32(f32::INFINITY.to_bits()),
@@ -450,7 +498,7 @@ impl<'a> Lower<'a> {
             // Ordered compares: a NaN anywhere is a miss.
             let through = self.s.m.cmp(c, pred::OGE, leave, from);
             let before = self.s.m.cmp(c, pred::OLT, enter, ray.extent);
-            let off = self.is_nan_f32(bx[0]);
+            let off = self.s.is_nan_f32(c, bx[0]);
             let on = self.s.m.bool(true);
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
@@ -480,7 +528,7 @@ impl<'a> Lower<'a> {
 
     /// The triangle test ([`bvh::triangle`] of [`bvh::triangle_vertices`]):
     /// four result dwords, made in the current block.
-    fn bvh_triangle(&mut self, at: NodeAt, kind: V, ray: &Ray) -> [V; 4] {
+    pub fn triangle(&mut self, at: NodeAt, kind: V, ray: &Ray) -> [V; 4] {
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         // The triangle's byte of the dword at byte 60: which of its
@@ -525,7 +573,10 @@ impl<'a> Lower<'a> {
         // The ray's largest axis z, and x and y after it in an order that
         // keeps the winding.
         let fzero = self.s.m.f32(0);
-        let size = ray.direction.map(|d| self.unary(6, d));
+        let size = ray.direction.map(|d| {
+            self.s
+                .op(c, "unary.f32", Attr::ReadNone, self.s.t.f32, 6, &[d])
+        });
         let xy = self.s.m.cmp(c, pred::OGE, size[0], size[1]);
         let xz = self.s.m.cmp(c, pred::OGE, size[0], size[2]);
         let yz = self.s.m.cmp(c, pred::OGE, size[1], size[2]);

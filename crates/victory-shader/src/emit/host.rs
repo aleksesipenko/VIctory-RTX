@@ -106,7 +106,10 @@ fn shader_model(device: &ID3D12Device) -> windows::core::Result<D3D_SHADER_MODEL
 /// default if there is no suitable enumerated adapter.
 pub fn create_preferred_device() -> windows::core::Result<ID3D12Device> {
     let requested = std::env::var("VICTORY_D3D12_ADAPTER").unwrap_or_default();
-    let requested = requested.trim();
+    select_device(requested.trim())
+}
+
+fn select_device(requested: &str) -> windows::core::Result<ID3D12Device> {
     // SAFETY: plain adapter queries and device creation.
     unsafe {
         let create = |adapter: Option<&IDXGIAdapter1>| -> windows::core::Result<ID3D12Device> {
@@ -167,6 +170,55 @@ fn an_explicit_adapter_matches_an_index_or_name() {
     assert!(!adapter_matches("", 0, integrated));
 }
 
+/// Enable once, before creating any device in the process. Enabling the
+/// debug layer again while another test owns a live device can remove it.
+pub fn enable_debug_layer() -> Result<(), String> {
+    static ENABLED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ENABLED
+        .get_or_init(|| {
+            let mut debug: Option<ID3D12Debug> = None;
+            // SAFETY: callers run this before their first device creation.
+            unsafe {
+                D3D12GetDebugInterface(&mut debug).map_err(err)?;
+                debug.ok_or("no ID3D12Debug")?.EnableDebugLayer();
+            }
+            Ok(())
+        })
+        .clone()
+}
+
+fn messages(queue: &ID3D12InfoQueue, errors_only: bool) -> Result<Vec<String>, String> {
+    let mut messages = Vec::new();
+    // SAFETY: the queried length sizes an aligned allocation. The text is
+    // copied while its owning allocation is still live.
+    unsafe {
+        if errors_only && queue.GetNumMessagesDiscardedByMessageCountLimit() != 0 {
+            return Err("D3D12 discarded messages before inspection".into());
+        }
+        for i in 0..queue.GetNumStoredMessagesAllowedByRetrievalFilter() {
+            let mut len = 0;
+            queue.GetMessage(i, None, &mut len).map_err(err)?;
+            let mut storage = vec![0u64; len.div_ceil(8)];
+            let msg = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            queue.GetMessage(i, Some(msg), &mut len).map_err(err)?;
+            let m = &*msg;
+            if !errors_only
+                || matches!(
+                    m.Severity,
+                    D3D12_MESSAGE_SEVERITY_ERROR | D3D12_MESSAGE_SEVERITY_CORRUPTION
+                )
+            {
+                let bytes = std::slice::from_raw_parts(
+                    m.pDescription,
+                    m.DescriptionByteLength.saturating_sub(1),
+                );
+                messages.push(String::from_utf8_lossy(bytes).into_owned());
+            }
+        }
+    }
+    Ok(messages)
+}
+
 impl Host {
     /// The preferred hardware adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -176,12 +228,7 @@ impl Host {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
             // refused pipeline's error then carries.
             if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
-                let mut debug: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut debug).is_ok()
-                    && let Some(debug) = debug
-                {
-                    debug.EnableDebugLayer();
-                }
+                let _ = enable_debug_layer();
             }
             let mut device: Option<ID3D12Device> = None;
             if warp {
@@ -208,6 +255,18 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// A particular hardware adapter, independent of WARP or process overrides.
+    pub fn on_adapter(name: &str) -> Result<Self, String> {
+        if name.trim().is_empty() {
+            return Err("explicit adapter name required".into());
+        }
+        let device = select_device(name.trim()).map_err(err)?;
+        if shader_model(&device).map_err(err)?.0 < D3D_SHADER_MODEL_6_6.0 {
+            return Err("adapter lacks SM 6.6".into());
+        }
+        Ok(Self { device })
     }
 
     /// The name of the adapter that actually created the device.
@@ -280,6 +339,14 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
+        let dwords = stages
+            .iter()
+            .map(|(s, _)| u64::from(s.user_data_dwords().max(1)))
+            .sum::<u64>()
+            + 2 * views.len() as u64;
+        if dwords > 64 {
+            return Err(format!("root signature needs {dwords} DWORDs (limit 64)"));
+        }
         for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -394,24 +461,26 @@ impl Host {
         let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
             return text;
         };
-        // SAFETY: each message is read into a buffer of the size the queue
-        // asks for, aligned for the message header.
-        unsafe {
-            for i in 0..queue.GetNumStoredMessages() {
-                let mut len = 0usize;
-                let _ = queue.GetMessage(i, None, &mut len);
-                let mut buffer = vec![0u64; len.div_ceil(8)];
-                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
-                if queue.GetMessage(i, Some(message), &mut len).is_ok() {
-                    let m = &*message;
-                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
-                    text.push_str(" | ");
-                    text.push_str(&String::from_utf8_lossy(bytes));
-                }
+        if let Ok(messages) = messages(&queue, false) {
+            for m in messages {
+                text.push_str(" | ");
+                text.push_str(&m);
             }
-            queue.ClearStoredMessages();
+            // SAFETY: the messages have been copied into the failing result.
+            unsafe { queue.ClearStoredMessages() };
         }
         text
+    }
+
+    /// Assertable diagnostics after a fenced dispatch. Reading preserves the queue.
+    pub fn check_debug_errors(&self) -> Result<(), String> {
+        let queue = self.device.cast::<ID3D12InfoQueue>().map_err(err)?;
+        let errors = messages(&queue, true)?;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -742,6 +811,8 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// Bind the nth returned buffer UAV as a root UAV as well (compute).
+    Output(usize),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -979,7 +1050,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Output(_) => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1110,6 +1183,8 @@ pub enum View<'a> {
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw UAV initialized before dispatch, e.g. a resident guest page.
+    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1352,9 +1427,15 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
+                            View::RawUavData(data) => (
+                                data.len() as u32,
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len() as u32,
+                                D3D12_BUFFER_UAV_FLAG_RAW,
+                            ),
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -1372,6 +1453,16 @@ impl Host {
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
                             D3D12_RESOURCE_STATE_COMMON,
                         )?;
+                        if let View::RawUavData(data) = v {
+                            let src = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &src, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(src);
+                        }
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
                             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1507,6 +1598,13 @@ impl Host {
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
+                    }
+                    Root::Output(n) => {
+                        let (resource, _, _, _) = uavs.get(*n).ok_or("missing root UAV")?;
+                        list.SetComputeRootUnorderedAccessView(
+                            *param,
+                            resource.GetGPUVirtualAddress(),
+                        );
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;

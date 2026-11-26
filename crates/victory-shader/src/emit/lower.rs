@@ -4503,12 +4503,7 @@ impl<'a> Lower<'a> {
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
     /// drivers (such as NVIDIA) do not fold `fcmp uno` away under fast-math.
     fn is_nan_f32(&mut self, f: V) -> V {
-        let c = self.cur;
-        let bits = self.as_int(f);
-        let mask = self.s.m.i32(0x7FFF_FFFF);
-        let abs = self.s.m.bin(c, Bin::And, bits, mask);
-        let inf = self.s.m.i32(0x7F80_0000);
-        self.s.m.cmp(c, pred::IUGT, abs, inf)
+        self.s.is_nan_f32(self.cur, f)
     }
 
     /// The median of three. With a NaN among them the hardware gives the

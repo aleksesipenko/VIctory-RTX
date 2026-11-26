@@ -8,11 +8,9 @@
 //! buffer's descriptor from the program's table (a resource of the host,
 //! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
 //! descriptor of numbers over title memory with the structure's address in
-//! the node pointer or in the descriptor. These tests have no host that
-//! keeps copies of title memory and their directory, so for the second
-//! they put a stand-in under the node reader
-//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
-//! through the directory, which is only checked to lower and validate.
+//! the node pointer or in the descriptor. The broad ray/node batches use a
+//! contiguous buffer under the node reader. The page-boundary test binds
+//! the actual directory, mapped UAV pages and missing-page fault buffer.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -498,16 +496,59 @@ impl Drop for Memory {
     }
 }
 
+/// D3D12 shares its device/InfoQueue between threads on an adapter. Other
+/// shader tests deliberately submit rejected PSOs; their messages must not
+/// enter a node test's acceptance queue, nor can they be filtered away.
+fn completed_in_child() -> bool {
+    const CHILD: &str = "ADA_NODE_TEST_CASE";
+    let thread = std::thread::current();
+    let name = thread.name().expect("libtest case name");
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .output()
+        .expect("launch isolated D3D12 node test");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && log.contains("adapter=NVIDIA GeForce RTX 4070 Ti SUPER"),
+        "{name}: {log}\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    eprint!("{log}");
+    true
+}
+
+fn ada() -> Host {
+    super::host::enable_debug_layer().expect("Windows Graphics Tools required");
+    let name = "NVIDIA GeForce RTX 4070 Ti SUPER";
+    let host = Host::on_adapter(name).expect("required Ada adapter");
+    assert_eq!(host.adapter_name().as_deref(), Some(name));
+    eprintln!("adapter={name}");
+    host
+}
+
 /// Runs every batch on the hardware adapter and WARP and compares with
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
 fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
-    let (shader, res) = build(wide, descriptor).expect("the program lowers");
+    let (mut shader, res) = build(wide, descriptor).expect("the program lowers");
+    validator::Validator::load(validator::Validator::default_path().as_deref())
+        .unwrap()
+        .validate(&mut shader.dxil)
+        .unwrap();
     assert_eq!(res.bvh.len(), 1);
     let (scene, batches) = scene();
     // The reference must see a bit of everything, or the comparison
     // proves little.
     let all: Vec<&Case> = batches.iter().flatten().collect();
+    assert!(all.len() >= 311, "legacy ray/node coverage");
+    eprintln!("Ada: {} ray/node cases", all.len());
     let results: Vec<[u32; 4]> = all.iter().map(|c| expected(&scene, c, sort)).collect();
     let boxes = |hits: usize| {
         all.iter()
@@ -540,15 +581,8 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             .any(|c| expected(&scene, c, true) != expected(&scene, c, false)),
         "no case tells sorted from unsorted"
     );
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
+    for (label, host) in [("Ada", Some(ada())), ("warp", Host::new(true).ok())] {
+        let Some(host) = host else { continue };
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -592,13 +626,17 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
                 );
             }
         }
-        ran += 1;
+        if label == "Ada" {
+            host.check_debug_errors().unwrap();
+        }
     }
-    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 #[test]
 fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
+    if completed_in_child() {
+        return;
+    }
     // Pointers count from the buffer's start.
     run(true, Descriptor::Table, u64::from(NODES), true);
     assert_eq!(
@@ -609,6 +647,9 @@ fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
 
 #[test]
 fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
+    if completed_in_child() {
+        return;
+    }
     run(false, Descriptor::Table, u64::from(NODES), true);
 }
 
@@ -617,6 +658,9 @@ const BASE: u64 = 0x12_3456_7800;
 
 #[test]
 fn the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
+    if completed_in_child() {
+        return;
+    }
     // The title's way: one descriptor for all of memory, the structure's
     // address folded into a 64-bit pointer.
     let _memory = Memory::at(BASE);
@@ -625,6 +669,9 @@ fn the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 
 #[test]
 fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
+    if completed_in_child() {
+        return;
+    }
     // The title's other way: the structure's address in the descriptor
     // (in 256-byte units, 40 bits), a 32-bit pointer from there. Here with
     // an address past 2^40 bytes, and without box sorting.
@@ -708,6 +755,9 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
 /// the strides in the same root view.
 #[test]
 fn a_picked_views_address_comes_from_the_hosts_table() {
+    if completed_in_child() {
+        return;
+    }
     use super::{SLOT_STRIDES, SLOT_STRIDES_BYTES, VIEW_ADDRESSES};
     let words = [
         0xBE85_0380, // s_mov_b32 s5, 0
@@ -735,15 +785,8 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
     // Slot 2, the one picked; slot 0 as a decoy.
     table[at..at + 2].copy_from_slice(&[0xdead_0000, 0xdd]);
     table[at + 4..at + 6].copy_from_slice(&[0x1234_5600, 0x42]);
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
+    for (label, host) in [("Ada", Some(ada())), ("warp", Host::new(true).ok())] {
+        let Some(host) = host else { continue };
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -771,9 +814,10 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
         for t in 0..THREADS as usize {
             assert_eq!(out[0][2 * t..2 * t + 2], [0x1234_5600, 0x42], "{label} thread {t}");
         }
-        ran += 1;
+        if label == "Ada" {
+            host.check_debug_errors().unwrap();
+        }
     }
-    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 /// A register that holds a lane mask on one path and a number on the other
@@ -783,6 +827,9 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
 /// numbers (`sop`), and the read is the console's register.
 #[test]
 fn mask_operations_on_a_joined_number_give_the_number() {
+    if completed_in_child() {
+        return;
+    }
     let words = [
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0302,
@@ -811,50 +858,139 @@ fn mask_operations_on_a_joined_number_give_the_number() {
     }
     let (shader, _) = lower::with_mask_ops_on_numbers(|| build_compute_shader(&native(&words)))
         .expect("the program lowers");
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     // The hardware device only: the program declares the console's 32
     // lanes (its wave operations), which WARP does not take.
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+    let label = "Ada";
+    let host = ada();
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let unused = [0u32; 4];
+    for (constants, want) in [
+        // The mask's path: lanes 0-23 as the number.
+        ([0, 0x1234_5678, 0x0100_0000], 0x01FF_00FF),
+        // The number's path.
+        ([1, 0x1234_5678, 0x0100_0000], 0x0134_0079),
+    ] {
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants([&constants[..], &[0, 0]].concat()))],
+                    views: &[
+                        View::Buffer {
+                            data: &unused,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for t in 0..THREADS as usize {
+            assert_eq!(out[0][t], want, "{label} {constants:x?} thread {t}");
+        }
+    }
+    host.check_debug_errors().unwrap();
+}
+
+#[test]
+fn box_straddling_real_guest_pages_and_missing_halves_on_ada() {
+    if completed_in_child() {
+        return;
+    }
+    use super::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+    let host = ada();
+    let (mut shader, _) = build(true, WHOLE).unwrap();
+    validator::Validator::load(validator::Validator::default_path().as_deref())
+        .unwrap()
+        .validate(&mut shader.dxil)
+        .unwrap();
+    assert_eq!(shader.root_uavs, [SLOT_FAULTS]);
+    assert_eq!(shader.root_srvs, [SLOT_MEMORY]);
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    // The node's first 64 bytes end exactly at the page boundary. Each
+    // directory entry points at a distinct raw UAV with its own window offset.
+    let first_page = 0x1_0002u32;
+    let byte = (u64::from(first_page) + 1) * 65536 - 64;
+    let ids = [0x105, 0x205, 0x305, 0x405];
+    let boxes = std::array::from_fn(|i| [4. * i as f32 + 1., -1., -1., 4. * i as f32 + 2., 1., 1.]);
+    let mut scene = Scene::new();
+    let n = scene.add(nodes::box32(ids, boxes), 32);
+    let batch = [Some((n, 5, Ray::new([0.; 3], [1., 0., 0.], 100.)))];
+    let records = buffer(&scene, &batch, byte);
+    let mut page1 = vec![0xdead_ffff; 16384 + 64];
+    let mut page2 = vec![0xdead_ffff; 16384 + 32];
+    page1[64 + 16384 - 16..].copy_from_slice(&scene.words[..16]);
+    page2[32..48].copy_from_slice(&scene.words[16..32]);
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let mem = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(USER_MEMORY_BASE))
+        .unwrap();
+    constants[mem.index as usize] = 2;
+    for (a, b) in [(true, true), (true, false), (false, true), (false, false)] {
+        let mut dir = vec![0; MEMORY_PAGES as usize * 2];
+        let i = first_page as usize * 2;
+        if a {
+            dir[i..i + 2].copy_from_slice(&[1, 256]);
+        }
+        if b {
+            dir[i + 2..i + 4].copy_from_slice(&[2, 128]);
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(constants.clone())),
+                        (1, Root::Output(4)),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: dir,
+                            },
+                        ),
+                    ],
+                    views: &[
+                        View::Buffer {
+                            data: &records[..(NODES / 4) as usize],
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                        View::RawUav(16384),
+                        View::RawUavData(&page1),
+                        View::RawUavData(&page2),
+                        View::RawUav(MEMORY_FAULTS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        let want = if !a {
+            [bvh::NONE; 4]
+        } else if !b {
+            [ids[0], ids[1], bvh::NONE, bvh::NONE]
+        } else {
+            ids
         };
-        let (root, pso) = match host.compute_pipeline(&shader) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("the {label} device does not take this program (waves of 64?): {e}; not run");
-                continue;
-            }
-        };
-        let unused = [0u32; 4];
-        for (constants, want) in [
-            // The mask's path: lanes 0-23 as the number.
-            ([0, 0x1234_5678, 0x0100_0000], 0x01FF_00FF),
-            // The number's path.
-            ([1, 0x1234_5678, 0x0100_0000], 0x0134_0079),
-        ] {
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![(0, Root::Constants([&constants[..], &[0, 0]].concat()))],
-                        views: &[View::Buffer { data: &unused, stride: Stride::Raw }, View::RawUav(4 * THREADS)],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            for t in 0..THREADS as usize {
-                assert_eq!(out[0][t], want, "{label} {constants:x?} thread {t}");
+        assert_eq!(out[0][..4], want, "mapped halves {a}/{b}");
+        assert_eq!(out[0][4..8], BEFORE, "inactive lane");
+        let mut faults = vec![0; MEMORY_FAULTS as usize];
+        for (mapped, page) in [(a, first_page), (b, first_page + 1)] {
+            if !mapped {
+                faults[(1 + page % (MEMORY_FAULTS - 1)) as usize] = page;
             }
         }
-        ran += 1;
+        assert_eq!(
+            out[4], faults,
+            "exact fault pages for mapped halves {a}/{b}"
+        );
     }
-    if ran == 0 {
-        eprintln!("not run on a device; lowered only");
-    }
+    host.check_debug_errors().unwrap();
 }
