@@ -38,6 +38,11 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// Whether `D3D12_HEAP_TYPE_GPU_UPLOAD` (Resizable BAR VRAM) is supported.
+    pub(crate) gpu_upload_supported: bool,
+    /// Cached local VRAM sample `(at, used_bytes, budget_bytes)` for
+    /// `D3D12_HEAP_TYPE_GPU_UPLOAD` admission checks.
+    upload_vram_headroom: Mutex<Option<(std::time::Instant, u64, u64)>>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -1102,6 +1107,16 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut o16).cast(),
+                size_of_val(&o16) as u32,
+            )
+            .is_ok()
+            && o16.GPUUploadHeapSupported.as_bool();
+        tracing::info!(gpu_upload_supported, "host GPU upload heap support");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -1152,6 +1167,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             dxr,
             device,
+            gpu_upload_supported,
+            upload_vram_headroom: Mutex::new(None),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -6859,6 +6876,85 @@ impl HostList {
         self.empty_closed.store(true, Ordering::Release);
     }
 
+    /// Releases oversized buffers when a list stays in the hot spare pool
+    /// (`list::HOT_SPARE`), keeping normal indirect argument and scratch
+    /// buffers warm across frames.
+    /// Provenance (GPL-3.0): Marvisak/VIctory#3228.
+    pub(crate) fn trim_oversized_buffers(&self) {
+        const MAX_WARM_INDIRECT_ARGS: u64 = 256 << 10;
+        const MAX_WARM_BATCH_BUFFERS: usize = 2;
+        const HOT_SCRATCH_CHUNKS: usize = 2;
+        let drop_indirect = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(_, cap)| *cap > MAX_WARM_INDIRECT_ARGS) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        drop(drop_indirect);
+        let drop_batches = {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            args.1 = 0;
+            if args.0.len() > MAX_WARM_BATCH_BUFFERS {
+                args.0.split_off(MAX_WARM_BATCH_BUFFERS)
+            } else {
+                Vec::new()
+            }
+        };
+        drop(drop_batches);
+        if !scratch_pool() {
+            let drop_chunks = {
+                let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+                scratch.current = 0;
+                scratch.used = 0;
+                if scratch.chunks.len() > HOT_SCRATCH_CHUNKS {
+                    scratch.chunks.split_off(HOT_SCRATCH_CHUNKS)
+                } else {
+                    Vec::new()
+                }
+            };
+            give_chunks(drop_chunks);
+        }
+    }
+
+    /// Releases indirect argument buffers and trims scratch chunks when a list
+    /// is parked in the cold idle pool beyond `list::HOT_SPARE`.
+    /// Provenance (GPL-3.0): Marvisak/VIctory#3228.
+    pub(crate) fn release_idle_buffers(&self) {
+        const IDLE_SCRATCH_SPARE: usize = 1;
+        let drop_indirect = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(drop_indirect);
+        let drop_batches = {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            args.1 = 0;
+            std::mem::take(&mut args.0)
+        };
+        drop(drop_batches);
+        if !scratch_pool() {
+            let drop_chunks = {
+                let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+                let keep = if scratch
+                    .chunks
+                    .first()
+                    .is_some_and(|(_, cap)| *cap > SCRATCH_FIRST * 4)
+                {
+                    0
+                } else {
+                    IDLE_SCRATCH_SPARE
+                };
+                scratch.current = 0;
+                scratch.used = 0;
+                if scratch.chunks.len() > keep {
+                    scratch.chunks.split_off(keep)
+                } else {
+                    Vec::new()
+                }
+            };
+            give_chunks(drop_chunks);
+        }
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -9342,6 +9438,129 @@ impl Host {
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        let bytes = size.max(1);
+        // D3D12 committed buffers occupy at least 64 KiB of physical VRAM;
+        // charge the aligned footprint against the cached local budget window
+        // so bursts of small buffers cannot overshoot the 75% ceiling.
+        let physical = bytes.checked_next_multiple_of(64 << 10).unwrap_or(u64::MAX);
+        if self.gpu_upload_supported
+            && upload_vram_enabled()
+            && self.upload_vram_has_headroom(physical)
+            && let Some(made) = self.upload_vram_buffer(bytes)
+        {
+            self.note_upload_vram(physical);
+            #[cfg(feature = "diagnostics")]
+            UPLOAD_VRAM_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            return Some(made);
+        }
+        let made = self.upload_ram_buffer(bytes)?;
+        #[cfg(feature = "diagnostics")]
+        UPLOAD_RAM_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Some(made)
+    }
+
+    fn upload_vram_has_headroom(&self, size: u64) -> bool {
+        let now = std::time::Instant::now();
+        let cached = {
+            let cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
+            if size < (4 << 20)
+                && let Some((at, used, budget)) = *cache
+                && now.duration_since(at) < std::time::Duration::from_millis(250)
+            {
+                Some((used, budget))
+            } else {
+                None
+            }
+        };
+        let (used, budget) = match cached {
+            Some(pair) => pair,
+            None => {
+                let [local, _] = self.sample_video_memory();
+                let Some(local) = local else {
+                    *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    return false;
+                };
+                let pair = (local.CurrentUsage, local.Budget);
+                *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((now, pair.0, pair.1));
+                pair
+            }
+        };
+        let dxr_active = self.dxr.is_some() || crate::dxr::requested();
+        let dxr_cap = if dxr_active { upload_vram_dxr_cap_bytes() } else { u64::MAX };
+        let dxr_headroom = if dxr_active { crate::dxr::slab_headroom() } else { 0 };
+        upload_vram_fits(used, budget, size, dxr_active, dxr_cap, dxr_headroom)
+    }
+
+    fn note_upload_vram(&self, size: u64) {
+        let mut cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, used, _)) = cache.as_mut() {
+            *used = used.saturating_add(size);
+        }
+    }
+
+    fn invalidate_upload_vram(&self) {
+        *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// A persistently mapped buffer in `D3D12_HEAP_TYPE_GPU_UPLOAD` (ReBAR VRAM)
+    /// starting in `D3D12_RESOURCE_STATE_COMMON`.
+    /// Provenance (GPL-3.0): Marvisak/VIctory#3228.
+    fn upload_vram_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: GPU_UPLOAD buffers start in COMMON and are persistently mapped.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    not_resident(),
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&self.device, b)?;
+                    mapped(&self.device)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "a GPU upload buffer".into());
+        }
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                self.invalidate_upload_vram();
+                tracing::debug!(error = %e, size, "GPU_UPLOAD buffer fell back to UPLOAD");
+                None
+            }
+        }
+    }
+
+    fn upload_ram_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -9393,6 +9612,92 @@ impl Host {
             }
         }
     }
+}
+
+/// Total bytes allocated in `GPU_UPLOAD` (VRAM) vs standard `UPLOAD` (RAM).
+#[cfg(feature = "diagnostics")]
+static UPLOAD_VRAM_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static UPLOAD_RAM_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Default DXR local VRAM cap in bytes (matches `crate::dxr::memory::Memory::new`, 12,800 MiB).
+const DEFAULT_DXR_VRAM_CAP_BYTES: u64 = 12_800 << 20;
+
+fn parse_upload_vram_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        let v = v.trim();
+        v == "0"
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("no")
+    })
+}
+
+/// Whether `Host::upload_buffer` may route allocations into `D3D12_HEAP_TYPE_GPU_UPLOAD`
+/// (Resizable BAR VRAM) while local VRAM has headroom.
+/// Escape hatch: `VICTORY_UPLOAD_VRAM=0` (or `false`/`off`/`no`) forces system-RAM `UPLOAD`.
+/// Provenance (GPL-3.0): Marvisak/VIctory#3228.
+fn upload_vram_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let val = std::env::var("VICTORY_UPLOAD_VRAM").ok();
+        parse_upload_vram_enabled(val.as_deref())
+    })
+}
+
+fn upload_vram_dxr_cap_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_DXR_VRAM_CAP_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .and_then(|mb| mb.checked_mul(1 << 20))
+            .unwrap_or(DEFAULT_DXR_VRAM_CAP_BYTES)
+    })
+}
+
+/// Maximum local VRAM bytes `GPU_UPLOAD` routing may reach before falling back
+/// to system-RAM `UPLOAD`: conservatively <= 75% of the OS local budget, and
+/// when DXR is active (`VICTORY_NATIVE_RT=1`), <= 75% of
+/// `min(local_budget, VICTORY_DXR_VRAM_CAP_MB)` minus unallocated DXR AS slab
+/// headroom (`crate::dxr::slab_headroom()`).
+fn upload_vram_ceiling(
+    local_budget_bytes: u64,
+    dxr_active: bool,
+    dxr_cap_bytes: u64,
+    dxr_slab_headroom: u64,
+) -> u64 {
+    if local_budget_bytes == 0 {
+        return 0;
+    }
+    let effective_budget = if dxr_active {
+        local_budget_bytes.min(dxr_cap_bytes)
+    } else {
+        local_budget_bytes
+    };
+    let pct_75 = ((u128::from(effective_budget) * 75) / 100) as u64;
+    if dxr_active {
+        pct_75.saturating_sub(dxr_slab_headroom)
+    } else {
+        pct_75
+    }
+}
+
+fn upload_vram_fits(
+    local_used_bytes: u64,
+    local_budget_bytes: u64,
+    size: u64,
+    dxr_active: bool,
+    dxr_cap_bytes: u64,
+    dxr_slab_headroom: u64,
+) -> bool {
+    let ceiling = upload_vram_ceiling(
+        local_budget_bytes,
+        dxr_active,
+        dxr_cap_bytes,
+        dxr_slab_headroom,
+    );
+    ceiling > 0 && local_used_bytes.saturating_add(size) <= ceiling
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
@@ -9773,6 +10078,11 @@ impl Meter {
                         put[1],
                         put[2] / 1e6,
                         put[3]
+                    );
+                    tracing::info!(
+                        "upload buffers allocated since start: VRAM {:.0} MB / RAM {:.0} MB",
+                        UPLOAD_VRAM_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+                        UPLOAD_RAM_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                     );
                     traffic::line(copy_stats_frames);
                     crate::copystat::log(copy_stats_frames);
@@ -10244,18 +10554,19 @@ impl Host {
     /// PC's memory shared with the card (where the system moves what does
     /// not fit on the card).
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
-        let adapter = self.adapter.as_ref()?;
-        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: plain queries that fill our structures.
-        unsafe {
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
-                .ok()?;
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
-                .ok()?;
-        }
+        let [own, shared] = self.sample_video_memory();
+        let (own, shared) = (own?, shared?);
+        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// Sample the local and non-local DXGI memory segments independently for
+    /// the panel and upload-VRAM headroom checks.
+    /// Provenance (GPL-3.0): Belobug/VIctory-Belobug-AMD#348.
+    pub(crate) fn sample_video_memory(&self) -> [Option<DXGI_QUERY_VIDEO_MEMORY_INFO>; 2] {
+        let groups = self.query_video_memory_groups();
+        let [Some(own), Some(shared)] = groups else {
+            return groups;
+        };
         // The card's budget moved by 256 MB or more since the last look:
         // said at once, with what was in use at the last look, so the log
         // has the moment. (It fell from 11,242 MB to some 10,300 MB with
@@ -10276,7 +10587,16 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        groups
+    }
+
+    fn query_video_memory_groups(&self) -> [Option<DXGI_QUERY_VIDEO_MEMORY_INFO>; 2] {
+        [DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL].map(|segment| {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            // SAFETY: DXGI writes the result to the live structure.
+            unsafe { self.adapter.as_ref()?.QueryVideoMemoryInfo(0, segment, &mut info) }.ok()?;
+            Some(info)
+        })
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
@@ -10284,18 +10604,8 @@ impl Host {
     /// card, the budget, the use, what could still be reserved and what
     /// is reserved (the layer reserves none).
     pub(crate) fn video_memory_groups(&self) -> Option<[[u64; 4]; 2]> {
-        let adapter = self.adapter.as_ref()?;
-        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: plain queries that fill our structures.
-        unsafe {
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
-                .ok()?;
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
-                .ok()?;
-        }
+        let [own, shared] = self.query_video_memory_groups();
+        let (own, shared) = (own?, shared?);
         let all = |m: &DXGI_QUERY_VIDEO_MEMORY_INFO| {
             [m.Budget, m.CurrentUsage, m.AvailableForReservation, m.CurrentReservation]
         };
@@ -10385,25 +10695,9 @@ impl Host {
 
     /// Whether buffers can lie in the card's memory and be mapped by the CPU
     /// (`D3D12_HEAP_TYPE_GPU_UPLOAD`: a resizable BAR, and a system and driver
-    /// that offer it); logged once.
+    /// that offer it).
     pub(crate) fn mapped_card_memory(&self) -> bool {
-        static THERE: OnceLock<bool> = OnceLock::new();
-        *THERE.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
-            // SAFETY: writes `options` of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS16,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-            };
-            let supported = ok && options.GPUUploadHeapSupported.as_bool();
-            tracing::info!(supported, "card memory the CPU maps");
-            supported
-        })
+        self.gpu_upload_supported
     }
 
     /// A buffer in the card's own memory that the CPU maps, shaders read and
@@ -11655,6 +11949,78 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn upload_vram_fits_caps_at_75_percent_and_respects_dxr_headroom() {
+        use super::{DEFAULT_DXR_VRAM_CAP_BYTES, upload_vram_ceiling, upload_vram_fits};
+        const MIB: u64 = 1 << 20;
+
+        // Zero budget never admits GPU_UPLOAD.
+        assert!(!upload_vram_fits(0, 0, 1024, false, u64::MAX, 0));
+        assert!(!upload_vram_fits(0, 0, 1024, true, DEFAULT_DXR_VRAM_CAP_BYTES, 1024 * MIB));
+
+        // RT off: conservative 75% ceiling (stricter than upstream 80%).
+        assert_eq!(upload_vram_ceiling(1000, false, u64::MAX, 0), 750);
+        assert!(upload_vram_fits(740, 1000, 10, false, u64::MAX, 0));
+        assert!(!upload_vram_fits(740, 1000, 11, false, u64::MAX, 0));
+        assert!(!upload_vram_fits(790, 1000, 10, false, u64::MAX, 0));
+
+        // Overflow safety on used + size and huge budgets.
+        assert!(!upload_vram_fits(u64::MAX, 1000, 1, false, u64::MAX, 0));
+        assert_eq!(
+            upload_vram_ceiling(u64::MAX, false, u64::MAX, 0),
+            ((u128::from(u64::MAX) * 75) / 100) as u64,
+        );
+
+        // RT on (16 GB RTX 4070 Ti SUPER: ~15,200 MiB OS budget, 12,800 MiB DXR cap, 1,024 MiB slab reserve).
+        let budget_16g = 15_200 * MIB;
+        assert_eq!(
+            upload_vram_ceiling(budget_16g, true, DEFAULT_DXR_VRAM_CAP_BYTES, 1024 * MIB),
+            (9_600 - 1_024) * MIB,
+        );
+        assert!(upload_vram_fits(
+            8_500 * MIB,
+            budget_16g,
+            76 * MIB,
+            true,
+            DEFAULT_DXR_VRAM_CAP_BYTES,
+            1024 * MIB,
+        ));
+        assert!(!upload_vram_fits(
+            8_500 * MIB,
+            budget_16g,
+            77 * MIB,
+            true,
+            DEFAULT_DXR_VRAM_CAP_BYTES,
+            1024 * MIB,
+        ));
+        // Once DXR AS slabs are allocated (slab_headroom == 0), ceiling is 75% of DXR cap (9,600 MiB).
+        assert_eq!(
+            upload_vram_ceiling(budget_16g, true, DEFAULT_DXR_VRAM_CAP_BYTES, 0),
+            9_600 * MIB,
+        );
+
+        // Tighter VICTORY_DXR_VRAM_CAP_MB lowers the GPU_UPLOAD ceiling proportionally.
+        assert_eq!(
+            upload_vram_ceiling(budget_16g, true, 8_000 * MIB, 1024 * MIB),
+            (6_000 - 1_024) * MIB,
+        );
+
+        // Headroom larger than 75% of budget saturates cleanly to 0 and rejects allocations.
+        assert!(!upload_vram_fits(0, 1024 * MIB, 64 << 10, true, DEFAULT_DXR_VRAM_CAP_BYTES, 1024 * MIB));
+    }
+
+    #[test]
+    fn upload_vram_flag_parses_disable_values() {
+        use super::parse_upload_vram_enabled;
+        assert!(parse_upload_vram_enabled(None));
+        assert!(parse_upload_vram_enabled(Some("")));
+        assert!(parse_upload_vram_enabled(Some("1")));
+        assert!(parse_upload_vram_enabled(Some("true")));
+        for off in ["0", " 0 ", "false", "FALSE", "off", "Off", "no", "NO"] {
+            assert!(!parse_upload_vram_enabled(Some(off)), "{off}");
+        }
     }
 }
 

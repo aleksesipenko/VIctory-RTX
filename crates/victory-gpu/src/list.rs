@@ -312,6 +312,17 @@ fn fresh_list_closed() -> Option<crate::host::HostList> {
     Some(fresh)
 }
 
+/// Hot spare lists kept with warm indirect argument and scratch buffers across
+/// frames; lists parked beyond this threshold release idle buffers to save VRAM.
+/// Provenance (GPL-3.0): Marvisak/VIctory#3228.
+#[cfg(windows)]
+const HOT_SPARE: usize = 24;
+
+#[cfg(windows)]
+fn is_hot_spare(idle_len: usize) -> bool {
+    idle_len < HOT_SPARE
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, and the host lists stay closed for
@@ -343,6 +354,11 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // never retain stale commands if submitted without Reset(), while the
         // next Reset() skips the redundant allocator.Reset() via `empty_closed`.
         host.reset_closed();
+        if is_hot_spare(IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed)) {
+            host.trim_oversized_buffers();
+        } else {
+            host.release_idle_buffers();
+        }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
@@ -2767,5 +2783,14 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recycle_hot_spare_boundary() {
+        assert!(is_hot_spare(0));
+        assert!(is_hot_spare(HOT_SPARE - 1));
+        assert!(!is_hot_spare(HOT_SPARE));
+        assert!(!is_hot_spare(HOT_SPARE + 16));
     }
 }
