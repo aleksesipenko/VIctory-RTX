@@ -175,15 +175,58 @@ fn ada_paired_lift_all_64_lanes() {
             .unwrap();
         let log = String::from_utf8_lossy(&output.stderr);
         assert!(
-            output.status.success() && log.contains("paired parity=64/64"),
+            output.status.success()
+                && (log.contains("paired parity=64/64") || log.contains("skipped: no DXR 1.1")),
             "{log}"
         );
         eprintln!("{log}");
         return;
     }
-    enable_debug_layer().unwrap();
-    let host = Host::on_adapter("NVIDIA GeForce RTX 4070 Ti SUPER").unwrap();
-    assert_eq!(host.translation_caps(), Some((32, false)));
+    let require = std::env::var_os("VICTORY_REQUIRE_DXR_TESTS").is_some_and(|v| v == "1");
+    if let Err(e) = enable_debug_layer() {
+        if require {
+            panic!("Windows Graphics Tools required: {e}");
+        }
+        eprintln!("skipped: no DXR 1.1 debug layer ({e})");
+        return;
+    }
+    let host = match std::env::var("VICTORY_D3D12_ADAPTER") {
+        Ok(name) if !name.trim().is_empty() => Host::on_adapter(name.trim()),
+        _ => Host::new(false),
+    };
+    let host = match host {
+        Ok(h) => h,
+        Err(e) => {
+            if require {
+                panic!("DXR 1.1 hardware adapter required: {e}");
+            }
+            eprintln!("skipped: no DXR 1.1 hardware adapter ({e})");
+            return;
+        }
+    };
+    let mut o5 = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    let tier_ok = unsafe {
+        host.device
+            .CheckFeatureSupport(
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS5,
+                (&raw mut o5).cast(),
+                size_of_val(&o5) as u32,
+            )
+            .is_ok()
+    } && o5.RaytracingTier.0 >= windows::Win32::Graphics::Direct3D12::D3D12_RAYTRACING_TIER_1_1.0;
+    if !tier_ok || host.translation_caps() != Some((32, false)) {
+        if require {
+            panic!(
+                "adapter lacks DXR Tier 1.1 or Wave32 caps: tier_ok={tier_ok} caps={:?}",
+                host.translation_caps()
+            );
+        }
+        eprintln!(
+            "skipped: no DXR 1.1 Wave32 hardware adapter (tier_ok={tier_ok}, caps={:?})",
+            host.translation_caps()
+        );
+        return;
+    }
     let (mut dxil, n, count_slot) = kernel();
     Validator::load(Validator::default_path().as_deref())
         .unwrap()

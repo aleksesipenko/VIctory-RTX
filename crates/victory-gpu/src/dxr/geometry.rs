@@ -49,7 +49,7 @@ impl Work {
     ) -> Self {
         let mut buffers = Vec::new();
         let mut addr = |va: u64, len: u64, align: u64| -> Checked<u64> {
-            if va == 0 || va % align != 0 || len == 0 || va.checked_add(len).is_none() {
+            if va == 0 || !va.is_multiple_of(align) || len == 0 || va.checked_add(len).is_none() {
                 return Err("invalid GPU input range");
             }
             let (buf, off) = resolve(va, len)?;
@@ -57,7 +57,7 @@ impl Work {
             let gpu = unsafe { buf.GetGPUVirtualAddress() }
                 .checked_add(off)
                 .ok_or("GPU address overflow")?;
-            if gpu % align != 0 {
+            if !gpu.is_multiple_of(align) {
                 return Err("unaligned host GPU input");
             }
             buffers.push(Binding {
@@ -86,7 +86,7 @@ fn translate(b: &Build, addr: &mut impl FnMut(u64, u64, u64) -> Checked<u64>) ->
             return Err("serialized flag is clear");
         }
     }
-    if b.desc.dest_va == 0 || b.desc.dest_va % 256 != 0 {
+    if b.desc.dest_va == 0 || !b.desc.dest_va.is_multiple_of(256) {
         return Err("invalid AS destination");
     }
     if !b.stream.is_empty() {

@@ -2603,7 +2603,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// left then, and the records as clamped.
     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
         let mut warp = WarpHarness::new()?;
-        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
+        let source = if rest {
+            SOURCE.replace("REST ?", "true ?")
+        } else {
+            SOURCE.replace("REST ?", "false ?")
+        };
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
@@ -2706,8 +2710,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
+            // Spend the exact 2^27 budget (2 * 65535 * 16 * 64 + 32 * 64 = 2^27)
+            // so the budget is exhausted regardless of `VICTORY_INDIRECT_REST`.
+            for (i, words) in [[65535u32, 16, 1], [65535, 16, 1], [32, 1, 1]].into_iter().enumerate() {
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -3190,7 +3195,12 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let expected_spent = if rest() != 0 {
+                BUDGET.min((1 << 26) * times * records as u32)
+            } else {
+                (1 << 26) * times * filled as u32
+            };
+            assert_eq!(spent, expected_spent);
         }
     }
 

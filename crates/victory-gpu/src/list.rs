@@ -197,7 +197,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 /// commands name, kept until it has run.
 #[cfg(windows)]
 pub(crate) enum Detached {
-    Owned(DetachedData),
+    Owned(Box<DetachedData>),
     Shared(std::sync::Arc<DetachedData>),
 }
 
@@ -327,7 +327,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             _uploads,
             _state,
         } = match list {
-            Detached::Owned(d) => d,
+            Detached::Owned(d) => *d,
             Detached::Shared(d) => match std::sync::Arc::try_unwrap(d) {
                 Ok(d) => d,
                 Err(_) => continue, // another submission or the closed title list still owns it
@@ -581,7 +581,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 .into_iter()
                 .map(|(waits, d)| {
                     d.host.mark_dxr_reusable();
-                    (waits, std::sync::Arc::new(d))
+                    // Reused on the owning submission queue thread; `Detached` itself is `Send` via `Queue`.
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    let shared = std::sync::Arc::new(d);
+                    (waits, shared)
                 })
                 .collect();
             append_dxr_recording(&mut parts, &recording);
@@ -597,7 +600,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             let (_, taken, order) = &mut parts[entry];
             let place = taken.len();
             order.push(place);
-            taken.push(Detached::Owned(detached));
+            taken.push(Detached::Owned(Box::new(detached)));
             last = Some((entry, place));
         }
         seen.push((this, if single { last } else { None }));
@@ -641,11 +644,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         order.push(taken.len());
         taken.push((
             this,
-            Detached::Owned(DetachedData {
+            Detached::Owned(Box::new(DetachedData {
                 host,
                 _uploads: uploads,
                 _state: state,
-            }),
+            })),
         ));
     }
     (taken.into_iter().map(|(_, d)| d).collect(), order)

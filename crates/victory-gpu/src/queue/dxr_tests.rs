@@ -21,24 +21,38 @@ fn dxr_thin_submission_order_and_abandonment() {
             .env("VICTORY_NATIVE_RT", "1")
             .env("VICTORY_THIN", "1")
             .env("VICTORY_RELAY", "2")
-            .env("VICTORY_D3D12_ADAPTER", "NVIDIA GeForce RTX 4070 Ti SUPER")
             .env_remove("VICTORY_D3D12_DEBUG")
             .status()
             .unwrap();
         assert!(ok.success());
         return;
     }
-    victory_shader::emit::host::enable_debug_layer().unwrap();
-    let host = crate::host::host().expect("RTX 4070 Ti SUPER required");
+    let require = std::env::var_os("VICTORY_REQUIRE_DXR_TESTS").is_some_and(|v| v == "1");
+    if let Err(e) = victory_shader::emit::host::enable_debug_layer() {
+        if require {
+            panic!("Windows Graphics Tools required: {e}");
+        }
+        eprintln!("skipping {NAME}: Windows Graphics Tools debug layer unavailable ({e})");
+        return;
+    }
+    let Some(host) = crate::host::host() else {
+        if require {
+            panic!("DXR 1.1 hardware adapter required");
+        }
+        eprintln!("skipping {NAME}: no D3D12 host device");
+        return;
+    };
+    let Some(side) = host.dxr.as_ref() else {
+        if require {
+            panic!("DXR 1.1 sidecar required");
+        }
+        eprintln!("skipping {NAME}: host adapter lacks DXR Tier 1.1");
+        return;
+    };
     let debug = victory_shader::emit::host::Host {
         device: host.device.clone(),
     };
-    assert_eq!(
-        debug.adapter_name().as_deref(),
-        Some("NVIDIA GeForce RTX 4070 Ti SUPER")
-    );
     assert!(crate::list::thin::on());
-    let side = host.dxr.as_ref().unwrap();
     let make = |kind| {
         let mut list = std::ptr::null();
         let allocator = std::ptr::NonNull::<u64>::dangling()

@@ -313,11 +313,11 @@ impl Sidecar {
         #[cfg(feature = "diagnostics")]
         let _native_buffers = crate::replay::record::unrecorded();
         #[cfg(feature = "diagnostics")]
-        if let Some((folder, frame, after)) = crate::replay::record::dxr_boundary() {
-            if let Err(err) = packet::save(&mut e, &work, folder, frame, after) {
-                tracing::error!(target:"victory_gpu::host", %err, "DXR packet incomplete");
-                let _ = std::fs::write(folder.join("dxr-failed.txt"), err.to_string());
-            }
+        if let Some((folder, frame, after)) = crate::replay::record::dxr_boundary()
+            && let Err(err) = packet::save(&mut e, &work, folder, frame, after)
+        {
+            tracing::error!(target:"victory_gpu::host", %err, "DXR packet incomplete");
+            let _ = std::fs::write(folder.join("dxr-failed.txt"), err.to_string());
         }
         if let Err(why) = e.submit(work, Origin::Guest) {
             drop(e);
@@ -907,7 +907,7 @@ impl Engine {
         if mode != 1 {
             return Err("console ignores copy mode");
         }
-        if dst == 0 || src == 0 || dst % 256 != 0 || src % 256 != 0 {
+        if dst == 0 || src == 0 || !dst.is_multiple_of(256) || !src.is_multiple_of(256) {
             return Err("invalid compact address");
         }
         let s = self

@@ -157,10 +157,46 @@ fn dxr_ada_debug_layer() {
         assert!(status.success(), "isolated Ada gate failed");
         return;
     }
-    victory_shader::emit::host::enable_debug_layer().expect("Windows Graphics Tools required");
-    let name = "NVIDIA GeForce RTX 4070 Ti SUPER";
-    let h = victory_shader::emit::host::Host::on_adapter(name).unwrap();
-    assert_eq!(h.adapter_name().as_deref(), Some(name));
+    let require = std::env::var_os("VICTORY_REQUIRE_DXR_TESTS").is_some_and(|v| v == "1");
+    if let Err(e) = victory_shader::emit::host::enable_debug_layer() {
+        if require {
+            panic!("Windows Graphics Tools required: {e}");
+        }
+        eprintln!("skipping {NAME}: Windows Graphics Tools debug layer unavailable ({e})");
+        return;
+    }
+    let h = match std::env::var("VICTORY_D3D12_ADAPTER") {
+        Ok(name) if !name.trim().is_empty() => victory_shader::emit::host::Host::on_adapter(name.trim()),
+        _ => victory_shader::emit::host::Host::new(false),
+    };
+    let h = match h {
+        Ok(h) => h,
+        Err(e) => {
+            if require {
+                panic!("DXR 1.1 hardware adapter required: {e}");
+            }
+            eprintln!("skipping {NAME}: no SM 6.6 hardware adapter ({e})");
+            return;
+        }
+    };
+    let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    let tier_ok = unsafe {
+        h.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                (&raw mut o5).cast(),
+                size_of_val(&o5) as u32,
+            )
+            .is_ok()
+    } && o5.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0;
+    if !tier_ok {
+        if require {
+            panic!("adapter lacks DXR Tier 1.1");
+        }
+        eprintln!("skipping {NAME}: hardware adapter lacks DXR Tier 1.1");
+        return;
+    }
+    let name = h.adapter_name().unwrap_or_else(|| "unknown".to_owned());
     let _info = h
         .device
         .cast::<ID3D12InfoQueue>()

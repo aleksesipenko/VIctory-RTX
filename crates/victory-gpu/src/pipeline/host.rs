@@ -1527,6 +1527,23 @@ mod tests {
             }
         };
 
+        let software = unsafe {
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+                IDXGIAdapter1, IDXGIFactory4,
+            };
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+                .is_ok_and(|d| {
+                    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                        || (d.VendorId == 0x1414 && d.DeviceId == 0x8c)
+                })
+        };
+        if software {
+            eprintln!("WARP software adapter ignores OMSetDepthBounds with DepthEnable=false; PSO cache verified, draw skipped");
+            return;
+        }
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }
