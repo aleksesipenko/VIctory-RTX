@@ -150,6 +150,17 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(backend.as_encoded_bytes());
             bytes.push(0);
         }
+        // Non-default Wave64/SCC switches: only hashed when overriding their
+        // defaults so existing v2 caches remain valid when unset.
+        if std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0") {
+            bytes.extend_from_slice(b"VICTORY_WAVE_PAIRS=0\0");
+        }
+        if std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_some_and(|v| v == "0") {
+            bytes.extend_from_slice(b"VICTORY_WAVE_LDS_LOOSE=0\0");
+        }
+        if std::env::var_os("VICTORY_SCC_LOCAL_ANY").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_SCC_LOCAL_ANY=1\0");
+        }
         append_native_rt_key(&mut bytes, victory_shader::emit::native_rt(), |name| {
             std::env::var_os(name)
         });

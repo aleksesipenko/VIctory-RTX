@@ -33,10 +33,23 @@ pub fn requested() -> bool {
 }
 
 static UNRECORDED: AtomicU64 = AtomicU64::new(0);
+static EMPTY_TLAS_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn unrecorded(count: u64, reason: &str) {
     UNRECORDED.fetch_add(count, Relaxed);
     tracing::warn!(target:"victory_gpu::host", count,reason,"native RT capture failed");
+}
+
+pub(crate) fn note_empty_tlas_fallback(key: u64) {
+    let n = EMPTY_TLAS_FALLBACKS.fetch_add(1, Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        tracing::warn!(
+            target: "victory_gpu::host",
+            key = format_args!("{key:#x}"),
+            fallbacks = n,
+            "native TLAS missing for non-zero guest VA; bound empty TLAS"
+        );
+    }
 }
 
 pub(crate) fn prepare(batch: Captured, list: &crate::host::HostList) -> Arc<[Work]> {
@@ -368,7 +381,7 @@ impl Engine {
         tracing::info!(target:"victory_gpu::host", input_items, submitted_items=s.input+lost, pending_items,
             built=s.built, skipped=s.skipped, failed=s.failed+lost,
             dynamic_blas=s.dynamic, static_blas=s.static_blas,refits=s.refits,tlas=s.tlas,compacted=s.compacted+s.auto_compacted, auto_compacted=s.auto_compacted, auto_refused=s.auto_refused,
-            missing_blas=s.missing_blas,stale_tlas=s.stale, pending_batches=self.pending.len(), reasons=?s.reasons,
+            missing_blas=s.missing_blas,stale_tlas=s.stale, empty_tlas_fallbacks=EMPTY_TLAS_FALLBACKS.load(Relaxed), pending_batches=self.pending.len(), reasons=?s.reasons,
             slab_mb=memory::slab_bytes()>>20, local_bytes=local, non_local_bytes=other, budget_bytes=budget,
             limit_bytes=memory::limit(self.mem.cap,budget), local_peak_bytes=local_peak,
             non_local_delta=other as i64-self.mem.start[3] as i64,private_commit_delta=private as i64-self.private_start as i64,

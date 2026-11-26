@@ -4587,6 +4587,9 @@ fn make_twinned(
             tlas_srv(device, &target, at);
             target
         } else {
+            if key != 0 {
+                crate::dxr::note_empty_tlas_fallback(key);
+            }
             empty_tlas_srv(host, at)?
         };
         #[cfg(feature = "diagnostics")]

@@ -229,16 +229,20 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// Series X on a 1080p set lists a 1080p mode), else `VICTORY_OUTPUT=WxH`
+/// when set (so title UI/menus match the target output resolution instead of
+/// clipping at 4K; provenance: Rubenpannen/VIctory-RTX5070 9f2fd8c, GPL-3.0),
+/// else 3840x2160.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
+        let parse = |name: &str| {
+            std::env::var(name).ok().and_then(|v| {
+                let (w, h) = v.trim().split_once(['x', 'X'])?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            })
+        };
+        let asked = parse("VICTORY_DISPLAY_MODE").or_else(|| parse("VICTORY_OUTPUT"));
         let size = match asked {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
             _ => (3840, 2160),
