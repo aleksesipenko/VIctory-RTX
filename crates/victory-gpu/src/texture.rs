@@ -1633,50 +1633,78 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
-/// Largest texture [`fingerprint_for`] reads whole when its slot is live.
-const LIVE_WHOLE_BYTES: u64 = 4 << 20;
+/// Largest texture [`fingerprint_for`] reads whole when dense/live
+/// fingerprinting is requested (covers 1080p RGBA ~8.3 MiB and matches
+/// `draw::LIVE_PASS_BUDGET_BYTES`).
+pub(crate) const LIVE_WHOLE_BYTES: u64 = 16 << 20;
 
-/// Bytes [`fingerprint_for`] reads from title memory for `(len, whole)`.
-pub(crate) fn fingerprint_bytes(len: u64, whole: bool) -> u64 {
-    if whole && len <= LIVE_WHOLE_BYTES {
+/// Uniform grid sampled by [`fingerprint_for`] for dense/live textures larger
+/// than [`LIVE_WHOLE_BYTES`]: 64 evenly-spaced 4 KiB slices (256 KiB total).
+const LIVE_GRID_SLICES: usize = 64;
+const LIVE_GRID_SLICE_BYTES: usize = 4 << 10;
+const LIVE_GRID_BYTES: u64 = (LIVE_GRID_SLICES * LIVE_GRID_SLICE_BYTES) as u64;
+
+/// Bytes [`fingerprint_for`] reads from title memory for `(len, dense)`.
+pub(crate) fn fingerprint_bytes(len: u64, dense: bool) -> u64 {
+    if !dense {
+        len.min(3 * (16 << 10))
+    } else if len <= LIVE_WHOLE_BYTES {
         len
     } else {
-        len.min(3 * (16 << 10))
+        LIVE_GRID_BYTES
     }
 }
 
-/// [`fingerprint`], or for a live slot (one found changing after its upload)
-/// no larger than 4 MiB, one of all of its memory (GPL-3.0 provenance:
+/// [`fingerprint`], or for a dense/live slot: all bytes up to
+/// [`LIVE_WHOLE_BYTES`] (16 MiB), and above 16 MiB a uniform 64×4 KiB grid
+/// (256 KiB) spanning the entire texture (GPL-3.0 base:
 /// avatarmanz/VIctory-7900XTX #390). The three 16 KiB windows miss a video
 /// plane's change when its start, middle and end rows are a still background
 /// (a TV news shot: the reporter moves between them), so a plane looked
 /// unchanged and waited while the other planes of the same video frame were
 /// uploaded: one frame's luma under another's chroma.
-pub(crate) fn fingerprint_for(at: u64, len: u64, live: bool) -> u64 {
-    if !live || len > LIVE_WHOLE_BYTES {
+pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
+    if !dense {
         return fingerprint(at, len);
     }
     const CHUNK: usize = 64 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    let len_u64 = len;
     let len = len as usize;
     let mut print = 0u128;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(CHUNK, 0);
-        let mut from = 0;
-        while from < len {
-            let bytes = CHUNK.min(len - from);
-            read[..bytes].fill(0);
-            crate::host::copy_mapped(
-                read.as_mut_ptr(),
-                (at as usize).wrapping_add(from) as *const u8,
-                bytes,
-                false,
-            );
-            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
-            from += bytes;
+        if len_u64 <= LIVE_WHOLE_BYTES {
+            read.resize(CHUNK, 0);
+            let mut from = 0;
+            while from < len {
+                let bytes = CHUNK.min(len - from);
+                read[..bytes].fill(0);
+                crate::host::copy_mapped(
+                    read.as_mut_ptr(),
+                    (at as usize).wrapping_add(from) as *const u8,
+                    bytes,
+                    false,
+                );
+                print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+                from += bytes;
+            }
+        } else {
+            read.resize(LIVE_GRID_SLICE_BYTES, 0);
+            let span = len - LIVE_GRID_SLICE_BYTES;
+            for i in 0..LIVE_GRID_SLICES {
+                let from = (i as u128 * span as u128 / (LIVE_GRID_SLICES - 1) as u128) as usize;
+                read[..LIVE_GRID_SLICE_BYTES].fill(0);
+                crate::host::copy_mapped(
+                    read.as_mut_ptr(),
+                    (at as usize).wrapping_add(from) as *const u8,
+                    LIVE_GRID_SLICE_BYTES,
+                    false,
+                );
+                print = print.rotate_left(37) ^ digest(&read[..LIVE_GRID_SLICE_BYTES]).0;
+            }
         }
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
@@ -1709,7 +1737,14 @@ fn staged_from(resource: This) -> u32 {
 /// (Of 787 repeated uploads of a frame that streams 398 were equal in every
 /// byte, and a texture uploaded again costs a staging buffer, a detiling and
 /// a copy more than this look.) `VICTORY_TEXTURE_SAME=0`: not asked.
-pub(crate) fn unchanged(resource: This, first: u32) -> bool {
+/// Enforces `budget` strictly before reading: if `*hashed_bytes + size > budget`
+/// the whole-buffer read is skipped and `false` is returned.
+pub(crate) fn unchanged(
+    resource: This,
+    first: u32,
+    hashed_bytes: &mut u64,
+    budget: u64,
+) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
         return false;
@@ -1730,8 +1765,12 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
     if from > crate::resource::read_from(layout, first).max(copy.base) {
         return false;
     }
-    let size = layout.bytes_from(from) as usize;
-    with_read(size, |read| {
+    let size = layout.bytes_from(from);
+    if hashed_bytes.saturating_add(size) > budget {
+        return false;
+    }
+    *hashed_bytes = hashed_bytes.saturating_add(size);
+    with_read(size as usize, |read| {
         if crate::host::read_there(memory, read) == 0 {
             return false;
         }
@@ -2162,10 +2201,13 @@ mod title_memory_tests {
         }
     }
 
-    /// A live fingerprint sees a change between the three 16 KiB strips that
-    /// the plain fingerprint misses, and stays non-zero.
+    /// Dense live fingerprinting hashes textures up to 16 MiB (e.g. 8.5 MiB
+    /// 1080p RGBA) in full, and above 16 MiB uses a 64×4 KiB uniform grid
+    /// (256 KiB <= 16 MiB) that catches mid-buffer changes missed by the three
+    /// 16 KiB strips.
     #[test]
     fn fingerprint_for_catches_changes_between_strips_when_live() {
+        // 1) Small 256 KiB plane: mid-strip change caught in full.
         let mut plane = vec![0x22u8; 256 << 10];
         let at = plane.as_ptr() as u64;
         let len = plane.len() as u64;
@@ -2173,18 +2215,43 @@ mod title_memory_tests {
         let live_before = super::fingerprint_for(at, len, true);
         assert_ne!(plain_before, 0);
         assert_ne!(live_before, 0);
-        // Offset 48 KiB lies strictly between the start (0..16 KiB) and
-        // middle (128..144 KiB) strips.
+        assert_eq!(super::fingerprint_bytes(len, true), len);
+        // Offset 48 KiB lies strictly between start (0..16 KiB) and middle (128..144 KiB).
         plane[48 << 10] ^= 0xff;
         assert_eq!(super::fingerprint_for(at, len, false), plain_before);
         assert_ne!(super::fingerprint_for(at, len, true), live_before);
-        // Oversized (> 4 MiB) falls back to the three-strip fingerprint.
-        let mut big = vec![0x11u8; (super::LIVE_WHOLE_BYTES as usize) + (64 << 10)];
+
+        // 2) 8.5 MiB HD RGBA plane (<= 16 MiB): hashed in full.
+        let hd_len = (8 << 20) + (512 << 10);
+        let mut hd = vec![0x33u8; hd_len];
+        let hd_at = hd.as_ptr() as u64;
+        assert_eq!(super::fingerprint_bytes(hd_len as u64, true), hd_len as u64);
+        let hd_plain = super::fingerprint_for(hd_at, hd_len as u64, false);
+        let hd_live = super::fingerprint_for(hd_at, hd_len as u64, true);
+        // Offset 2 MiB + 123 lies strictly between the 3 strips.
+        hd[(2 << 20) + 123] ^= 0xaa;
+        assert_eq!(super::fingerprint_for(hd_at, hd_len as u64, false), hd_plain);
+        assert_ne!(super::fingerprint_for(hd_at, hd_len as u64, true), hd_live);
+
+        // 3) 17 MiB (> 16 MiB): dense 64×4 KiB uniform grid (256 KiB <= 16 MiB).
+        let big_len = 17 << 20;
+        let mut big = vec![0x11u8; big_len];
         let big_at = big.as_ptr() as u64;
-        let big_len = big.len() as u64;
-        let big_before = super::fingerprint_for(big_at, big_len, true);
-        big[48 << 10] ^= 0xff;
-        assert_eq!(super::fingerprint_for(big_at, big_len, true), big_before);
+        let grid_cost = super::fingerprint_bytes(big_len as u64, true);
+        assert_eq!(grid_cost, super::LIVE_GRID_BYTES);
+        assert!(grid_cost <= super::LIVE_WHOLE_BYTES);
+        let big_plain = super::fingerprint_for(big_at, big_len as u64, false);
+        let big_live = super::fingerprint_for(big_at, big_len as u64, true);
+        // Interior grid slice i=16 (~4.3 MiB): strictly between start and middle strips.
+        let span = big_len - super::LIVE_GRID_SLICE_BYTES;
+        let slice_16 = (16u128 * span as u128 / (super::LIVE_GRID_SLICES - 1) as u128) as usize;
+        big[slice_16 + 17] ^= 0xff;
+        assert_eq!(super::fingerprint_for(big_at, big_len as u64, false), big_plain);
+        assert_ne!(
+            super::fingerprint_for(big_at, big_len as u64, true),
+            big_live,
+            "dense uniform grid must catch mid-buffer changes above 16 MiB"
+        );
     }
 }
 
