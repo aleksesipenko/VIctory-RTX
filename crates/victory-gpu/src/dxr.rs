@@ -606,13 +606,14 @@ impl Engine {
         if key != 0 {
             self.replace(key, None);
         } else if matches!(&w.op, Op::Rejected { .. }) {
-            // Do not wipe all already-built world BLAS entries on one rejected
-            // call in live gameplay; only strict certification clears the table.
+            // In strict certification mode clear everything; in live gameplay
+            // drop TLAS entries so no stale TLAS persists while keeping built BLASes.
             if strict_tlas() {
                 self.entries.retain(|&k, _| k == 0);
                 self.table = None;
             } else {
-                tracing::warn!(target: "victory_gpu::host", why, "native RT rejected batch without destination VA; keeping existing AS entries");
+                self.entries.retain(|&k, e| k == 0 || !e.top);
+                tracing::warn!(target: "victory_gpu::host", why, "native RT rejected batch without destination VA; invalidated TLAS entries");
             }
         }
     }

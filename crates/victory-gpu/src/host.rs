@@ -2472,6 +2472,10 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Non-COM host objects referenced by commands recorded in this list
+    /// (for example, NGX DLSS features), kept alive until the list is reset.
+    #[cfg(feature = "dlss")]
+    kept_any: Vec<Box<dyn std::any::Any + Send>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -7256,6 +7260,10 @@ impl HostList {
             {
                 return false;
             }
+            #[cfg(feature = "dlss")]
+            if !deferred.kept_any.is_empty() {
+                return false;
+            }
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -7718,6 +7726,12 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Keeps a non-COM host object alive until the list is reset.
+    #[cfg(feature = "dlss")]
+    pub(crate) fn keep_any(&self, object: Box<dyn std::any::Any + Send>) {
+        self.deferred().kept_any.push(object);
     }
 
     /// Whether this is the first time since the reset that the list asks

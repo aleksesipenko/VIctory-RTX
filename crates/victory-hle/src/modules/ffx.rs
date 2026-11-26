@@ -16,6 +16,7 @@
 //! a pointer, a 32-byte description and a state.
 
 use std::ffi::{c_char, c_void};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// The DLL whose upscale entry points are taken.
@@ -26,15 +27,40 @@ static REAL_DESTROY: AtomicUsize = AtomicUsize::new(0);
 static REAL_QUERY: AtomicUsize = AtomicUsize::new(0);
 static REAL_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 
-/// Sentinel storage whose address serves as our synthetic upscale context.
-static OUR_CONTEXT: u64 = 0x5649_4354_444C_5353;
+/// Active synthetic upscale contexts and their `CreateUpscale.flags`.
+static OUR_CONTEXTS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
-fn our_context_ptr() -> *mut c_void {
-    (&raw const OUR_CONTEXT).cast_mut().cast()
+fn alloc_our_context(flags: u32) -> *mut c_void {
+    let ptr = Box::into_raw(Box::new(0x5649_4354_444C_5353u64)).cast::<c_void>();
+    OUR_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((ptr as usize, flags));
+    ptr
+}
+
+fn free_our_context(ptr: *mut c_void) -> bool {
+    let mut list = OUR_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pos) = list.iter().position(|&(p, _)| p == ptr as usize) else {
+        return false;
+    };
+    list.swap_remove(pos);
+    // SAFETY: allocated by `Box::into_raw` in `alloc_our_context`.
+    unsafe { drop(Box::from_raw(ptr.cast::<u64>())) };
+    true
+}
+
+fn our_context_flags(ptr: *mut c_void) -> Option<u32> {
+    OUR_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|&&(p, _)| p == ptr as usize)
+        .map(|&(_, flags)| flags)
 }
 
 fn is_our_context(ptr: *mut c_void) -> bool {
-    ptr == our_context_ptr()
+    our_context_flags(ptr).is_some()
 }
 
 /// Records one of the title DLL's real entry points for pass-through.
@@ -240,8 +266,6 @@ fn jitter_offset(index: i32, phase_count: i32) -> (f32, f32) {
     (halton(idx, 2) - 0.5, halton(idx, 3) - 0.5)
 }
 
-static CREATE_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 extern "system" fn create_context(
     context: *mut *mut c_void,
     desc: *const Header,
@@ -254,9 +278,8 @@ extern "system" fn create_context(
     {
         // SAFETY: an upscale creation descriptor, by its type.
         let c = unsafe { &*desc.cast::<CreateUpscale>() };
-        CREATE_FLAGS.store(c.flags, Ordering::Relaxed);
         // SAFETY: out pointer from caller.
-        unsafe { *context = our_context_ptr() };
+        unsafe { *context = alloc_our_context(c.flags) };
         tracing::info!(
             max_render = ?c.max_render,
             max_output = ?c.max_output,
@@ -274,7 +297,7 @@ extern "system" fn create_context(
 
 extern "system" fn destroy_context(context: *mut *mut c_void, mem_cb: *const c_void) -> u32 {
     // SAFETY: caller's context pointer.
-    if !context.is_null() && is_our_context(unsafe { *context }) {
+    if !context.is_null() && free_our_context(unsafe { *context }) {
         unsafe { *context = std::ptr::null_mut() };
         return OK;
     }
@@ -450,7 +473,12 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     near: d.camera_near,
                     far: d.camera_far,
                     frame_ms: d.frame_time_delta,
-                    create_flags: CREATE_FLAGS.load(Ordering::Relaxed),
+                    create_flags: if !context.is_null() {
+                        // SAFETY: caller's context pointer.
+                        our_context_flags(unsafe { *context }).unwrap_or(0)
+                    } else {
+                        0
+                    },
                     dlss: want_dlss(),
                 };
                 if victory_gpu::list::upscale(d.list, &up) {

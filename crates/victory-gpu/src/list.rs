@@ -1096,7 +1096,7 @@ pub(super) fn upscale_now(this: This, up: &Upscale) -> bool {
                 frame_ms: up.frame_ms,
                 create_flags: up.create_flags,
             };
-            done = crate::dlss::record(&host.device, &list.list, &inputs);
+            done = crate::dlss::record(&host.device, list, &inputs);
         }
         if !done {
             done = crate::stretch::record_stretch(&host.device, &list.list, to, from, up.render);

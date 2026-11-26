@@ -225,11 +225,15 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
             let bytes = &now.to_le_bytes()[here.clone()];
             if bytes == patch {
                 // (Another thread's fault at the same place: done already.)
+                note_patched(at);
                 break true;
             }
             let Some(new) = (bytes == was).then(|| with_patch(now, at, &patch)).flatten() else {
                 break false;
             };
+            // Publish before writing bytes so a concurrent `#UD` on another thread
+            // waiting on `PATCHING` always observes `at` as patched.
+            note_patched(at);
             let there = std::arch::x86_64::cmpxchg16b(word, now, new, SeqCst, SeqCst);
             if there == now {
                 break true;
@@ -427,8 +431,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
     let Some((what, len)) = decode::decode(code) else {
-        // Another thread may have concurrently patched this exact instruction
-        // while this thread was entering the #UD handler; retry execution at `rip`.
+        // Synchronize with any concurrent in-place patch before checking
+        // `PATCHED_SITES` so a sibling thread faulting mid-patch never slips through.
+        let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
         if is_patched(rip) {
             return CONTINUE_EXECUTION;
         }
@@ -457,9 +462,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // SAFETY: the instruction's own bytes, made writable for the patch and restored.
             unsafe {
                 if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                    note_patched(rip);
                     std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
                     VirtualProtect(rip as *const _, len, old, &mut old);
-                    note_patched(rip);
                 }
             }
         }

@@ -102,10 +102,12 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
-        // With the band asked for and no share, the band's level.
-        Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
-        set => set,
+    *SET.get_or_init(|| match std::env::var("VICTORY_AMBIENT") {
+        // Only fall back to the RT band's default level when `VICTORY_AMBIENT`
+        // is unset or empty; explicit `0`/`off` keeps ambient disabled.
+        Err(_) => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        Ok(raw) if raw.trim().is_empty() => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        Ok(raw) => parse(&raw),
     })
 }
 

@@ -18,12 +18,13 @@
 //! [DLSS 4 Transformer], `L`=12 [DLSS 4.5 UltraPerf], `M`=13 [DLSS 4.5
 //! Transformer], or `default`/unset), `VICTORY_DLSS_MV_SIGN=-1` (motion vectors
 //! the other way), `VICTORY_DLSS_JITTER_SIGN=-1`,
-//! `VICTORY_DLSS_MV_JITTERED=0|1` (default 1), `VICTORY_DLSS_HDR=0|1` (default:
-//! by the colour format), `VICTORY_DLSS_DEPTH_INVERTED=0|1` (default: by
-//! near > far), `VICTORY_DLSS_SHARPNESS=<0..1>`.
+//! `VICTORY_DLSS_MV_JITTERED=0|1` (default: from FFX create flags),
+//! `VICTORY_DLSS_HDR=0|1` (default: by the colour format),
+//! `VICTORY_DLSS_DEPTH_INVERTED=0|1` (default: by near > far),
+//! `VICTORY_DLSS_SHARPNESS=<0..1>`.
 
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -114,25 +115,45 @@ struct Feature {
     key: [u32; 5],
 }
 
-/// Defers `NVSDK_NGX_D3D12_ReleaseFeature` until in-flight GPU command lists
-/// that evaluated the previous feature have completed (`crate::host::retire`).
-struct RetiredFeature(*mut c_void);
+// SAFETY: `handle` is only passed to NGX calls under `DLSS`; when the last
+// `Arc<Feature>` drops (on whichever thread resets the last `HostList` that
+// recorded it), `Drop` only queues the raw handle into `RETIRED_HANDLES` for
+// `NVSDK_NGX_D3D12_ReleaseFeature` under `DLSS`.
+unsafe impl Send for Feature {}
+unsafe impl Sync for Feature {}
 
-// SAFETY: NGX feature handle retired only after GPU submissions complete.
-unsafe impl Send for RetiredFeature {}
+/// Feature handles whose cache slot and every recording `HostList` have been
+/// released; drained strictly under `DLSS` so NGX calls stay serialized.
+static RETIRED_HANDLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-impl Drop for RetiredFeature {
+impl Drop for Feature {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: handle created by `NVSDK_NGX_D3D12_CreateFeature`.
-            unsafe { NVSDK_NGX_D3D12_ReleaseFeature(self.0) };
+        if !self.handle.is_null() {
+            RETIRED_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).push(self.handle as usize);
         }
+    }
+}
+
+/// Releases queued NGX feature handles. Caller must hold `DLSS`.
+fn drain_retired() {
+    let handles = {
+        let mut q = RETIRED_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+        if q.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *q)
+    };
+    for raw in handles {
+        // SAFETY: `DLSS` mutex is held; handle came from
+        // `NVSDK_NGX_D3D12_CreateFeature` and every `HostList` referencing it
+        // has finished and been reset or dropped.
+        unsafe { NVSDK_NGX_D3D12_ReleaseFeature(raw as *mut c_void) };
     }
 }
 
 struct Dlss {
     params: *mut c_void,
-    feature: Option<Feature>,
+    feature: Option<Arc<Feature>>,
 }
 
 // SAFETY: the SDK's objects are used under the mutex only.
@@ -251,12 +272,13 @@ fn init(device: &ID3D12Device) -> Option<Dlss> {
 /// Records DLSS over `inputs` into `list`; false if it could not (the caller
 /// stretches instead). The list's descriptor heaps and root state are the
 /// SDK's afterwards: the caller replays the title's.
-pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, inputs: &Inputs<'_>) -> bool {
+pub(crate) fn record(device: &ID3D12Device, list: &crate::host::HostList, inputs: &Inputs<'_>) -> bool {
     let mut guard = DLSS.lock().unwrap_or_else(|e| e.into_inner());
     let dlss = match guard.get_or_insert_with(|| init(device)) {
         Some(d) => d,
         None => return false,
     };
+    drain_retired();
     // SAFETY: live resources.
     let (out, colour) = unsafe { (inputs.output.GetDesc(), inputs.colour.GetDesc()) };
     let render = [
@@ -286,9 +308,10 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
     let key = [in_w, in_h, out.Width as u32, out.Height, flags as u32];
     let p = dlss.params;
     if dlss.feature.as_ref().is_none_or(|f| f.key != key) {
-        if let Some(old) = dlss.feature.take() {
-            crate::host::retire(RetiredFeature(old.handle));
-        }
+        // Dropping the cached `Arc` queues the handle for NGX release only
+        // once every `HostList` that recorded it has finished and reset.
+        drop(dlss.feature.take());
+        drain_retired();
         let quality = env_i("VICTORY_DLSS_QUALITY").unwrap_or_else(|| auto_quality(render[0], out.Width as u32));
         let preset = dlss_preset();
         let mut handle = std::ptr::null_mut();
@@ -311,7 +334,7 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
                 NVSDK_NGX_Parameter_SetUI(p, name!("DLSS.Hint.Render.Preset.UltraPerformance"), *code);
                 NVSDK_NGX_Parameter_SetUI(p, name!("DLSS.Hint.Render.Preset.UltraQuality"), *code);
             }
-            NVSDK_NGX_D3D12_CreateFeature(list.as_raw(), FEATURE_SUPER_SAMPLING, p, &mut handle)
+            NVSDK_NGX_D3D12_CreateFeature(list.list.as_raw(), FEATURE_SUPER_SAMPLING, p, &mut handle)
         };
         if r != SUCCESS || handle.is_null() {
             tracing::warn!(result = format_args!("{r:#x}"), ?key, "DLSS: no feature for these sizes; this upscale stays a stretch");
@@ -331,9 +354,10 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
             colour_format = colour.Format.0,
             "DLSS: feature made"
         );
-        dlss.feature = Some(Feature { handle, key });
+        dlss.feature = Some(Arc::new(Feature { handle, key }));
     }
     let Some(feature) = dlss.feature.as_ref() else { return false };
+    list.keep_any(Box::new(Arc::clone(feature)));
     let mv = env_f("VICTORY_DLSS_MV_SIGN", 1.0);
     let jit = env_f("VICTORY_DLSS_JITTER_SIGN", 1.0);
     let raw = |r: Option<&ID3D12Resource>| r.map_or(std::ptr::null_mut(), |r| r.as_raw());
@@ -355,7 +379,7 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
         NVSDK_NGX_Parameter_SetF(p, name!("FrameTimeDeltaInMsec"), inputs.frame_ms);
         NVSDK_NGX_Parameter_SetUI(p, name!("DLSS.Render.Subrect.Dimensions.Width"), render[0].min(in_w));
         NVSDK_NGX_Parameter_SetUI(p, name!("DLSS.Render.Subrect.Dimensions.Height"), render[1].min(in_h));
-        NVSDK_NGX_D3D12_EvaluateFeature_C(list.as_raw(), feature.handle, p, std::ptr::null())
+        NVSDK_NGX_D3D12_EvaluateFeature_C(list.list.as_raw(), feature.handle, p, std::ptr::null())
     };
     if r != SUCCESS {
         static TOLD: std::sync::Once = std::sync::Once::new();
