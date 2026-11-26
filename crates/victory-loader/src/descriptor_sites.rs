@@ -101,7 +101,7 @@ fn stub(store: &[u8], at: usize, to: usize, marks: usize) -> Option<Vec<u8>> {
     out.extend([0x48, 0x8b, 0x4a, 0x18]); // mov rcx, [rdx+24]
     out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
     out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
-    let back = crate::console_insn::jump(to + out.len(), at + store.len())?;
+    let back = crate::reach::jump(to + out.len(), at + store.len())?;
     out.extend(back);
     Some(out)
 }
@@ -142,17 +142,17 @@ pub unsafe fn apply(base: usize, size: usize, marks: usize, sites: &[Site]) -> V
             }
             let at = window + site.store;
             if room.is_none() {
-                room = crate::console_insn::near(at).map(|place| (place, 0));
+                room = crate::reach::near(at).map(|place| (place, 0));
             }
             let Some((place, used)) = room.as_mut() else {
                 return Hooked::Failed("no room for code near the title's");
             };
             let to = *place + *used;
             let store = &site.bytes[site.store..site.store + site.len];
-            let (Some(body), Some(jump)) = (stub(store, at, to, marks), crate::console_insn::jump(at, to)) else {
+            let (Some(body), Some(jump)) = (stub(store, at, to, marks), crate::reach::jump(at, to)) else {
                 return Hooked::Failed("not a store of the expected form, or out of reach");
             };
-            if *used + body.len() > crate::console_insn::STUBS_LEN {
+            if *used + body.len() > crate::reach::STUBS_LEN {
                 return Hooked::Failed("no room for code near the title's");
             }
             let mut old = 0;

@@ -1303,7 +1303,25 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }
+    if newer {
+        f[0xb8 / 8] = suspend as *const ();
+        f[0xc0 / 8] = resume as *const ();
+    }
     f
+}
+
+/// The newer layout's suspend and resume of a queue (0xb8, 0xc0; see [`newer_slot`]): the
+/// title suspends its queues as it is suspended, which ends it here (it called 0xb8 last,
+/// from title+0x24900a5, and was told the method is missing). Nothing is held back on the
+/// host: the queue goes on as it was, and the title ends right after.
+/// shortcut: a resume after a suspend has nothing to restart.
+extern "system" fn suspend(_: This, _flags: u32) -> HRESULT {
+    S_OK
+}
+
+/// See [`suspend`].
+extern "system" fn resume(_: This) -> HRESULT {
+    S_OK
 }
 
 static FUNCTIONS: Table<36> = Table(queue_table(false));
