@@ -272,10 +272,21 @@ impl Recording {
 
     /// Translates what there is.
     fn run(&self) {
-        self.run_with(crate::pipeline::bound);
+        self.run_with(crate::pipeline::bound, |back, chunk, left, dxr| {
+            translate(back, chunk, left, dxr)
+        });
     }
 
-    fn run_with(&self, mut on_pipeline: impl FnMut(This)) {
+    fn run_with<P, T>(&self, mut on_pipeline: P, mut on_translate: T)
+    where
+        P: FnMut(This),
+        T: FnMut(
+            This,
+            &[u64],
+            &dyn Fn() -> bool,
+            &mut dyn FnMut() -> Option<crate::dxr::Captured>,
+        ) -> (u64, bool),
+    {
         struct RunningGuard<'a>(&'a Recording);
         impl Drop for RunningGuard<'_> {
             fn drop(&mut self) {
@@ -352,12 +363,9 @@ impl Recording {
                 }
                 Step::Translate { chunk, back } => {
                     let began = std::time::Instant::now();
-                    let (calls, closed) = translate(
-                        back,
-                        &chunk,
-                        || self.abandoned.load(Acquire),
-                        || held(&self.inner).dxr.pop_front(),
-                    );
+                    let left = || self.abandoned.load(Acquire);
+                    let mut dxr = || held(&self.inner).dxr.pop_front();
+                    let (calls, closed) = on_translate(back, &chunk, &left, &mut dxr);
                     STATS[0].fetch_add(calls, Relaxed);
                     STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
                     let mut inner = held(&self.inner);
@@ -1148,10 +1156,13 @@ mod tests {
             inner.scheduled = true;
         }
         let mut saw_pipeline = None;
-        rec.run_with(|p| {
-            assert!(!rec.done(), "pipeline::bound must run before done is published");
-            saw_pipeline = Some(p);
-        });
+        rec.run_with(
+            |p| {
+                assert!(!rec.done(), "pipeline::bound must run before done is published");
+                saw_pipeline = Some(p);
+            },
+            |_, _, _, _| unreachable!("empty recording must take fast-path"),
+        );
         assert_eq!(saw_pipeline, Some(sentinel));
         assert!(rec.done());
         assert!(rec.back().is_null());
@@ -1164,7 +1175,10 @@ mod tests {
             inner.scheduled = true;
         }
         let mut called = false;
-        abandoned.run_with(|_| called = true);
+        abandoned.run_with(
+            |_| called = true,
+            |_, _, _, _| unreachable!("abandoned empty recording must take fast-path"),
+        );
         assert!(!called, "abandoned recording must not dereference pipeline");
         assert!(abandoned.done());
         assert!(abandoned.back().is_null());
@@ -1193,13 +1207,16 @@ mod tests {
             let entered = entered.clone();
             let pipeline_done = pipeline_done.clone();
             std::thread::spawn(move || {
-                rec.run_with(|p| {
-                    assert_eq!(p as usize, sentinel_addr);
-                    assert!(!rec.done());
-                    entered.wait();
-                    release_rx.recv().unwrap();
-                    pipeline_done.store(true, Release);
-                });
+                rec.run_with(
+                    |p| {
+                        assert_eq!(p as usize, sentinel_addr);
+                        assert!(!rec.done());
+                        entered.wait();
+                        release_rx.recv().unwrap();
+                        pipeline_done.store(true, Release);
+                    },
+                    |_, _, _, _| unreachable!("empty recording must take fast-path"),
+                );
             })
         };
 
@@ -1246,5 +1263,94 @@ mod tests {
         );
         assert!(rec.done());
         assert!(rec.back().is_null());
+    }
+
+    /// A concurrent `abandon()` also waits until an in-flight non-empty
+    /// `translate` step finishes before returning.
+    #[test]
+    fn abandon_waits_for_in_flight_non_empty_translate() {
+        let sentinel_back = 0xdead_beefusize;
+        let rec = Arc::new(Recording::new(0));
+        {
+            let mut inner = held(&rec.inner);
+            inner.back = sentinel_back;
+            inner.chunks.push_back(vec![
+                RESET | (1 << 16),
+                0,
+                (Plain::TOPOLOGY as u64) | (1 << 16),
+                4,
+                CLOSE,
+            ]);
+            inner.scheduled = true;
+        }
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let translate_done = Arc::new(AtomicBool::new(false));
+        let abandon_returned = Arc::new(AtomicBool::new(false));
+        let saw_translate_done_after_abandon = Arc::new(AtomicBool::new(false));
+
+        let worker = {
+            let rec = rec.clone();
+            let entered = entered.clone();
+            let translate_done = translate_done.clone();
+            std::thread::spawn(move || {
+                rec.run_with(
+                    |_| unreachable!("non-empty chunk must not hit empty fast-path"),
+                    |back, chunk, left, _dxr| {
+                        assert_eq!(back as usize, sentinel_back);
+                        assert_eq!(chunk.len(), 5);
+                        assert!(!left());
+                        entered.wait();
+                        release_rx.recv().unwrap();
+                        assert!(left(), "abandon() flag must be visible inside translate");
+                        translate_done.store(true, Release);
+                        (3, true)
+                    },
+                );
+            })
+        };
+
+        entered.wait();
+
+        let abandon_entered = Arc::new(std::sync::Barrier::new(2));
+        let abandoner = {
+            let rec = rec.clone();
+            let abandon_entered = abandon_entered.clone();
+            let translate_done = translate_done.clone();
+            let abandon_returned = abandon_returned.clone();
+            let saw_translate_done_after_abandon = saw_translate_done_after_abandon.clone();
+            std::thread::spawn(move || {
+                abandon_entered.wait();
+                rec.abandon();
+                saw_translate_done_after_abandon.store(translate_done.load(Acquire), Release);
+                abandon_returned.store(true, Release);
+            })
+        };
+
+        abandon_entered.wait();
+        while !rec.abandoned.load(Acquire) {
+            std::thread::yield_now();
+        }
+        {
+            let inner = held(&rec.inner);
+            assert!(inner.running);
+            assert!(
+                !abandon_returned.load(Acquire),
+                "abandon() must not return while translate runs"
+            );
+        }
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        abandoner.join().unwrap();
+        assert!(abandon_returned.load(Acquire));
+        assert!(translate_done.load(Acquire));
+        assert!(
+            saw_translate_done_after_abandon.load(Acquire),
+            "abandon() returned before non-empty translate finished"
+        );
+        assert!(rec.done());
+        // Clear dummy sentinel before `Drop for Recording` runs.
+        held(&rec.inner).back = 0;
     }
 }

@@ -1655,6 +1655,23 @@ pub(crate) fn fingerprint_bytes(len: u64, dense: bool) -> u64 {
     }
 }
 
+/// Non-periodic 64-bit SplitMix64-style avalanche mixer for combining each
+/// chunk digest with its chunk/slice index so identical changes spaced at
+/// periodic multiples (e.g. 64 × 64 KiB = 4 MiB) never cancel out.
+#[inline]
+fn mix_chunk(acc: u64, chunk: u128, index: usize) -> u64 {
+    let lo = chunk as u64;
+    let hi = (chunk >> 64) as u64;
+    let mixed = lo ^ hi.rotate_left(31) ^ (index as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let mut acc = acc
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(mixed);
+    acc ^= acc >> 30;
+    acc = acc.wrapping_mul(0x94D0_49BB_1331_11EB);
+    acc ^= acc >> 27;
+    acc
+}
+
 /// [`fingerprint`], or for a dense/live slot: all bytes up to
 /// [`LIVE_WHOLE_BYTES`] (16 MiB), and above 16 MiB a uniform 64×4 KiB grid
 /// (256 KiB) spanning the entire texture (GPL-3.0 base:
@@ -1673,12 +1690,13 @@ pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
     }
     let len_u64 = len;
     let len = len as usize;
-    let mut print = 0u128;
+    let mut acc = len_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if len_u64 <= LIVE_WHOLE_BYTES {
             read.resize(CHUNK, 0);
             let mut from = 0;
+            let mut index = 0usize;
             while from < len {
                 let bytes = CHUNK.min(len - from);
                 read[..bytes].fill(0);
@@ -1688,8 +1706,9 @@ pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
                     bytes,
                     false,
                 );
-                print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+                acc = mix_chunk(acc, digest(&read[..bytes]).0, index);
                 from += bytes;
+                index += 1;
             }
         } else {
             read.resize(LIVE_GRID_SLICE_BYTES, 0);
@@ -1703,12 +1722,11 @@ pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
                     LIVE_GRID_SLICE_BYTES,
                     false,
                 );
-                print = print.rotate_left(37) ^ digest(&read[..LIVE_GRID_SLICE_BYTES]).0;
+                acc = mix_chunk(acc, digest(&read[..LIVE_GRID_SLICE_BYTES]).0, i);
             }
         }
     });
-    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
-    u64::from_le_bytes(first) | 1
+    acc | 1
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -2251,6 +2269,24 @@ mod title_memory_tests {
             super::fingerprint_for(big_at, big_len as u64, true),
             big_live,
             "dense uniform grid must catch mid-buffer changes above 16 MiB"
+        );
+    }
+
+    /// Identical flips spaced exactly 4 MiB apart (64 × 64 KiB chunks) in an
+    /// 8 MiB buffer must not cancel out in `fingerprint_for`.
+    #[test]
+    fn fingerprint_for_has_no_4mib_periodic_collision() {
+        let len = 8usize << 20;
+        let mut buf = vec![0x55u8; len];
+        let at = buf.as_ptr() as u64;
+        let before = super::fingerprint_for(at, len as u64, true);
+        let offset = 0x1234usize;
+        buf[offset] ^= 0xff;
+        buf[offset + (4 << 20)] ^= 0xff;
+        let after = super::fingerprint_for(at, len as u64, true);
+        assert_ne!(
+            after, before,
+            "identical flips spaced 4 MiB apart must not collide"
         );
     }
 }

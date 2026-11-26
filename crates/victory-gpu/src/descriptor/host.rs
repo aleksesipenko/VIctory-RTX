@@ -1197,32 +1197,35 @@ impl TextureQueue {
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
     ///
-    /// Reserves fair capacity so dense/live slots take at most `max / 2` when
-    /// non-live (`Plain` recheck, `later`/`partly`, `fresh`) slots are waiting,
-    /// guaranteeing `Plain` and fresh textures never starve even if thousands
-    /// of live slots are due simultaneously.
+    /// Interleaves non-live (`Plain` recheck, `later`/`partly`, `fresh`) and
+    /// dense/live (`ChangedOnce`/`Live`/`Paused`) slots 1-for-1 starting with
+    /// non-live, so even an early break on time or upload budget guarantees
+    /// forward progress for both `Plain` and `Live` textures.
     fn in_order([mut live, mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         live.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
         again.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
         fresh.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
-        let non_live = again.len() + fresh.len();
-        let max_live = if non_live == 0 {
-            max
-        } else {
-            (max / 2).max(max.saturating_sub(non_live))
-        };
-        let live_take = live.len().min(max_live);
-        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(live_take + non_live));
-        order.extend(live.iter().take(live_take).map(|&(_, index, write)| (index, write)));
-        let rem = max.saturating_sub(order.len());
-        order.extend(again.iter().take(rem).map(|&(_, index, write)| (index, write)));
+        let mut non_live: Vec<(u32, u64)> = Vec::with_capacity((again.len() + fresh.len()).min(max));
+        non_live.extend(again.iter().take(max).map(|&(_, index, write)| (index, write)));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && non_live.len() < max {
+            non_live.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && non_live.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                non_live.push((fresh[old].1, fresh[old].2));
+            }
+        }
+        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(live.len() + non_live.len()));
+        let (mut nl, mut lv) = (0, 0);
+        while order.len() < max && (nl < non_live.len() || lv < live.len()) {
+            if nl < non_live.len() {
+                order.push(non_live[nl]);
+                nl += 1;
+            }
+            if order.len() < max && lv < live.len() {
+                order.push((live[lv].1, live[lv].2));
+                lv += 1;
             }
         }
         order
@@ -1314,7 +1317,7 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
-            if state == LiveState::Plain {
+            if state == LiveState::Plain && baseline == LiveBaseline::Strip {
                 self.live.remove(&index);
             } else {
                 self.live_polls += 1;
@@ -1324,11 +1327,10 @@ impl TextureQueue {
         }
     }
 
-    /// Defers a dense/live (`ChangedOnce`/`Live`/`Paused`) slot to `due` when
-    /// the pass's live-hash byte budget is exhausted, preserving its `checked`
-    /// state, `looks`, `baseline`, and older `live_polls` rank so it runs
-    /// first next pass.
-    pub(crate) fn defer_live(&mut self, index: u32, write: u64, due: u64) {
+    /// Defers a recheck slot to `due` when the pass's shared recheck byte
+    /// budget is exhausted, preserving its `checked` state, `looks`,
+    /// `baseline`, and older `live_polls` rank so it runs first next pass.
+    pub(crate) fn defer_recheck(&mut self, index: u32, write: u64, due: u64) {
         if let Some(w) = self.same(index, write) {
             w.due = w.due.max(due);
         }
@@ -2299,12 +2301,12 @@ impl HostHeap {
         textures.recheck(index, write, due, at, print, looks, uploaded, state, baseline);
     }
 
-    /// See [`TextureQueue::defer_live`].
-    pub(crate) fn texture_slot_defer_live(&self, index: u32, write: u64, due: u64) {
+    /// See [`TextureQueue::defer_recheck`].
+    pub(crate) fn texture_slot_defer_recheck(&self, index: u32, write: u64, due: u64) {
         self.textures
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .defer_live(index, write, due);
+            .defer_recheck(index, write, due);
     }
 
     /// See [`TextureQueue::checked`].
@@ -6063,14 +6065,15 @@ mod tests {
         // Frame 2: hash 10 and 11, defer 12 for budget.
         rr.recheck(10, w(10), 3, (0x1000, 0x2000), 1, 1, 1, LiveState::Live, LiveBaseline::Dense);
         rr.recheck(11, w(11), 3, (0x3000, 0x2000), 2, 1, 1, LiveState::Live, LiveBaseline::Dense);
-        rr.defer_live(12, w(12), 3);
+        rr.defer_recheck(12, w(12), 3);
         assert_eq!(rr.due(3, 10), [(12, w(12)), (10, w(10)), (11, w(11))]);
         assert_eq!(rr.checked(12).map(|c| c.3), Some(0), "deferred slot keeps looks count");
     }
 
     /// Even when 5,000 ready `Live` slots exceed the 4,096 per-pass cap,
-    /// `TextureQueue::in_order` reserves fair capacity so `Plain` recheck and
-    /// fresh slots are always served on the very next pass (zero starvation).
+    /// `TextureQueue::in_order` interleaves `Plain`/`fresh` and `Live` 1-for-1
+    /// starting with `Plain`, so even taking only the first 4 items makes
+    /// immediate forward progress for both `Plain` and `Live` (zero starvation).
     #[test]
     fn plain_slots_never_starve_behind_thousands_of_live_slots() {
         let mut q = TextureQueue::default();
@@ -6092,6 +6095,21 @@ mod tests {
         }
         let batch = q.due(2, 4096);
         assert_eq!(batch.len(), 4096);
+        // Even breaking after just the first 4 items serves both Plain and Live (1-for-1, Plain first).
+        let first4: Vec<u32> = batch.iter().take(4).map(|&(s, _)| s).collect();
+        assert!(
+            (10_000..10_020).contains(&first4[0]),
+            "slot 0 must be a Plain slot, got {}",
+            first4[0]
+        );
+        assert!(first4[1] < 5000, "slot 1 must be a Live slot, got {}", first4[1]);
+        assert!(
+            (10_000..10_020).contains(&first4[2]),
+            "slot 2 must be a Plain slot, got {}",
+            first4[2]
+        );
+        assert!(first4[3] < 5000, "slot 3 must be a Live slot, got {}", first4[3]);
+
         let returned: std::collections::HashSet<u32> = batch.iter().map(|&(s, _)| s).collect();
         for slot in 10_000..10_020u32 {
             assert!(returned.contains(&slot), "Plain recheck slot {slot} starved behind Live slots");
@@ -6099,7 +6117,7 @@ mod tests {
         for slot in 20_000..20_020u32 {
             assert!(returned.contains(&slot), "Fresh slot {slot} starved behind Live slots");
         }
-        // Heavy contention (5,000 Live + 3,000 non-live, cap 4,096): 50/50 fair split.
+        // Heavy contention (5,000 Live + 3,000 non-live, cap 4,096): 50/50 interleaved split.
         for slot in 30_000..32_960u32 {
             q.written(slot, 2, 2, false);
         }
