@@ -30,13 +30,29 @@ use victory_shader::{
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
-fn ada(debug: bool) -> Host {
-    if debug {
-        enable_debug_layer().expect("install Windows Graphics Tools");
+fn ada(debug: bool) -> Option<Host> {
+    let require = std::env::var_os("VICTORY_REQUIRE_DXR_TESTS").is_some_and(|v| v == "1");
+    if debug && let Err(e) = enable_debug_layer() {
+        if require {
+            panic!("install Windows Graphics Tools: {e}");
+        }
+        eprintln!("skipped: no DXR 1.1 debug layer ({e})");
+        return None;
     }
-    let name = "NVIDIA GeForce RTX 4070 Ti SUPER";
-    let host = Host::on_adapter(name).expect("physical Ada adapter required");
-    assert_eq!(host.adapter_name().as_deref(), Some(name));
+    let host = match std::env::var("VICTORY_D3D12_ADAPTER") {
+        Ok(name) if !name.trim().is_empty() => Host::on_adapter(name.trim()),
+        _ => Host::new(false),
+    };
+    let host = match host {
+        Ok(h) => h,
+        Err(e) => {
+            if require {
+                panic!("DXR 1.1 hardware adapter required: {e}");
+            }
+            eprintln!("skipped: no DXR 1.1 hardware adapter ({e})");
+            return None;
+        }
+    };
     assert_eq!(
         host.device.cast::<ID3D12InfoQueue>().is_ok(),
         debug,
@@ -44,18 +60,25 @@ fn ada(debug: bool) -> Host {
     );
     let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
     // SAFETY: feature and destination structure agree.
-    unsafe {
+    let tier_ok = unsafe {
         host.device
             .CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS5,
                 (&raw mut opts).cast(),
                 size_of_val(&opts) as u32,
             )
-            .unwrap();
+            .is_ok()
+    } && opts.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0;
+    if !tier_ok {
+        if require {
+            panic!("hardware adapter lacks DXR Tier 1.1");
+        }
+        eprintln!("skipped: hardware adapter lacks DXR Tier 1.1");
+        return None;
     }
-    assert!(opts.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0);
+    let name = host.adapter_name().unwrap_or_else(|| "unknown".to_owned());
     eprintln!("adapter={name} DXR>=1.1 debug={debug}");
-    host
+    Some(host)
 }
 
 fn clean(host: &Host) {
@@ -84,7 +107,7 @@ fn ada_phase1() {
     for n in [0, 4] {
         assert!(victory_shader::emit::rt_replay::ray_query_shader(n, QueryMode::Closest).is_err());
     }
-    let mut gpu = Gpu::new(ada(true));
+    let mut gpu = ada(true).map(Gpu::new);
     for layers in 1..=3 {
         let p = scenes::small(layers);
         let bytes = p.encode().unwrap();
@@ -149,8 +172,13 @@ fn ada_phase1() {
             "first input obstacle is not closest"
         );
 
-        rt::bench::checked(&mut gpu, &packet);
+        if let Some(gpu) = gpu.as_mut() {
+            rt::bench::checked(gpu, &packet);
+        }
     }
+    let Some(mut gpu) = gpu else {
+        return;
+    };
     let mut empty_near = scenes::small(2);
     empty_near.tlases[0].clear();
     oracle::freeze(&mut empty_near);
@@ -187,18 +215,24 @@ fn ada_phase1() {
 #[ignore = "full L1 packet under the D3D12 debug layer"]
 fn l1_debug_packet() {
     let p = rt::bench::packet();
-    let mut gpu = Gpu::new(ada(true));
+    let Some(host) = ada(true) else {
+        return;
+    };
+    let mut gpu = Gpu::new(host);
     rt::bench::checked(&mut gpu, &p);
     clean(&gpu.host);
 }
 
 #[test]
-#[ignore = "dedicated release timestamp benchmark on RTX 4070 Ti SUPER"]
+#[ignore = "dedicated release timestamp benchmark on a DXR 1.1 GPU"]
 fn l1_timestamps() {
     if cfg!(debug_assertions) {
         panic!("measure with cargo test --release");
     }
     let p = rt::bench::packet();
-    let mut gpu = Gpu::new(ada(false));
+    let Some(host) = ada(false) else {
+        return;
+    };
+    let mut gpu = Gpu::new(host);
     rt::bench::measure(&mut gpu, &p);
 }
