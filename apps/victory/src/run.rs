@@ -205,12 +205,15 @@ pub fn run(
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
+    // VICTORY_UPSCALER; each off without it), and optional watchdog disarm
+    // (VICTORY_NO_WATCHDOG=1).
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::watchdog::apply_asked(image.base(), size, &hash) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

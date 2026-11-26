@@ -31,6 +31,7 @@ pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
+pub mod watchdog;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
