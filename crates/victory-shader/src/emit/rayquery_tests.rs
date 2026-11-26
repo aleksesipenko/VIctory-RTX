@@ -563,6 +563,7 @@ fn emit_front_back_track_cs(two_pass: bool) -> Vec<u8> {
                 fallback: None,
             },
         ],
+        completed_timeouts: vec![],
         committed_meta_loads: vec![],
     };
 
@@ -595,6 +596,7 @@ fn emit_front_back_track_cs(two_pass: bool) -> Vec<u8> {
         init_min_front_t: Some(init_min_front_t),
         anyhit_inits: vec![],
         anyhit_entry_dxil: None,
+        inactive: Default::default(),
         fallbacks,
     };
 

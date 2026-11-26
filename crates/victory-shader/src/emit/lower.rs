@@ -127,6 +127,9 @@ pub(super) fn lower_rt(parts: &Parts) -> Result<Lowered, ShaderError> {
     let counted = counted_in_threads(parts);
     let plan = LiftPlan::recognize(parts, counted);
     let result = lower_impl(parts, counted, &plan);
+    if let Ok(lowered) = &result {
+        plan.report_emitted(&lowered.dxil);
+    }
     if let Err(ref e) = result
         && !plan.entries.is_empty()
     {
@@ -8975,7 +8978,7 @@ impl<'a> Lower<'a> {
             let r = if v.dpp.is_some() {
                 Err("a compare with DPP")
             } else {
-                self.compare(inst, rest)
+                self.compare(inst, rest, (b, i))
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {
@@ -11230,7 +11233,7 @@ impl<'a> Lower<'a> {
         })
     }
 
-    fn compare(&mut self, inst: &Inst, rest: &str) -> Result<(), Why> {
+    fn compare(&mut self, inst: &Inst, rest: &str, site: Site) -> Result<(), Why> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
@@ -11392,6 +11395,7 @@ impl<'a> Lower<'a> {
             }
             _ => return Err(inst.name()),
         };
+        let r = self.completed_timeout(site, r);
         self.lane_bits_for(inst, r);
         Ok(())
     }

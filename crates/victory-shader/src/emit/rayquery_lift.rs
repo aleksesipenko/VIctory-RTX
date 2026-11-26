@@ -16,7 +16,16 @@
 //! Integration with guest registers, metadata loads and paired Wave64 lives in
 //! `rayquery_lower.rs`. The matcher returns complete regions before any guest
 //! instruction is replaced.
+//!
+//! Under VICTORY_NATIVE_RT=1 an entered hardware traversal may finish even
+//! when a guest step watchdog would expire later. A lane that skips the first
+//! guest intersection must retain its guest outputs, including timeout.
 
+mod address;
+pub(super) mod entry;
+mod initial;
+mod watchdog;
+use address::Word;
 use std::collections::{HashMap, HashSet};
 
 use crate::gfx10::{Fields, NULL, Operand};
@@ -98,10 +107,8 @@ pub(crate) enum CandidateInput {
     RayT,
     Bary(u8),
     FrontFace,
-    /// `1` (valid non-zero node sentinel for `!= 0` / `< 4` status guards).
-    One,
-    /// `0` (dead BVH address/base feeding only replaced [`RayMetaLoad`]s).
-    Zero,
+    /// Immediate scaffolding input, including hit sentinels and dead addresses.
+    Constant(u32),
     /// Pre-loop value copied through deleted BVH scaffolding.
     CopyOf(Value),
     /// Index into [`AnyHitInfo::state_vars`] (reads the `Proceed()` loop PHI).
@@ -175,8 +182,10 @@ pub(crate) enum RayOutput {
     FrontBackMinFrontT,
     /// Loop-carried user state variable `idx` from [`RayLoopKind::AnyHit`].
     AnyHitState(usize),
-    /// Loop iteration counter or timeout flag (always `0` under hardware DXR).
+    /// Guest scratch proven dead on every observable lane.
     Zero,
+    /// A proven guest watchdog is false after the hardware traversal completes.
+    CompletedWatchdog,
     /// Unmodified pre-loop value carried through the loop.
     CopyOf(Value),
 }
@@ -239,6 +248,8 @@ pub(crate) struct RayLoop {
     pub outputs: Vec<RayOutputBinding>,
     /// Post-loop BVH metadata `global_load_*` sites replaced by `COMMITTED_*` queries.
     pub committed_meta_loads: Vec<(Site, RayMetaKind)>,
+    /// Original watchdog comparisons whose limit can be zero.
+    pub completed_timeouts: Vec<Site>,
 }
 
 /// Resolved DXIL `V` operands passed from `Lower` into [`emit_ray_loop`].
@@ -276,6 +287,8 @@ pub(crate) struct ResolvedRayInputs {
     pub anyhit_entry_dxil: Option<usize>,
     /// Pre-loop fallback `i32` values keyed by IR `Value`.
     pub fallbacks: HashMap<Value, V>,
+    /// Exact entry registers of lanes bypassing a wave-wide paired trace.
+    pub inactive: HashMap<Value, V>,
 }
 
 /// Pending `Proceed()` loop blocks/PHIs completed when `Lower` reaches [`AnyHitInfo::tail_block`].
@@ -388,6 +401,9 @@ struct Analyzer<'a> {
     bvh_nodes: HashMap<Site, BvhNodes>,
     /// `Resources::descriptors` indexed by `Site`.
     descriptors: HashMap<Site, &'a Source>,
+    // A single non-reentrant query. Only its post-exit paths read native
+    // metadata; all other paths keep the original guest load.
+    post_path: Option<(usize, usize, HashSet<usize>)>,
 }
 
 /// Finds all verified XDXR BVH traversal loops in `p` that can be safely lifted
@@ -403,6 +419,45 @@ pub(crate) fn find_ray_loops(
     }
     let a = Analyzer::new(p, structured, res, scalar);
     a.run()
+}
+
+pub(crate) fn isolated_ray_loops(
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+    scalar: &HashMap<Site, Address>,
+    mut admit: impl FnMut(Vec<RayLoop>) -> bool,
+) {
+    let mut a = Analyzer::new(p, st, res, scalar);
+    for (h, nodes, sites) in a.candidates().into_iter().rev() {
+        let Some((exit, pred, _)) = a.canonical_exit(&nodes) else {
+            continue;
+        };
+        let mut path = HashSet::new();
+        let mut work = vec![exit];
+        while let Some(b) = work.pop() {
+            if path.insert(b) {
+                work.extend(p.blocks[b].exit.successors())
+            }
+        }
+        if !path.is_disjoint(&nodes) {
+            continue;
+        }
+
+        a.post_path = Some((exit, pred, path));
+        if let Some(r) = a.analyze_loop(
+            h,
+            &nodes,
+            &sites,
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        ) && admit(vec![r])
+        {
+            break;
+        }
+    }
 }
 
 impl<'a> Analyzer<'a> {
@@ -479,6 +534,7 @@ impl<'a> Analyzer<'a> {
             uses,
             bvh_nodes,
             descriptors,
+            post_path: None,
         }
     }
 
@@ -515,11 +571,12 @@ impl<'a> Analyzer<'a> {
         if pr != Bool::TRUE && !nf.contains(&(pr, true)) {
             nf.push((pr, true));
         }
-        if let LaneExit::Branch {
-            when,
-            taken,
-            not_taken,
-        } = self.st.exits[pred]
+        if !self.st.wide.contains(&pred)
+            && let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = self.st.exits[pred]
         {
             if taken == succ && not_taken != succ {
                 if when != Bool::TRUE && !nf.contains(&(when, true)) {
@@ -568,7 +625,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn run(&self) -> Vec<RayLoop> {
+    fn candidates(&self) -> Vec<(usize, HashSet<usize>, Vec<Site>)> {
         // 1. Collect natural loops keyed by header from dominator back-edges.
         let mut by_header: HashMap<usize, HashSet<usize>> = HashMap::new();
         for &u in &self.order {
@@ -619,6 +676,21 @@ impl<'a> Analyzer<'a> {
             .cloned()
             .collect();
 
+        outer
+    }
+
+    fn native_edge(&self, block: usize, pred: usize) -> bool {
+        self.post_path
+            .as_ref()
+            .is_none_or(|(exit, kept, reachable)| {
+                !reachable.contains(&block)
+                    || (*exit == block && *kept == pred)
+                    || reachable.contains(&pred)
+            })
+    }
+
+    fn run(&self) -> Vec<RayLoop> {
+        let outer = self.candidates();
         let mut lifted: Vec<RayLoop> = Vec::new();
         let mut claimed: HashSet<usize> = HashSet::new();
         // Post-loop committed metadata load sites -> `(kind, rq_group)`.
@@ -993,6 +1065,17 @@ impl<'a> Analyzer<'a> {
             claimed_cand_meta,
         )?;
 
+        let mut completed_timeouts = Vec::new();
+        for out in &outputs {
+            if out.output == RayOutput::CompletedWatchdog
+                && let Some(sites) =
+                    self.completed_watchdog(out.value, nodes, &loop_all, entry_block)
+            {
+                completed_timeouts.extend(sites);
+            }
+        }
+        completed_timeouts.sort_unstable();
+        completed_timeouts.dedup();
         let mut skipped_blocks: Vec<usize> = loop_all
             .iter()
             .copied()
@@ -1025,6 +1108,7 @@ impl<'a> Analyzer<'a> {
             instance_mask,
             ray_flags,
             outputs,
+            completed_timeouts,
             committed_meta_loads,
         })
     }
@@ -2214,10 +2298,16 @@ impl<'a> Analyzer<'a> {
         if f.src.len() < 2 {
             return false;
         }
-        let c0 = const_operand(&f.src[0])
-            .or_else(|| operand_val(inst, &f.src[0]).and_then(|v| self.eval_const(v, 0)));
-        let c1 = const_operand(&f.src[1])
-            .or_else(|| operand_val(inst, &f.src[1]).and_then(|v| self.eval_const(v, 0)));
+        let Some(((b, i), _)) = inst.writes.first().and_then(|&(_, v)| self.def_inst(v)) else {
+            return false;
+        };
+        // The face byte is consumed only by lanes executing this select.
+        let lanes = self.st.guards[b][i].unwrap_or(self.st.reach[b]);
+        let byte = |op: &Operand| {
+            const_operand(op)
+                .or_else(|| operand_val(inst, op).and_then(|v| self.const_under(v, 0, lanes)))
+        };
+        let (c0, c1) = (byte(&f.src[0]), byte(&f.src[1]));
         matches!(
             (c0, c1),
             (Some(0xFF), Some(0xFE)) | (Some(0xFE), Some(0xFF))
@@ -3013,6 +3103,7 @@ impl<'a> Analyzer<'a> {
                 &inst_byte_off_lo_roots,
                 &inst_addr_hi_roots,
                 Some((tail_block, &skipped_tail_set)),
+                None,
                 &[],
                 &HashSet::new(),
             )?;
@@ -3141,9 +3232,11 @@ impl<'a> Analyzer<'a> {
             } else if cand_ff_vals.contains(&v) {
                 inputs.push((v, CandidateInput::FrontFace));
             } else if cur_tri_vals.contains(&v) || cur_inst_vals.contains(&v) {
-                inputs.push((v, CandidateInput::One));
+                inputs.push((v, CandidateInput::Constant(1)));
             } else if dead_addr_inputs.contains(&v) {
-                inputs.push((v, CandidateInput::Zero));
+                inputs.push((v, CandidateInput::Constant(0)));
+            } else if let Word::Imm(k) = self.copy_word(Word::Ssa(v)) {
+                inputs.push((v, CandidateInput::Constant(k)));
             } else if let Some(&sidx) = state_val_to_idx.get(&v) {
                 inputs.push((v, CandidateInput::StateVar(sidx)));
             } else if self.is_dead_implicit_guarded_read(
@@ -3157,7 +3250,7 @@ impl<'a> Analyzer<'a> {
                 // whose result is never operand-read in lanes where the guard was false!
                 // Check this BEFORE `is_unchanged_copy` so dead guarded reads don't create
                 // spurious cross-loop dependencies on earlier loops' dead scratch VGPRs!
-                inputs.push((v, CandidateInput::Zero));
+                inputs.push((v, CandidateInput::Constant(0)));
             } else if let Some(pre) = self.is_unchanged_copy(v, nodes, 0)
                 && self
                     .def_block(pre)
@@ -3652,22 +3745,44 @@ impl<'a> Analyzer<'a> {
 
     fn pre_loop_const(&self, v: Value, nodes: &HashSet<usize>, entry_block: usize) -> Option<u32> {
         let pre = self.pre_loop_value(v, nodes, entry_block, 0)?;
-        self.eval_const(pre, 0)
+        self.const_under(pre, 0, self.st.reach[entry_block])
     }
 
     /// Evaluates compile-time constant integer values (including `s_brev_b32`, `s_movk_i32`, etc.).
     fn eval_const(&self, v: Value, depth: u32) -> Option<u32> {
+        self.const_under(v, depth, Bool::TRUE)
+    }
+
+    fn const_under(&self, v: Value, depth: u32, lanes: Bool) -> Option<u32> {
         if depth > 8 {
             return None;
         }
-        let (_, inst) = self.def_inst(v)?;
-        match inst.name() {
+        if let Some(Def::Phi(b, i)) = self.defs[v.0 as usize] {
+            let mut common = None;
+            for &arg in &self.p.blocks[b].phis[i].args {
+                if arg == v {
+                    continue;
+                }
+                let k = self.const_under(arg, depth + 1, lanes)?;
+                if common.replace(k).is_some_and(|other| other != k) {
+                    return None;
+                }
+            }
+            return common;
+        }
+        let ((b, i), inst) = self.def_inst(v)?;
+        let &(reg, result) = inst.writes.first()?;
+        if result != v || !address::plain(inst) {
+            return None;
+        }
+        let result = match inst.name() {
             "s_mov_b32" | "v_mov_b32" => {
                 let src = first_src_operand(inst)?;
                 if let Some(k) = const_operand(src) {
-                    return Some(k);
+                    Some(k)
+                } else {
+                    operand_val(inst, src).and_then(|x| self.const_under(x, depth + 1, lanes))
                 }
-                operand_val(inst, src).and_then(|x| self.eval_const(x, depth + 1))
             }
             "s_movk_i32" => {
                 let Fields::Sop { imm: Some(imm), .. } = &inst.fields else {
@@ -3678,19 +3793,30 @@ impl<'a> Analyzer<'a> {
             "s_brev_b32" => {
                 let src = first_src_operand(inst)?;
                 let k = const_operand(src).or_else(|| {
-                    operand_val(inst, src).and_then(|x| self.eval_const(x, depth + 1))
+                    operand_val(inst, src).and_then(|x| self.const_under(x, depth + 1, lanes))
                 })?;
                 Some(k.reverse_bits())
             }
             "s_not_b32" | "v_not_b32" => {
                 let src = first_src_operand(inst)?;
                 let k = const_operand(src).or_else(|| {
-                    operand_val(inst, src).and_then(|x| self.eval_const(x, depth + 1))
+                    operand_val(inst, src).and_then(|x| self.const_under(x, depth + 1, lanes))
                 })?;
                 Some(!k)
             }
             _ => None,
+        }?;
+        // A predicated write proves a constant only if the preserved value agrees.
+        if let Some(guard) = self.st.guards[b][i]
+            && self.bools_meet(&[(lanes, true), (guard, false)])
+            && inst
+                .read(reg)
+                .and_then(|old| self.const_under(old, depth + 1, lanes))
+                != Some(result)
+        {
+            return None;
         }
+        Some(result)
     }
 
     /// Extracts `RAY_FLAG_*` from the loop's opacity, face-culling, accept-first-hit, and procedural checks.
@@ -4534,7 +4660,7 @@ impl<'a> Analyzer<'a> {
                         &other_skipped_blocks,
                     )?;
                     let canon = canonical_cls?;
-                    if other_cls.output != canon.output {
+                    if other_cls.output != canon.output || other_cls.fallback != canon.fallback {
                         return None;
                     }
                 } else if canonical_cls.is_some() && canonical_arg != arg {
@@ -4615,7 +4741,13 @@ impl<'a> Analyzer<'a> {
         //    status tests or verified BVH metadata loads (`committed_meta_loads`).
         let mut post_scope: HashSet<usize> = HashSet::new();
         for &b in &self.order {
-            if !loop_all.contains(&b) && !other_skipped_blocks.contains(&b) {
+            if !loop_all.contains(&b)
+                && !other_skipped_blocks.contains(&b)
+                && self
+                    .post_path
+                    .as_ref()
+                    .is_none_or(|(_, _, reach)| reach.contains(&b))
+            {
                 post_scope.insert(b);
             }
         }
@@ -4628,6 +4760,7 @@ impl<'a> Analyzer<'a> {
                 &[],
                 &[],
                 None,
+                Some((exit_block, exit_pred, loop_all)),
                 lifted,
                 lifted_blocks,
             )?;
@@ -4752,30 +4885,23 @@ impl<'a> Analyzer<'a> {
             });
         }
 
-        // 7. Loop iteration counter or timeout flag -> `RayOutput::Zero`.
-        if self.is_iter_counter_or_timeout(v, nodes, entry_block, 0) {
+        // A live iteration count or an arbitrary comparison of that count
+        // is observable guest data. Only discard it under the dead-use proof.
+        if self.completed_flag(v, nodes, entry_block)
+            || self
+                .completed_watchdog(v, nodes, loop_all, entry_block)
+                .is_some()
+        {
             return Some(RayOutputBinding {
                 value: v,
-                output: RayOutput::Zero,
+                output: RayOutput::CompletedWatchdog,
                 fallback: None,
             });
         }
-
-        // 8. Value whose post-loop uses are provably disjoint from `reach[entry_block]`, OR
-        //    a dead BVH-traversal scratch VGPR that only flows into post-loop merge PHIs.
-        //    Since `entry_block` lanes never observe this value, emit `Zero` (no `CopyOf(pre)`)
-        //    so we never create spurious dependencies on earlier loops' scratch VGPRs!
+        // A merge PHI can carry scratch to a real post-loop use on any of
+        // its incoming edges. Follow the value through PHIs and predicated writes.
         if matches!(reg, Reg::V(_))
-            && (self.uses_disjoint_from_entry(v, loop_all, entry_block, lifted, lifted_blocks)
-                || self.is_dead_bvh_scratch_liveout(
-                    v,
-                    reg,
-                    nodes,
-                    loop_all,
-                    tri_hit,
-                    lifted,
-                    lifted_blocks,
-                ))
+            && self.uses_disjoint_from_entry(v, loop_all, entry_block, lifted, lifted_blocks)
         {
             return Some(RayOutputBinding {
                 value: v,
@@ -4800,16 +4926,26 @@ impl<'a> Analyzer<'a> {
         lifted_blocks: &HashSet<usize>,
     ) -> bool {
         let entry_reach = self.st.reach[entry_block];
-        let mut seen: HashSet<(Value, Vec<(Bool, bool)>)> = HashSet::new();
+        let mut seen: HashMap<Value, Vec<(Bool, bool)>> = HashMap::new();
         let mut work: Vec<(Value, Vec<(Bool, bool)>)> = vec![(root, vec![(entry_reach, true)])];
         let mut steps = 0usize;
-        while let Some((v, facts)) = work.pop() {
+        while let Some((v, mut facts)) = work.pop() {
             steps += 1;
-            if steps > 256 {
+            if steps > 4096 {
                 return false;
             }
-            if !seen.insert((v, facts.clone())) {
-                continue;
+            // At joins keep facts true on every reaching path. Dropping a fact
+            // can only make an observable use more likely. Revisit a value
+            // only when its previous set of possible lanes has grown.
+            if let Some(prior) = seen.get_mut(&v) {
+                let n = prior.len();
+                prior.retain(|f| facts.contains(f));
+                if n == prior.len() {
+                    continue;
+                }
+                facts.clone_from(prior);
+            } else {
+                seen.insert(v, facts.clone());
             }
             if lifted.iter().any(|other| {
                 ray_loop_reads_value(other, v)
@@ -4821,7 +4957,13 @@ impl<'a> Analyzer<'a> {
                 return false;
             }
             for &(b, idx_opt) in &self.uses[v.0 as usize] {
-                if loop_all.contains(&b) || lifted_blocks.contains(&b) {
+                if loop_all.contains(&b)
+                    || lifted_blocks.contains(&b)
+                    || self
+                        .post_path
+                        .as_ref()
+                        .is_some_and(|(_, _, after)| !after.contains(&b))
+                {
                     continue;
                 }
                 let Some(i) = idx_opt else {
@@ -4829,29 +4971,49 @@ impl<'a> Analyzer<'a> {
                         if !phi.args.contains(&v) {
                             continue;
                         }
-                        if let Some(margs) = self.st.phi_masks.get(&phi.value) {
-                            for (&arg, &mb) in phi.args.iter().zip(margs) {
-                                if arg != v {
-                                    continue;
-                                }
-                                let mut next_facts = facts.clone();
-                                if mb != Bool::TRUE && !next_facts.contains(&(mb, true)) {
-                                    next_facts.push((mb, true));
-                                }
-                                if self.bools_meet(&next_facts) {
-                                    work.push((phi.value, next_facts));
-                                }
+                        for (k, (&pred, &arg)) in
+                            self.p.blocks[b].preds.iter().zip(&phi.args).enumerate()
+                        {
+                            if arg != v {
+                                continue;
                             }
-                        } else {
-                            for (&pred, &arg) in self.p.blocks[b].preds.iter().zip(&phi.args) {
-                                if arg != v {
-                                    continue;
-                                }
-                                let next_facts = self.edge_facts(pred, b, &facts);
-                                if self.bools_meet(&next_facts) {
-                                    work.push((phi.value, next_facts));
-                                }
+                            // A guest-only predecessor cannot have executed this
+                            // non-reentrant region. Keep *every* original exit
+                            // edge while comparing its live-outs with the canonical one.
+                            if self.post_path.as_ref().is_some_and(|(exit, _, after)| {
+                                !after.contains(&pred) && !(*exit == b && loop_all.contains(&pred))
+                            }) {
+                                continue;
                             }
+                            let mut next = if let Some(masks) = self.st.phi_masks.get(&phi.value) {
+                                let mut next = facts.clone();
+                                let m = masks[k];
+                                if m != Bool::TRUE && !next.contains(&(m, true)) {
+                                    next.push((m, true))
+                                }
+                                next
+                            } else {
+                                self.edge_facts(pred, b, &facts)
+                            };
+                            if !self.bools_meet(&next) {
+                                continue;
+                            }
+                            if self.dominates(b, pred) {
+                                // SSA mask atoms defined within this loop
+                                // can change at its next dynamic iteration.
+                                next.retain(|&(mask, _)| {
+                                    self.st
+                                        .bools
+                                        .support(mask)
+                                        .into_iter()
+                                        .filter_map(atom_value)
+                                        .all(|v| {
+                                            self.def_block(v)
+                                                .is_some_and(|db| !self.dominates(b, db))
+                                        })
+                                });
+                            }
+                            work.push((phi.value, next));
                         }
                     }
                     continue;
@@ -4862,48 +5024,40 @@ impl<'a> Analyzer<'a> {
                     .reads
                     .iter()
                     .any(|&(r, rv)| rv == v && ops.contains(&r));
-                if !is_op_read {
-                    // Partial-register / single-lane writes preserve bits/lanes of `old`
-                    // even when active; conservatively reject.
-                    let is_partial = inst.name() == "v_writelane_b32"
-                        || matches!(&inst.fields, Fields::Valu(f) if f.sdwa.is_some());
-                    if is_partial {
+                if is_op_read {
+                    let mut check = facts.clone();
+                    check.push((self.st.reach[b], true));
+                    if let Some(g) = self.st.guards[b][i] {
+                        check.push((g, true));
+                    }
+                    if self.bools_meet(&check) {
                         return false;
                     }
-                    if let Some(g) = self.st.guards[b][i] {
-                        // A guarded VGPR write lowers to `select(g, new, old)`, so `old` (`v`)
-                        // survives into `w` only in lanes where `g == false`.
-                        // Inside a 1-block GFX10 waterfall loop (`v_readfirstlane` + `s_andn2_wrexec`),
-                        // every lane active on entry (`reach[b]`) executes the body once, so a full
-                        // write to a register never operand-read in `b` kills `old` on all `reach[b]` lanes!
-                        let kill_cond = if self.is_waterfall_kill_block(b, v) {
-                            self.st.reach[b]
-                        } else {
-                            g
-                        };
-                        let mut next_facts = facts.clone();
-                        if !next_facts.contains(&(kill_cond, false)) {
-                            next_facts.push((kill_cond, false));
-                        }
-                        if self.bools_meet(&next_facts) {
-                            for &(r, rv) in &inst.reads {
-                                if rv == v
-                                    && let Some(w) = inst.write(r)
-                                {
-                                    work.push((w, next_facts.clone()));
-                                }
+                }
+                if let Some(g) = self.st.guards[b][i] {
+                    // A guarded VGPR write lowers to `select(g, new, old)`, so `old` (`v`)
+                    // survives into `w` only in lanes where `g == false`.
+                    // Inside a 1-block GFX10 waterfall loop (`v_readfirstlane` + `s_andn2_wrexec`),
+                    // every lane active on entry (`reach[b]`) executes the body once, so a full
+                    // write to a register never operand-read in `b` kills `old` on all `reach[b]` lanes!
+                    let kill_cond = if self.is_waterfall_kill_block(b, v) {
+                        self.st.reach[b]
+                    } else {
+                        g
+                    };
+                    let mut next_facts = facts.clone();
+                    if !next_facts.contains(&(kill_cond, false)) {
+                        next_facts.push((kill_cond, false));
+                    }
+                    if self.bools_meet(&next_facts) {
+                        for &(r, rv) in &inst.reads {
+                            if rv == v
+                                && let Some(w) = inst.write(r)
+                            {
+                                work.push((w, next_facts.clone()));
                             }
                         }
                     }
-                    continue;
-                }
-                let mut check = facts.clone();
-                check.push((self.st.reach[b], true));
-                if let Some(g) = self.st.guards[b][i] {
-                    check.push((g, true));
-                }
-                if self.bools_meet(&check) {
-                    return false;
                 }
             }
         }
@@ -4939,110 +5093,6 @@ impl<'a> Analyzer<'a> {
         true
     }
 
-    /// Returns `true` if `v` (in VGPR `reg`) is purely an internal BVH traversal scratch
-    /// register (never written in hit-commit / any-hit blocks) that has zero direct
-    /// post-loop operand reads and only enters post-loop control-flow merge PHIs.
-    #[allow(clippy::too_many_arguments)]
-    fn is_dead_bvh_scratch_liveout(
-        &self,
-        v: Value,
-        reg: Reg,
-        nodes: &HashSet<usize>,
-        loop_all: &HashSet<usize>,
-        tri_hit: &TriangleHitInfo,
-        lifted: &[RayLoop],
-        lifted_blocks: &HashSet<usize>,
-    ) -> bool {
-        if lifted
-            .iter()
-            .any(|other| ray_loop_reads_real_input(other, v))
-        {
-            return false;
-        }
-        // Reject if `reg` is written in commit_block, opacity_block (after `cmpx`), or hit_block
-        // (after `s_and_saveexec`). Dead local scratch temps written inside `ah.body_blocks` (that
-        // are NOT `state_vars`, NOT committed, and have zero direct post-loop operand reads) are safe.
-        let mut forbidden_blocks: HashSet<usize> = HashSet::new();
-        if let HitMode::AnyHit(ref ah) = tri_hit.mode
-            && let Exit::Jump(commit_b) = self.p.blocks[ah.tail_block].exit
-        {
-            forbidden_blocks.insert(commit_b);
-        }
-        for &b in &forbidden_blocks {
-            if self.p.blocks[b]
-                .insts
-                .iter()
-                .any(|inst| inst.writes.iter().any(|&(r, _)| r == reg))
-            {
-                return false;
-            }
-        }
-        if let Some(op_b) = tri_hit.opacity_block {
-            let start = self
-                .find_opacity_cmpx_in_block(op_b)
-                .map_or(0, |idx| idx + 1);
-            if self.p.blocks[op_b].insts[start..]
-                .iter()
-                .any(|inst| inst.writes.iter().any(|&(r, _)| r == reg))
-            {
-                return false;
-            }
-        }
-        let hb = tri_hit.hit_block;
-        if let Some(se_idx) = self.p.blocks[hb]
-            .insts
-            .iter()
-            .position(|i| matches!(i.name(), "s_and_saveexec_b32" | "s_and_saveexec_b64"))
-            && self.p.blocks[hb].insts[se_idx + 1..]
-                .iter()
-                .any(|inst| inst.writes.iter().any(|&(r, _)| r == reg))
-        {
-            return false;
-        }
-        // Must actually be written by BVH scaffolding inside `nodes`.
-        let written_in_scaff = nodes.iter().any(|&b| {
-            !forbidden_blocks.contains(&b)
-                && self.p.blocks[b]
-                    .insts
-                    .iter()
-                    .any(|inst| inst.writes.iter().any(|&(r, _)| r == reg))
-        });
-        if !written_in_scaff {
-            return false;
-        }
-        // Every post-loop use of `v` must be either a non-operand overwrite (`op=false`)
-        // or a merge PHI (with at least one incoming edge != `v`), or a fallback/copy in another lifted loop.
-        let used_as_other_fallback = lifted.iter().any(|other| ray_loop_reads_value(other, v));
-        let mut saw_use = used_as_other_fallback;
-        for &(b, idx_opt) in &self.uses[v.0 as usize] {
-            if loop_all.contains(&b) || lifted_blocks.contains(&b) {
-                continue;
-            }
-            saw_use = true;
-            match idx_opt {
-                Some(i) => {
-                    let inst = &self.p.blocks[b].insts[i];
-                    let ops = operand_reads(self.p, inst);
-                    if inst
-                        .reads
-                        .iter()
-                        .any(|&(r, rv)| rv == v && ops.contains(&r))
-                    {
-                        return false;
-                    }
-                }
-                None => {
-                    for phi in &self.p.blocks[b].phis {
-                        if phi.args.contains(&v) && phi.args.iter().all(|&a| a == v) {
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-        saw_use
-    }
-
     fn value_reg(&self, v: Value) -> Option<Reg> {
         match self.defs.get(v.0 as usize).copied().flatten()? {
             Def::Input(r) => Some(r),
@@ -5068,7 +5118,20 @@ impl<'a> Analyzer<'a> {
                 let inst = &self.p.blocks[b].insts[i];
                 if matches!(inst.name(), "v_mov_b32" | "s_mov_b32") {
                     let src = single_reg_src(inst)?;
-                    return self.is_unchanged_copy(src, nodes, depth + 1);
+                    let copy = self.is_unchanged_copy(src, nodes, depth + 1)?;
+                    let &(dst, result) = inst.writes.first()?;
+                    if result != v || !address::plain(inst) {
+                        return None;
+                    }
+                    if self.st.guards[b][i].is_some()
+                        && inst
+                            .read(dst)
+                            .and_then(|old| self.is_unchanged_copy(old, nodes, depth + 1))
+                            != Some(copy)
+                    {
+                        return None;
+                    }
+                    return Some(copy);
                 }
                 None
             }
@@ -5110,6 +5173,7 @@ impl<'a> Analyzer<'a> {
         inst_byte_off_lo_roots: &[Value],
         inst_addr_hi_roots: &[Value],
         skipped_tail: Option<(usize, &HashSet<usize>)>,
+        collapsed_exit: Option<(usize, usize, &HashSet<usize>)>,
         lifted: &[RayLoop],
         _lifted_blocks: &HashSet<usize>,
     ) -> Option<MetaAnalysisResult> {
@@ -5263,7 +5327,12 @@ impl<'a> Analyzer<'a> {
                     }
                     let Some(i) = idx_opt else {
                         for phi in &self.p.blocks[b].phis {
-                            if phi.args.contains(&v) {
+                            if phi
+                                .args
+                                .iter()
+                                .zip(&self.p.blocks[b].preds)
+                                .any(|(&arg, &pred)| arg == v && self.native_edge(b, pred))
+                            {
                                 // Dead merge PHIs or incoming values whose lanes are disjoint from all
                                 // operand uses of `phi` do not propagate!
                                 if !self.phi_incoming_reaches_use_in_scope(
@@ -6380,6 +6449,7 @@ impl<'a> Analyzer<'a> {
             &tags,
             tlas_high,
             skipped_tail,
+            collapsed_exit,
         ) {
             return None;
         }
@@ -6396,6 +6466,7 @@ impl<'a> Analyzer<'a> {
         tags: &HashMap<Value, BvhTag>,
         tlas_high: Value,
         skipped_tail: Option<(usize, &HashSet<usize>)>,
+        collapsed_exit: Option<(usize, usize, &HashSet<usize>)>,
     ) -> bool {
         // A single hardware getter replaces the load on *every* incoming edge.
         // Walk the actual load addresses back through tagged definitions. A PHI
@@ -6419,7 +6490,18 @@ impl<'a> Analyzer<'a> {
             else {
                 return false;
             };
-            if !self.proven_address_high(lo, hi, tlas_high) {
+            if !self.proven_address_high(lo, hi, tlas_high)
+                && !self.def_inst(tlas_high).is_some_and(|(_, t)| {
+                    t.writes.get(1).map(|w| w.1) == Some(tlas_high)
+                        && self.address_pair(
+                            Word::Ssa(lo),
+                            Word::Ssa(hi),
+                            (t.writes[0].1, tlas_high),
+                            tags,
+                            0,
+                        )
+                })
+            {
                 return false;
             }
             needed.push(lo);
@@ -6435,7 +6517,17 @@ impl<'a> Analyzer<'a> {
             match self.defs[v.0 as usize] {
                 Some(Def::Phi(b, i)) if scope.contains(&b) => {
                     let phi = &self.p.blocks[b].phis[i];
-                    for &arg in &phi.args {
+                    for (&pred, &arg) in self.p.blocks[b].preds.iter().zip(&phi.args) {
+                        // Lowering retains exactly one incoming edge from this
+                        // traversal. Its other exit values were classified
+                        // against the canonical live-out before examining uses.
+                        if !self.native_edge(b, pred)
+                            || collapsed_exit.is_some_and(|(exit, kept, region)| {
+                                exit == b && pred != kept && region.contains(&pred)
+                            })
+                        {
+                            continue;
+                        }
                         if tags.get(&arg) == tags.get(&v) {
                             needed.push(arg);
                         } else if self.phi_incoming_reaches_use_in_scope(
@@ -6455,18 +6547,18 @@ impl<'a> Analyzer<'a> {
                     // may install an unrelated guest address on the rest. A tagged
                     // operand alone also cannot establish both arms of a select.
                     if self.st.guards[b][i].is_some()
-                        || matches!(
+                        || (matches!(
                             inst.name(),
                             "v_cndmask_b32" | "s_cselect_b32" | "s_cselect_b64"
-                        )
+                        ) && !(tags.get(&v) == Some(&BvhTag::TriPrimOff)
+                            && self.primitive_slot_select(v, tags)))
                     {
                         return false;
                     }
-                    needed.extend(
-                        inst.reads
-                            .iter()
-                            .filter_map(|&(_, arg)| tags.contains_key(&arg).then_some(arg)),
-                    );
+                    needed.extend(inst.reads.iter().filter_map(|&(r, arg)| {
+                        (operand_reads(self.p, inst).contains(&r) && tags.contains_key(&arg))
+                            .then_some(arg)
+                    }));
                 }
                 _ => {}
             }
@@ -6478,41 +6570,19 @@ impl<'a> Analyzer<'a> {
     /// Even a verified low dword can be paired with a different address space.
     /// Accept the TLAS high word or an add-with-carry from the *same* low sum.
     fn proven_address_high(&self, lo: Value, hi: Value, tlas_high: Value) -> bool {
-        let source = |mut v| {
-            for _ in 0..8 {
-                let Some(((b, i), inst)) = self.def_inst(v) else {
-                    break;
-                };
-                if self.st.guards[b][i].is_some()
-                    || !matches!(inst.name(), "v_mov_b32" | "s_mov_b32")
-                {
-                    break;
-                }
-                let Some(next) = single_reg_src(inst) else {
-                    break;
-                };
-                v = next;
-            }
-            v
-        };
-        let hi = source(hi);
-        if hi == tlas_high {
+        let hi = self.copy_word(Word::Ssa(hi));
+        if hi == Word::Ssa(tlas_high) {
             return true;
         }
-        let (Some((_, low)), Some(((b, i), high))) = (self.def_inst(source(lo)), self.def_inst(hi))
-        else {
+        let (Word::Ssa(lo), Word::Ssa(hi)) = (self.copy_word(Word::Ssa(lo)), hi) else {
             return false;
         };
-        let carry = match &high.fields {
-            Fields::Sop { .. } if high.name() == "s_addc_u32" => high.read(Reg::Scc),
-            Fields::Valu(v) if high.name() == "v_add_co_ci_u32" => {
-                v.src.get(2).and_then(|op| operand_val(high, op))
-            }
-            _ => None,
+        let (Some(low), Some(high)) = (self.unguarded_def(lo), self.unguarded_def(hi)) else {
+            return false;
         };
-        self.st.guards[b][i].is_none()
-            && other_val_from_const_op(high, 0).is_some_and(|v| source(v) == tlas_high)
-            && carry.is_some_and(|v| low.writes.iter().skip(1).any(|&(_, w)| v == w))
+        self.is_wide_sum(low, high, lo, hi)
+            && other_val_from_const_op(high, 0)
+                .is_some_and(|v| self.copy_word(Word::Ssa(v)) == Word::Ssa(tlas_high))
     }
 
     /// A node offset added to an unrelated guest buffer can index arbitrary
@@ -6524,7 +6594,30 @@ impl<'a> Analyzer<'a> {
         if depth >= 8 {
             return None;
         }
+        if self.unpacked_tlas(v, tlas, None) {
+            return Some(0);
+        }
+        if let Some(Def::Phi(b, i)) = self.defs[v.0 as usize] {
+            let mut off = None;
+            for (&p, &a) in self.p.blocks[b]
+                .preds
+                .iter()
+                .zip(&self.p.blocks[b].phis[i].args)
+            {
+                if !self.native_edge(b, p) {
+                    continue;
+                }
+                let k = self.extract_base_low_offset(a, tlas, depth + 1)?;
+                if off.replace(k).is_some_and(|prev| prev != k) {
+                    return None;
+                }
+            }
+            return off;
+        }
         let ((b, i), inst) = self.def_inst(v)?;
+        if !address::plain(inst) || inst.writes[0].1 != v {
+            return None;
+        }
         // A masked VGPR definition leaves its previous, possibly unrelated,
         // pointer in the inactive lanes.
         if self.st.guards[b][i].is_some() {
@@ -7191,184 +7284,6 @@ impl<'a> Analyzer<'a> {
         }
         true
     }
-
-    /// Recognises XDXR's per-iteration counter (`iter = 0; iter += 1; cmp iter, 0xffff`)
-    /// and timeout flag (`iter > 0xfffe ? -1 : 0`).
-    fn is_iter_counter_or_timeout(
-        &self,
-        v: Value,
-        nodes: &HashSet<usize>,
-        entry_block: usize,
-        depth: u32,
-    ) -> bool {
-        if depth > 8 {
-            return false;
-        }
-        let Some(def) = self.defs.get(v.0 as usize).copied().flatten() else {
-            return false;
-        };
-        match def {
-            Def::Input(_) => false,
-            Def::Phi(b, pi) => {
-                if !nodes.contains(&b) {
-                    return false;
-                }
-                let phi = &self.p.blocks[b].phis[pi];
-                // Pre-loop initialiser must be 0, and every in-loop back-edge must be
-                // `phi + 1` (or a copy/inner-phi of `phi + 1`).
-                let mut saw_zero = false;
-                let mut saw_inc = false;
-                for (&pred, &arg) in self.p.blocks[b].preds.iter().zip(&phi.args) {
-                    if arg == v {
-                        continue;
-                    }
-                    if b == entry_block && !nodes.contains(&pred) {
-                        if self.eval_const(arg, 0) == Some(0) {
-                            saw_zero = true;
-                        } else {
-                            return false;
-                        }
-                    } else if self.is_increment_of(arg, v, nodes, &mut HashSet::new(), 0)
-                        || self.is_iter_counter_or_timeout(arg, nodes, entry_block, depth + 1)
-                    {
-                        saw_inc = true;
-                    } else {
-                        return false;
-                    }
-                }
-                if b == entry_block {
-                    saw_zero && saw_inc
-                } else {
-                    saw_inc
-                }
-            }
-            Def::Inst(b, i) => {
-                if !nodes.contains(&b) {
-                    return false;
-                }
-                let inst = &self.p.blocks[b].insts[i];
-                match inst.name() {
-                    "v_mov_b32" | "s_mov_b32" => single_reg_src(inst).is_some_and(|s| {
-                        self.is_iter_counter_or_timeout(s, nodes, entry_block, depth + 1)
-                    }),
-                    "v_add_nc_u32" | "v_add_co_u32" | "s_add_i32" | "s_add_u32" => {
-                        other_const_arg_any(inst) == Some(1)
-                            && other_val_from_const_op(inst, 1).is_some_and(|base| {
-                                self.is_iter_counter_or_timeout(base, nodes, entry_block, depth + 1)
-                            })
-                    }
-                    // Timeout flag: `v_cndmask_b32 dst, 0, -1, cond` where `cond` compares an iter counter.
-                    "v_cndmask_b32" => {
-                        let Fields::Valu(f) = &inst.fields else {
-                            return false;
-                        };
-                        if f.src.len() < 3 {
-                            return false;
-                        }
-                        let c0 = const_operand(&f.src[0]);
-                        let c1 = const_operand(&f.src[1]);
-                        matches!(
-                            (c0, c1),
-                            (Some(0), Some(0xFFFF_FFFF)) | (Some(0xFFFF_FFFF), Some(0))
-                        ) && operand_val(inst, &f.src[2])
-                            .is_some_and(|cond| self.is_timeout_cond(cond, nodes, entry_block, 0))
-                    }
-                    _ => false,
-                }
-            }
-        }
-    }
-
-    fn is_timeout_cond(
-        &self,
-        v: Value,
-        nodes: &HashSet<usize>,
-        entry_block: usize,
-        depth: u32,
-    ) -> bool {
-        if depth > 8 {
-            return false;
-        }
-        let Some(((b, _), inst)) = self.def_inst(v) else {
-            return false;
-        };
-        if !nodes.contains(&b) {
-            return false;
-        }
-        match inst.name() {
-            "s_cmpk_gt_u32" | "s_cmpk_lt_u32" | "s_cmpk_ge_u32" | "s_cmpk_le_u32"
-            | "s_cmp_gt_u32" | "s_cmp_lt_u32" | "s_cmp_ge_u32" | "s_cmp_le_u32"
-            | "v_cmp_gt_u32" | "v_cmp_lt_u32" | "v_cmp_ge_u32" | "v_cmp_le_u32" => inst
-                .reads
-                .iter()
-                .any(|&(_, rv)| self.is_iter_counter_or_timeout(rv, nodes, entry_block, 0)),
-            "s_cselect_b32" | "s_cselect_b64" => inst
-                .read(Reg::Scc)
-                .is_some_and(|scc| self.is_timeout_cond(scc, nodes, entry_block, depth + 1)),
-            "v_and_b32" | "s_and_b32" => other_val_from_const_op(inst, 1)
-                .is_some_and(|s| self.is_timeout_cond(s, nodes, entry_block, depth + 1)),
-            "v_cmp_eq_u32" | "v_cmp_ne_u32" | "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmpk_eq_u32"
-            | "s_cmpk_lg_u32" => {
-                inst.reads
-                    .iter()
-                    .any(|&(_, rv)| self.is_iter_counter_or_timeout(rv, nodes, entry_block, 0))
-                    || (other_val_from_const_op(inst, 1)
-                        .or_else(|| other_val_from_const_op(inst, 0)))
-                    .is_some_and(|s| self.is_timeout_cond(s, nodes, entry_block, depth + 1))
-            }
-            _ => false,
-        }
-    }
-
-    fn is_increment_of(
-        &self,
-        v: Value,
-        target: Value,
-        nodes: &HashSet<usize>,
-        visited: &mut HashSet<Value>,
-        depth: u32,
-    ) -> bool {
-        if depth > 16 {
-            return false;
-        }
-        if v == target || !visited.insert(v) {
-            return true;
-        }
-        match self.defs.get(v.0 as usize).copied().flatten() {
-            Some(Def::Inst(b, i)) if nodes.contains(&b) => {
-                let inst = &self.p.blocks[b].insts[i];
-                match inst.name() {
-                    "v_mov_b32" | "s_mov_b32" => single_reg_src(inst).is_some_and(|s| {
-                        self.is_increment_of(s, target, nodes, visited, depth + 1)
-                    }),
-                    "v_add_nc_u32" | "v_add_co_u32" | "s_add_i32" | "s_add_u32" => {
-                        other_const_arg_any(inst) == Some(1)
-                            && other_val_from_const_op(inst, 1).is_some_and(|s| {
-                                self.is_increment_of(s, target, nodes, visited, depth + 1)
-                            })
-                    }
-                    "v_cndmask_b32" => {
-                        let Fields::Valu(f) = &inst.fields else {
-                            return false;
-                        };
-                        f.src.len() >= 2
-                            && operand_val(inst, &f.src[0]).is_some_and(|s| {
-                                self.is_increment_of(s, target, nodes, visited, depth + 1)
-                            })
-                            && operand_val(inst, &f.src[1]).is_some_and(|s| {
-                                self.is_increment_of(s, target, nodes, visited, depth + 1)
-                            })
-                    }
-                    _ => false,
-                }
-            }
-            Some(Def::Phi(b, pi)) if nodes.contains(&b) => self.p.blocks[b].phis[pi]
-                .args
-                .iter()
-                .all(|&a| a == v || self.is_increment_of(a, target, nodes, visited, depth + 1)),
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7523,8 +7438,14 @@ pub(crate) fn emit_ray_loop(
 
         let mut merged = Vec::with_capacity(rl.outputs.len() + cand_outs.len());
         for (binding, &(val_id, traced_v)) in rl.outputs.iter().zip(&traced) {
+            if let Some(&saved) = inputs.inactive.get(&val_id) {
+                let phi = s.m.phi(merge_blk, i32t);
+                s.m.set_phi(phi, vec![(traced_v, after_blk), (saved, entry_dxil)]);
+                merged.push((val_id, phi));
+                continue;
+            }
             let out_v = match binding.output {
-                RayOutput::Zero => s.m.i32(0),
+                RayOutput::Zero | RayOutput::CompletedWatchdog => s.m.i32(0),
                 RayOutput::CopyOf(pre) => inputs
                     .fallbacks
                     .get(&pre)
@@ -7979,8 +7900,7 @@ fn emit_trace_body(
                     CandidateInput::RayT | CandidateInput::Bary(_) | CandidateInput::FrontFace => {
                         continue;
                     }
-                    CandidateInput::One => s.m.i32(1),
-                    CandidateInput::Zero => s.m.i32(0),
+                    CandidateInput::Constant(k) => s.m.i32(k),
                     CandidateInput::CopyOf(pre) => inputs
                         .fallbacks
                         .get(&pre)
@@ -8030,7 +7950,10 @@ fn emit_trace_body(
         let needs_hit_fields = rl.outputs.iter().any(|b| {
             !matches!(
                 b.output,
-                RayOutput::CommittedStatusTriNode | RayOutput::Zero | RayOutput::CopyOf(_)
+                RayOutput::CommittedStatusTriNode
+                    | RayOutput::Zero
+                    | RayOutput::CompletedWatchdog
+                    | RayOutput::CopyOf(_)
             )
         });
         if !needs_hit_fields {
@@ -8040,7 +7963,7 @@ fn emit_trace_body(
             for binding in &rl.outputs {
                 let v = match binding.output {
                     RayOutput::CommittedStatusTriNode => s.m.select(after_blk, any_hit, one, zero),
-                    RayOutput::Zero => zero,
+                    RayOutput::Zero | RayOutput::CompletedWatchdog => zero,
                     RayOutput::CopyOf(pre) => inputs.fallbacks.get(&pre).copied().unwrap_or(zero),
                     _ => unreachable!(),
                 };
@@ -8061,7 +7984,7 @@ fn emit_trace_body(
         let mut outs = Vec::with_capacity(rl.outputs.len());
         for binding in &rl.outputs {
             let v = match binding.output {
-                RayOutput::Zero => s.m.i32(0),
+                RayOutput::Zero | RayOutput::CompletedWatchdog => s.m.i32(0),
                 RayOutput::CopyOf(pre) => inputs
                     .fallbacks
                     .get(&pre)
@@ -8114,6 +8037,7 @@ fn emit_trace_body(
         !matches!(
             binding.output,
             RayOutput::Zero
+                | RayOutput::CompletedWatchdog
                 | RayOutput::CopyOf(_)
                 | RayOutput::AnyHitState(_)
                 | RayOutput::FrontBackMinFrontT
@@ -8141,7 +8065,7 @@ fn emit_trace_body(
                 i32t,
             ),
             RayOutput::AnyHitState(k) => state_phis[k],
-            RayOutput::Zero => s.m.i32(0),
+            RayOutput::Zero | RayOutput::CompletedWatchdog => s.m.i32(0),
             RayOutput::CopyOf(pre) => inputs.fallbacks[&pre],
             committed => {
                 let value = emit_committed_hit_output(s, hit, rq, committed, i32t);
@@ -8275,7 +8199,8 @@ fn flat_or_smem_load_info(inst: &Inst, v: Value) -> Option<(u32, u32)> {
     };
     match &inst.fields {
         Fields::Flat {
-            addr: Some(Operand::Vector { reg, .. }),
+            addr: Some(Operand::Vector { reg, dwords: 2 }),
+            saddr: Some(Operand::Scalar { code: NULL, .. }),
             offset,
             ..
         } if inst.read(Reg::V(*reg)) == Some(v) => u32::try_from(*offset).ok().map(|o| (ndw, o)),
@@ -8285,7 +8210,7 @@ fn flat_or_smem_load_info(inst: &Inst, v: Value) -> Option<(u32, u32)> {
             soffset,
             ..
         } if inst.read(Reg::S(*code)) == Some(v) => {
-            let off = *offset + const_operand(soffset).unwrap_or(0) as i32;
+            let off = offset.checked_add(i32::try_from(const_operand(soffset)?).ok()?)?;
             u32::try_from(off).ok().map(|o| (ndw, o))
         }
         _ => None,
@@ -8463,6 +8388,30 @@ mod tests {
     }
 
     #[test]
+    fn post_loop_accumulator_keeps_the_live_destination() {
+        // A traversal writes v2. The next block consumes it as the addend
+        // of v_fmac_f32 v2, v0, v1; neither encoded source names v2.
+        let words = [
+            0x7e04_0281u32,
+            0xbf82_0000,
+            (0x2b << 25) | (2 << 17) | (1 << 9) | 256,
+            0xbf81_0000,
+        ];
+        let bytes = words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
+        let p = crate::ir::build(&bytes, false, 4).unwrap();
+        assert_eq!(p.blocks[1].insts[0].name(), "v_fmac_f32");
+        let st = crate::structure::structure(&p).unwrap();
+        let res = Resources::default();
+        let scalar = HashMap::new();
+        let a = Analyzer::new(&p, &st, &res, &scalar);
+        let old = p.blocks[0].insts[0].write(Reg::V(2)).unwrap();
+        assert!(!a.uses_disjoint_from_entry(old, &HashSet::from([0]), 0, &[], &HashSet::new()));
+    }
+
+    #[test]
     fn metadata_load_keeps_guest_addresses_after_a_join_or_masked_overwrite() {
         let build = |words: &[u32]| {
             let code = words
@@ -8471,6 +8420,35 @@ mod tests {
                 .collect::<Vec<_>>();
             crate::ir::build(&code, false, 8).unwrap()
         };
+        let res = Resources::default();
+        let scalar = HashMap::new();
+        // A masked zero may leave a live guest pointer in an inactive lane.
+        let prog = build(&[0x7da4_0080, 0x7e04_0280, 0xbefe_04c1, 0xbf81_0000]);
+        let st = crate::structure::structure(&prog).unwrap();
+        let analyzer = Analyzer::new(&prog, &st, &res, &scalar);
+        let value = prog.blocks[0].insts[1].write(Reg::V(2)).unwrap();
+        assert_eq!(analyzer.eval_const(value, 0), None);
+        assert_eq!(
+            analyzer.const_under(value, 0, st.guards[0][1].unwrap()),
+            Some(0)
+        );
+
+        // 0x7fffff00 + 0x100 has signed overflow without unsigned carry.
+        for (low, expected) in [(0x8008_ff08, true), (0x8108_ff08, false)] {
+            let prog = build(&[low, 0x100, 0x8209_8009, 0xbf81_0000]);
+            let st = crate::structure::structure(&prog).unwrap();
+            let analyzer = Analyzer::new(&prog, &st, &res, &scalar);
+            let (lo, hi) = (&prog.blocks[0].insts[0], &prog.blocks[0].insts[1]);
+            assert_eq!(
+                analyzer.proven_address_high(
+                    lo.write(Reg::S(8)).unwrap(),
+                    hi.write(Reg::S(9)).unwrap(),
+                    hi.read(Reg::S(9)).unwrap()
+                ),
+                expected
+            );
+        }
+
         let prog = build(&[
             0xbf07_8007,
             0xbf84_0002, // scalar condition
@@ -8481,8 +8459,6 @@ mod tests {
             0x047d_0000, // global_load_dword v4, v[0:1], off
             0xbf81_0000,
         ]);
-        let res = Resources::default();
-        let scalar = HashMap::new();
         let st = crate::structure::structure(&prog).unwrap();
         let analyzer = Analyzer::new(&prog, &st, &res, &scalar);
         let join = prog.blocks.len() - 1;
@@ -8495,10 +8471,17 @@ mod tests {
         let hi = prog.blocks[join].insts[0].read(Reg::V(1)).unwrap();
         let scope = (0..prog.blocks.len()).collect();
         let mut tags = HashMap::from([(phi.value, tag), (phi.args[0], tag)]);
-        assert!(!analyzer.metadata_addresses_proven(&scope, [(join, 0)], &tags, hi, None));
+        assert!(!analyzer.metadata_addresses_proven(&scope, [(join, 0)], &tags, hi, None, None));
         tags.insert(phi.args[1], tag);
-        assert!(analyzer.metadata_addresses_proven(&scope, [(join, 0)], &tags, hi, None));
-        assert!(!analyzer.metadata_addresses_proven(&scope, [(join, 0)], &tags, phi.args[0], None));
+        assert!(analyzer.metadata_addresses_proven(&scope, [(join, 0)], &tags, hi, None, None));
+        assert!(!analyzer.metadata_addresses_proven(
+            &scope,
+            [(join, 0)],
+            &tags,
+            phi.args[0],
+            None,
+            None
+        ));
         // Two independent pointer inputs to equivalent moves are still different buffers.
         let from_first = prog.blocks[1].insts[0].read(Reg::V(2)).unwrap();
         assert_eq!(
@@ -8522,6 +8505,7 @@ mod tests {
         let analyzer = Analyzer::new(&prog, &st, &res, &scalar);
         let address = prog.blocks[0].insts[1].write(Reg::V(2)).unwrap();
         assert!(st.guards[0][1].is_some());
+        assert!(!analyzer.mask_covers(&prog.blocks[0].insts[1], &prog.blocks[0].insts[3], &[]));
         let pointer = prog.blocks[0].insts[1].read(Reg::V(3)).unwrap();
         assert_eq!(analyzer.extract_base_low_offset(address, pointer, 0), None);
         assert!(!analyzer.metadata_addresses_proven(
@@ -8529,6 +8513,7 @@ mod tests {
             [(0, 3)],
             &HashMap::from([(address, tag)]),
             prog.blocks[0].insts[3].read(Reg::V(3)).unwrap(),
+            None,
             None
         ));
     }
@@ -8600,6 +8585,7 @@ mod tests {
                     fallback: None,
                 },
             ],
+            completed_timeouts: vec![],
             committed_meta_loads: vec![],
         };
 
@@ -8636,6 +8622,7 @@ mod tests {
             init_min_front_t: None,
             anyhit_inits: vec![],
             anyhit_entry_dxil: None,
+            inactive: HashMap::new(),
             fallbacks,
         };
 
@@ -8688,6 +8675,7 @@ mod tests {
                     fallback: Some(Value(7)),
                 },
             ],
+            completed_timeouts: vec![],
             committed_meta_loads: vec![],
         };
 
@@ -8737,6 +8725,7 @@ mod tests {
                 init_min_front_t: Some(ten_f),
                 anyhit_inits: vec![],
                 anyhit_entry_dxil: None,
+                inactive: HashMap::new(),
                 fallbacks,
             };
 
@@ -8817,6 +8806,7 @@ mod tests {
                     fallback: Some(Value(0)),
                 },
             ],
+            completed_timeouts: vec![],
             committed_meta_loads: vec![],
         };
 
@@ -8843,6 +8833,7 @@ mod tests {
             init_min_front_t: None,
             anyhit_inits: vec![zero],
             anyhit_entry_dxil: Some(anyhit_body),
+            inactive: HashMap::new(),
             fallbacks,
         };
 
@@ -8955,6 +8946,7 @@ mod tests {
                 output: RayOutput::AnyHitState(0),
                 fallback: Some(Value(0)),
             }],
+            completed_timeouts: vec![],
             committed_meta_loads: vec![],
         };
 
@@ -8978,6 +8970,7 @@ mod tests {
             init_min_front_t: None,
             anyhit_inits: vec![zero],
             anyhit_entry_dxil: Some(anyhit_body),
+            inactive: HashMap::new(),
             fallbacks: HashMap::new(),
         };
 
@@ -9084,6 +9077,7 @@ mod tests {
                     fallback: None,
                 },
             ],
+            completed_timeouts: vec![],
             committed_meta_loads: vec![],
         };
 
@@ -9173,6 +9167,7 @@ mod tests {
             init_min_front_t: None,
             anyhit_inits: vec![],
             anyhit_entry_dxil: Some(anyhit_body),
+            inactive: HashMap::new(),
             fallbacks,
         };
 
@@ -9277,6 +9272,7 @@ mod tests {
             instance_mask: RayInput::Const(0xFF),
             ray_flags: RayInput::Const(ray_flag::SKIP_PROCEDURAL_PRIMITIVES),
             outputs: vec![],
+            completed_timeouts: vec![],
             committed_meta_loads: meta,
         };
 

@@ -12,7 +12,7 @@ use crate::{io, ir, resource, structure};
 use lift::{RayOutputBinding, RayTemplate};
 use windows::Win32::Graphics::Direct3D12::D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
 
-fn kernel() -> (Vec<u8>, usize, usize) {
+fn kernel(wide: bool) -> (Vec<u8>, usize, usize) {
     let mov = |dst: u32, src: u32| 0x7e00_0200 | dst << 17 | src;
     let cvt = |dst: u32, src: u32| 0x7e00_0c00 | dst << 17 | (256 + src);
     let op = |op: u32, dst: u32, a: u32, b: u32| op << 25 | dst << 17 | b << 9 | a;
@@ -36,11 +36,22 @@ fn kernel() -> (Vec<u8>, usize, usize) {
         op(3, 7, 255, 7),
         1.25f32.to_bits(), // keep hits off the tMax boundary
         op(0x1b, 8, 132, 0),
-        op(0x1a, 8, 134, 8),                     // flags = (lane & 4) << 6
-        0x7c00_0000 | 0xc5 << 17 | 3 << 9 | 258, // v_cmp_ne_u32 vcc, v2, v3
-        0xbe90_246a,                             // s_and_saveexec_b64 s[16:17], vcc
-        0xbf82_0000,                             // preheader -> trace
+        op(0x1a, 8, 134, 8),                          // flags = (lane & 4) << 6
+        0x7c00_0000 | 0xc5 << 17 | 3 << 9 | 258,      // v_cmp_ne_u32 vcc, v2, v3
+        0xbe90_246a,                                  // s_and_saveexec_b64 s[16:17], vcc
+        if wide { 0xbf88_000a } else { 0xbf82_0000 }, // EXECZ skips the trace for the whole wave
     ];
+    if wide {
+        // The branch can enter both virtual halves because one lane is live.
+        // The guest intersection itself is guarded by its incoming EXEC.
+        code.extend([
+            0xf19c_9f07,
+            0x0003_0801,
+            0x0504_0302,
+            0x0908_0706,
+            0x000c_0b0a,
+        ]);
+    }
     for reg in 1..=4 {
         code.push(mov(reg, 128));
     } // trace live-outs
@@ -58,7 +69,12 @@ fn kernel() -> (Vec<u8>, usize, usize) {
     let native = native_with(&code, true, 64, 0);
     let p = ir::build(&native.code, true, native.vgprs).unwrap();
     assert_eq!(p.blocks.len(), 3);
-    let st = structure::structure(&p).unwrap();
+    let st = if wide {
+        structure::structure_wide(&p, &HashSet::from([0]))
+    } else {
+        structure::structure(&p)
+    }
+    .unwrap();
     let io = io::raise(&p, &native).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let parts = Parts {
@@ -127,6 +143,7 @@ fn kernel() -> (Vec<u8>, usize, usize) {
                 fallback: (output == RayOutput::CommittedRayT).then_some(tmax),
             })
             .collect(),
+        completed_timeouts: vec![],
         committed_meta_loads: meta
             .into_iter()
             .enumerate()
@@ -184,11 +201,6 @@ fn ada_paired_lift_all_64_lanes() {
     enable_debug_layer().unwrap();
     let host = Host::on_adapter("NVIDIA GeForce RTX 4070 Ti SUPER").unwrap();
     assert_eq!(host.translation_caps(), Some((32, false)));
-    let (mut dxil, n, count_slot) = kernel();
-    Validator::load(Validator::default_path().as_deref())
-        .unwrap()
-        .validate(&mut dxil)
-        .unwrap();
     let verts = [0, 1].map(|g| {
         (0..16)
             .flat_map(|prim| {
@@ -222,59 +234,75 @@ fn ada_paired_lift_all_64_lanes() {
         contrib: 0,
         flags: 0,
     });
-    for count in [64usize, 45] {
-        let mut constants = vec![0; n];
-        constants[count_slot] = count as u32;
-        let words = run_scene(
-            &host,
-            &dxil,
-            Bindings::Guest(constants),
-            &geoms,
-            &instances,
-            64 * 16,
-        )
-        .unwrap();
-        let active = |lane: usize| lane < count && lane & 7 != lane >> 5;
-        let masks = [0, 1]
-            .map(|half| (0..32).fold(0u32, |m, n| m | (u32::from(active(32 * half + n)) << n)));
-        let mut hits = [0; 2];
-        for lane in 0..64 {
-            if lane >= count {
+    for wide in [false, true] {
+        let (mut dxil, n, count_slot) = kernel(wide);
+        Validator::load(Validator::default_path().as_deref())
+            .unwrap()
+            .validate(&mut dxil)
+            .unwrap();
+        for count in [64usize, 45] {
+            let mut constants = vec![0; n];
+            constants[count_slot] = count as u32;
+            let words = run_scene(
+                &host,
+                &dxil,
+                Bindings::Guest(constants),
+                &geoms,
+                &instances,
+                64 * 16,
+            )
+            .unwrap();
+            let active = |lane: usize| lane < count && lane & 7 != lane >> 5;
+            let masks = [0, 1]
+                .map(|half| (0..32).fold(0u32, |m, n| m | (u32::from(active(32 * half + n)) << n)));
+            let mut hits = [0; 2];
+            for lane in 0..64 {
+                if lane >= count {
+                    assert_eq!(
+                        &words[lane * 16..lane * 16 + 10],
+                        &[0; 10],
+                        "unlaunched lane {lane} wrote a row"
+                    );
+                    continue;
+                }
+                let half = lane >> 5;
+                let x = lane - half * 31;
+                let t = ((1 + ((x / 2) & 3)) + half) as f32 / (1 + half) as f32;
+                let tmax = 1.25 + (lane & 3) as f32;
+                let hit = active(lane) && lane & 4 == 0 && x < 32 && t <= tmax;
+                hits[half] += u32::from(hit);
+                let uv = if hit { 0.25f32.to_bits() } else { 0 };
+                let mut want = [
+                    lane as u32,
+                    u32::from(hit),
+                    if hit { t } else { tmax }.to_bits(),
+                    uv,
+                    uv,
+                    if hit { [17, 93][half] } else { 0 },
+                    if hit { (x as u32 & 1) << 8 } else { 0 },
+                    if hit { x as u32 / 2 } else { 0 },
+                    masks[0],
+                    masks[1],
+                ];
+                if wide && !active(lane) {
+                    // The guest never wrote these VGPRs in this lane.
+                    want[1..5].copy_from_slice(&[
+                        (lane as f32 + 0.25).to_bits(),
+                        half as u32,
+                        (lane & 7) as u32,
+                        1 << half,
+                    ]);
+                }
                 assert_eq!(
                     &words[lane * 16..lane * 16 + 10],
-                    &[0; 10],
-                    "unlaunched lane {lane} wrote a row"
+                    &want,
+                    "console lane {lane}"
                 );
-                continue;
             }
-            let half = lane >> 5;
-            let x = lane - half * 31;
-            let t = ((1 + ((x / 2) & 3)) + half) as f32 / (1 + half) as f32;
-            let tmax = 1.25 + (lane & 3) as f32;
-            let hit = active(lane) && lane & 4 == 0 && x < 32 && t <= tmax;
-            hits[half] += u32::from(hit);
-            let uv = if hit { 0.25f32.to_bits() } else { 0 };
-            let want = [
-                lane as u32,
-                u32::from(hit),
-                if hit { t } else { tmax }.to_bits(),
-                uv,
-                uv,
-                if hit { [17, 93][half] } else { 0 },
-                if hit { (x as u32 & 1) << 8 } else { 0 },
-                if hit { x as u32 / 2 } else { 0 },
-                masks[0],
-                masks[1],
-            ];
-            assert_eq!(
-                &words[lane * 16..lane * 16 + 10],
-                &want,
-                "console lane {lane}"
+            host.check_debug_errors().unwrap();
+            eprintln!(
+                "paired parity={count}/{count} hits={hits:?} VCC={masks:x?} wide={wide} D3D12 errors/corruption=0"
             );
         }
-        host.check_debug_errors().unwrap();
-        eprintln!(
-            "paired parity={count}/{count} hits={hits:?} VCC={masks:x?} D3D12 errors/corruption=0"
-        );
     }
 }

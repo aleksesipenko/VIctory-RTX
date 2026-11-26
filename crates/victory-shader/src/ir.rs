@@ -1555,10 +1555,46 @@ type Effects = (Vec<Reg>, Vec<Reg>);
 /// value of a VGPR it only writes.
 pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
     let lanes = 1 + u8::from(p.wave64);
-    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs)
+    let mut reads = effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs)
         .ok()
         .flatten()
-        .map_or_else(Vec::new, |e| e.0)
+        .map_or_else(Vec::new, |e| e.0);
+    // These instructions need the old destination even in an EXEC-enabled
+    // lane. Keep half-width and permuted forms conservative: a selected
+    // half, a masked row/bank or an out-of-bounds source can preserve data.
+    let name = inst.name();
+    let reads_dst = match &inst.fields {
+        Fields::Valu(f) => {
+            f.sdwa.is_some()
+                || f.dpp.is_some()
+                || [
+                    "v_mac_",
+                    "v_fmac_",
+                    "v_pk_fmac_",
+                    "v_dot2c_",
+                    "v_dot4c_",
+                    "v_dot8c_",
+                    "v_interp_p2",
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                || name.contains("16")
+                || matches!(name, "v_writelane_b32" | "v_movreld_b32" | "v_movrelsd_b32")
+        }
+        Fields::Vintrp { .. } => name.starts_with("v_interp_p2"),
+        Fields::Ds { .. } | Fields::Flat { .. } | Fields::Buffer { .. } | Fields::Image { .. } => {
+            name.contains("d16")
+        }
+        _ => false,
+    };
+    if reads_dst {
+        for &(reg, _) in &inst.writes {
+            if matches!(reg, Reg::V(_)) && !reads.contains(&reg) {
+                reads.push(reg);
+            }
+        }
+    }
+    reads
 }
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
@@ -1927,6 +1963,84 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
         Operand::Const(_) | Operand::Literal(_) | Operand::Attr { .. } => {}
     }
     Ok(())
+}
+
+/// The prefix of a guest traversal that can execute before its first root
+/// intersection, with the feasible successors on the initial incoming edge.
+pub(crate) struct RayPrefix {
+    pub preheader: usize,
+    pub header: usize,
+    pub edges: std::collections::BTreeMap<usize, Vec<usize>>,
+    pub sentinel_pop: Option<(usize, usize)>,
+}
+
+/// Rotate at the intersection by peeling the certified prefix, preserving its
+/// real scalar instructions, EXEC gates, timeout path and no-trace live-outs.
+pub(crate) fn peel_ray_dispatch(p: &Program, regions: &[RayPrefix]) -> Option<Program> {
+    if regions.is_empty() {
+        return None;
+    }
+    let mut blocks = p.blocks.clone();
+    let mut redirects = HashMap::new();
+    for region in regions {
+        let mut copies = HashMap::new();
+        for &b in region.edges.keys() {
+            copies.insert(b, blocks.len());
+            blocks.push(p.blocks[b].clone());
+        }
+        for (&b, edges) in &region.edges {
+            let copy = &mut blocks[copies[&b]];
+            let target = |s: &usize| copies.get(s).copied().unwrap_or(*s);
+            copy.exit = match edges[..] {
+                [dest] => Exit::Jump(target(&dest)),
+                [_, _] if let Exit::Branch { taken, not_taken } = p.blocks[b].exit => {
+                    Exit::Branch {
+                        taken: target(&taken),
+                        not_taken: target(&not_taken),
+                    }
+                }
+                _ => return None,
+            };
+            if let Some((pop, i)) = region.sentinel_pop
+                && pop == b
+            {
+                let inst = &mut copy.insts[i];
+                let (Reg::V(dst), _) = *inst.writes.first()? else {
+                    return None;
+                };
+                let word = 0x7e00_0200 | u32::from(dst) << 17 | 193;
+                inst.machine = gfx10::Instruction::new(
+                    inst.machine.offset,
+                    gfx10::Encoding::Vop1,
+                    1,
+                    vec![word],
+                );
+                inst.fields = inst.machine.fields(p.wave64);
+                inst.reads
+                    .retain(|(r, _)| *r == Reg::V(dst) || matches!(*r, Reg::S(EXEC | 127)));
+            }
+        }
+        redirects.insert((region.preheader, region.header), copies[&region.header]);
+    }
+    for (b, blk) in blocks.iter_mut().enumerate() {
+        blk.phis.clear();
+        let redirect = |s: &mut usize| {
+            if let Some(&to) = redirects.get(&(b, *s)) {
+                *s = to
+            }
+        };
+        match &mut blk.exit {
+            Exit::Jump(s) => redirect(s),
+            Exit::Branch { taken, not_taken } => {
+                redirect(taken);
+                redirect(not_taken)
+            }
+            _ => {}
+        }
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
 }
 
 #[cfg(test)]
