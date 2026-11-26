@@ -378,24 +378,33 @@ fn xma() -> RwLockReadGuard<'static, Xma> {
 struct Context(*mut u32);
 
 impl Context {
-    fn get(self, word: usize) -> u32 {
-        // SAFETY: inside the context array; the title reads and writes it
-        // concurrently, like the hardware's.
-        unsafe { self.0.add(word).read_volatile() }
+    fn atomic(self, word: usize) -> &'static std::sync::atomic::AtomicU32 {
+        // SAFETY: `self.0` points into the 64-byte-aligned XMA context array
+        // (4-byte aligned `u32` words) shared concurrently with the title.
+        unsafe { &*self.0.add(word).cast::<std::sync::atomic::AtomicU32>() }
     }
 
+    fn get(self, word: usize) -> u32 {
+        self.atomic(word).load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
-        // SAFETY: as above.
-        unsafe { self.0.add(word).write_volatile(value) }
+        self.atomic(word).store(value, std::sync::atomic::Ordering::Release);
     }
 
     fn field(self, word: usize, shift: u32, bits: u32) -> u32 {
-        (self.get(word) >> shift) & ((1 << bits) - 1)
+        (self.get(word) >> shift) & if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 }
     }
 
     fn set_field(self, word: usize, shift: u32, bits: u32, value: u32) {
-        let mask = ((1u32 << bits) - 1) << shift;
-        self.set(word, (self.get(word) & !mask) | ((value << shift) & mask));
+        let mask = if bits == 32 { u32::MAX } else { ((1u32 << bits) - 1) << shift };
+        let bits_val = (value << shift) & mask;
+        let _ = self.atomic(word).fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some((cur & !mask) | bits_val),
+        );
     }
 
     fn channels(self) -> usize {

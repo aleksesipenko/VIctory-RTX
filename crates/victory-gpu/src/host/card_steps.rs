@@ -158,6 +158,14 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         });
                     }
                 }
+                // Texture copy-back ranges land directly in title memory
+                // (GPL-3.0 provenance: avatarmanz/VIctory-7900XTX #383).
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -1160,6 +1168,37 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    #[test]
+    fn texture_copy_back_writers_refuse_overlapping_reads() {
+        let flight = Flight {
+            number: 1,
+            fence: 1,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back: Vec::new(),
+            own: None,
+            texture_back_ranges: vec![(100, 108)],
+        };
+        let writers = writers(&[Late::Run(flight)]);
+        assert_eq!(writers.len(), 1);
+        assert!(writers[0].shadow.is_none());
+        assert!(!writers[0].copy);
+        assert_eq!((writers[0].from, writers[0].to), (100, 108));
+        for (from, to) in [(96, 101), (100, 108), (104, 120)] {
+            assert_eq!(
+                holder(&writers, from, to).err(),
+                Some("a read-back or a value behind a flight is written there"),
+            );
+        }
+        for (from, to) in [(90, 100), (108, 120)] {
+            assert_ne!(
+                holder(&writers, from, to).err(),
+                Some("a read-back or a value behind a flight is written there"),
+            );
+        }
     }
 
     /// Reads are all before writes, between two buffers and within one, and

@@ -74,6 +74,21 @@ impl Drop for Front {
     }
 }
 
+/// Frees any unconsumed `UPLOAD` `Box<Upload>` pointers left in a stream that
+/// was never passed through [`translate`].
+fn drop_unconsumed_uploads(stream: &[u64]) {
+    let mut i = 0;
+    while i < stream.len() {
+        let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        if op == UPLOAD && len >= 1 && i + 1 < stream.len() {
+            // SAFETY: `allocate_upload` created this `Box<Upload>` once, and
+            // this stream was never translated.
+            unsafe { drop(Box::from_raw(stream[i + 1] as *mut Upload)) };
+        }
+        i += 1 + len;
+    }
+}
+
 impl Front {
     /// Lets go of the recording there is: one never submitted is not run any
     /// further.
@@ -83,6 +98,7 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        drop_unconsumed_uploads(&self.words);
         self.words.clear();
     }
 
@@ -280,6 +296,9 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        for chunk in &inner.chunks {
+            drop_unconsumed_uploads(chunk);
+        }
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
