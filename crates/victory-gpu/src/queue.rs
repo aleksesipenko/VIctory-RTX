@@ -9,6 +9,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 mod behind;
+#[cfg(all(test, windows))]
+mod dxr_tests;
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
@@ -578,6 +580,19 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
+            return;
+        }
+        if host.dxr.is_some()
+            && !cuts()
+            && !this.is_null()
+            && lists.iter().any(|&l| crate::list::cut_list(l))
+        {
+            // In whole-list wait modes, retain the gates the original submission
+            // would have tested before the first physical piece of each list.
+            if waits() {
+                crate::list::gate_dxr_parts(lists, split());
+            }
+            submit_cut(this, lists);
             return;
         }
         if cuts() && !this.is_null() {

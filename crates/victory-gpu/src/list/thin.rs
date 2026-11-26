@@ -198,6 +198,7 @@ pub(crate) struct Recording {
 #[derive(Default)]
 struct Inner {
     chunks: VecDeque<Vec<u64>>,
+    dxr: VecDeque<crate::dxr::Captured>,
     /// Streams translated (commands may name places in them until the end).
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
@@ -252,7 +253,12 @@ impl Recording {
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
-            let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            let (calls, closed) = translate(
+                back,
+                &chunk,
+                || self.abandoned.load(Acquire),
+                || held(&self.inner).dxr.pop_front(),
+            );
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
@@ -281,7 +287,15 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            if crate::dxr::requested()
+                && (self.abandoned.load(Acquire) || super::cut_list(inner.back as This))
+            {
+                // Earlier DXR pieces may already pin GPU inputs. Release this
+                // unsubmitted backing list now instead of parking it in BACKS.
+                super::list_release(inner.back as This);
+            } else {
+                held(&BACKS).push(inner.back);
+            }
         }
     }
 }
@@ -502,6 +516,21 @@ const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 const UPSCALE: u64 = after(17);
+const DXR: u64 = after(18);
+
+/// The marker and its owned payload belong to the same recording. Reset or
+/// abandonment drops unconsumed batches, even before the first chunk is sent.
+pub(super) fn dxr(this: This, batch: crate::dxr::Captured) {
+    let f = front(this);
+    if f.closed || f.recording.is_none() {
+        crate::dxr::unrecorded(batch.count(), "closed thin list");
+        return;
+    }
+    held(&f.recording.as_ref().unwrap().inner)
+        .dxr
+        .push_back(batch);
+    f.put(DXR, &[]);
+}
 
 /// Writes the title's upscale down with the list's calls (`super::upscale`);
 /// false if the list has no recording being written.
@@ -724,7 +753,12 @@ extern "system" fn copy_texture_region_x(
 
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
-fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+fn translate(
+    list: This,
+    stream: &[u64],
+    left: impl Fn() -> bool,
+    mut dxr: impl FnMut() -> Option<crate::dxr::Captured>,
+) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
     while i < stream.len() {
@@ -741,6 +775,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
+            continue;
+        }
+        if op == DXR {
+            let batch = dxr().expect("thin DXR marker without payload");
+            if !skip {
+                super::dxr_boundary(list, batch);
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {

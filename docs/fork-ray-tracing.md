@@ -162,6 +162,16 @@ fork's constant.
 
 It is off while the builder runs.
 
+## Native DXR sidecar on Windows
+
+Set `VICTORY_NATIVE_RT=1` to build host DXR 1.1 acceleration structures alongside the title's ordinary renderer. Unset or `0` binds the original builder imports directly. For Phase 2 keep the existing DLSS/render settings and the miss shader backend. Game lighting and performance are measured separately during the live run.
+
+Each submitted builder call uses the producer's GPU buffers on the renderer's direct queue. Static rehydration uses the original geometry descriptions and preserves geometry order. A packed input without usable geometry descriptions or an unsupported XDXR stream appears in the failure counters. An unresolved nonzero instance address prevents publication of that TLAS. A legal zero instance address remains inactive. Native refit requires unchanged geometry shape and provably unchanged active primitives. The sidecar rebuilds indexed, float, transformed and AABB geometry when the title requests an update.
+
+The default `VICTORY_DXR_VRAM_CAP_MB=12800` is in MiB. Admission uses the smaller of this cap and the DXGI local budget after reserving the larger of 1 GiB and 10% of that budget. `VICTORY_CARD_ROOM_FOR_DXR_MB` defaults to 1024 and reserves space for future AS slabs in the renderer's texture allocator. The `native RT submission totals` log includes completed items, reasons, missing instances, physical slab bytes in MiB, local and non-local usage, and accumulated GPU time. Compare captures with the same launcher settings and the same scene. A debug run with frame recording incurs synchronous readback.
+
+To capture a real frame, use a diagnostics build with `VICTORY_RECORD=<folder>` and `VICTORY_RECORD_FRAMES=1`. Create the file `<folder>/go` in the intended scene. The standard recording and its `notes.txt` are under `capture-N/`. The `native-rt/` directory there holds the initial driver-serialized AS generations, a directory of page buffers by replay resource ID, and the ordered batches with the consuming GPU input bytes. Each `.vrt` ends with a 32-byte BLAKE3 digest. `dxr-failed.txt` identifies an incomplete native capture. The ordinary frame player does not restore native AS generations. The narrow replay must match the serialization header's driver identifier and relocate the stored BLAS addresses before tracing.
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

@@ -55,6 +55,12 @@ pub(super) struct Phase {
 }
 
 impl Phase {
+    pub(super) fn dxr_boundary(&self) -> Option<(u32, usize)> {
+        match &self.stage {
+            Stage::Capturing(c) if c.started => Some((c.frame, c.submits.len())),
+            _ => None,
+        }
+    }
     pub(super) fn done(&self) -> bool {
         matches!(self.stage, Stage::Done)
     }
@@ -1191,6 +1197,12 @@ fn resolved(r: &Recorder, mut s: Slot) -> Slot {
         && s.described != 0
         && kind == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0
     {
+        if s.pad == 1 {
+            // The frame retains the guest address separately for L1 relocation.
+            // Generic frame playback has no trace consumer in Phase 2.
+            s.desc[16..24].fill(0);
+            return s;
+        }
         r.problem("views of acceleration structures are null in the capture");
         return Slot {
             kind: slot::SRV,

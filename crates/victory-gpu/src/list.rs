@@ -126,6 +126,10 @@ struct List {
     /// list is cut at its waits for memory values ([`cut`]).
     #[cfg(windows)]
     earlier: Vec<Part>,
+    /// Native AS producer boundaries remain executable until the guest resets
+    /// this recording, including repeat submissions separated by queue waits.
+    #[cfg(windows)]
+    dxr_recording: Option<DxrRecording>,
     /// The waits recorded before the first work of `host`: the queue stands
     /// at them before it runs `host`.
     #[cfg(windows)]
@@ -192,7 +196,13 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 /// With it go the upload memory and the dynamic descriptor slots its
 /// commands name, kept until it has run.
 #[cfg(windows)]
-pub(crate) struct Detached {
+pub(crate) enum Detached {
+    Owned(DetachedData),
+    Shared(std::sync::Arc<DetachedData>),
+}
+
+#[cfg(windows)]
+pub(crate) struct DetachedData {
     host: crate::host::HostList,
     _uploads: Vec<Upload>,
     _state: crate::draw::State,
@@ -201,14 +211,24 @@ pub(crate) struct Detached {
 #[cfg(windows)]
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
-        &self.host
+        match self {
+            Self::Owned(d) => &d.host,
+            Self::Shared(d) => &d.host,
+        }
     }
 
     /// Releases this list's dynamic descriptor slots once its GPU submission
     /// has completed, without waiting for the full `bury_lag` allocator delay
     /// (from codec-d/cool_fox f4b48ad; avoids exhausting NVIDIA's capped view heap).
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        match self {
+            Self::Owned(d) => d._state.tables_done(),
+            Self::Shared(d) => {
+                if let Some(d) = std::sync::Arc::get_mut(d) {
+                    d._state.tables_done();
+                }
+            }
+        }
     }
 }
 
@@ -301,7 +321,18 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, list) in lists.into_iter().enumerate() {
+        let DetachedData {
+            host,
+            _uploads,
+            _state,
+        } = match list {
+            Detached::Owned(d) => d,
+            Detached::Shared(d) => match std::sync::Arc::try_unwrap(d) {
+                Ok(d) => d,
+                Err(_) => continue, // another submission or the closed title list still owns it
+            },
+        };
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
@@ -380,6 +411,42 @@ fn cut(this: This, wait: ValueWait) {
     }
 }
 
+/// Called only by the installed builder hooks. Seal the producer list at
+/// the actual call boundary: later skinning/copies on this same guest list
+/// must not change the data this build reads.
+#[cfg(windows)]
+pub(crate) fn queue_dxr(this: This, batch: crate::dxr::Captured) {
+    if host_list(this).is_some() {
+        dxr_boundary(this, batch);
+    } else {
+        thin::dxr(this, batch);
+    }
+}
+
+#[cfg(windows)]
+fn dxr_boundary(this: This, batch: crate::dxr::Captured) {
+    // SAFETY: exclusively recorded by the guest or the thin back-list worker.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(current) = list.host.as_ref() else {
+        crate::dxr::unrecorded(batch.count(), "no backing list");
+        return;
+    };
+    let Some(fresh) = fresh_list() else {
+        crate::host::fail(format_args!("cannot split native RT producer list"));
+    };
+    current.set_dxr(batch);
+    current.close();
+    let done = list.host.replace(fresh).unwrap();
+    list.earlier.push(Part {
+        waits: std::mem::take(&mut list.gate),
+        host: done,
+    });
+    list.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replay(list.host.as_ref().unwrap());
+}
+
 /// Whether list `this` recorded a wait for a memory value (with waits cut
 /// into lists).
 #[cfg(windows)]
@@ -390,7 +457,7 @@ pub(crate) fn cut_list(this: This) -> bool {
     // SAFETY: one of our lists, closed and submitted: nothing records
     // into it.
     let list = unsafe { &*this.cast::<List>() };
-    !list.earlier.is_empty() || !list.gate.is_empty()
+    !list.earlier.is_empty() || !list.gate.is_empty() || list.dxr_recording.is_some()
 }
 
 /// What a queue is given for submitted lists that were cut at their waits:
@@ -399,7 +466,44 @@ pub(crate) fn cut_list(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
-/// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
+#[cfg(windows)]
+pub(crate) fn gate_dxr_parts(lists: &[This], per_list: bool) {
+    let mut waits = waits_by_list(lists);
+    if !per_list && !waits.is_empty() {
+        let all = waits.iter_mut().flat_map(std::mem::take).collect();
+        if let Some(i) = lists.iter().position(|l| !l.is_null()) {
+            waits[i] = all;
+        }
+    }
+    for (&this, gates) in lists.iter().zip(waits) {
+        if !this.is_null() && !gates.is_empty() {
+            // SAFETY: closed list exclusively owned during its submission.
+            let l = unsafe { &mut *this.cast_mut().cast::<List>() };
+            if let Some(first) = l.earlier.first_mut() {
+                first.waits.extend(gates);
+            } else {
+                l.gate.extend(gates);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+type DxrRecording = Vec<(Vec<ValueWait>, std::sync::Arc<DetachedData>)>;
+
+#[cfg(windows)]
+fn append_dxr_recording(parts: &mut Parts, recording: &DxrRecording) {
+    for (waits, data) in recording {
+        if !waits.is_empty() {
+            parts.push((waits.clone(), Vec::new(), Vec::new()));
+        }
+        let (_, taken, order) = parts.last_mut().unwrap();
+        order.push(taken.len());
+        taken.push(Detached::Shared(data.clone()));
+    }
+}
+
+/// Takes the host sides of the submitted lists, part by part ([`cut`]),
 /// and leaves each list a new, closed host list for its next reset, as
 /// [`detach`] does. What comes back is in the order the queue runs it: a
 /// new entry starts at every part that has waits; host lists without
@@ -419,6 +523,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         if this.is_null() {
             continue;
         }
+        // SAFETY: submissions of a closed backing list are serialized by the queue.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if let Some(recording) = &list.dxr_recording {
+            append_dxr_recording(&mut parts, recording);
+            continue;
+        }
         if let Some(&(_, at)) = seen.iter().find(|(t, _)| *t == this) {
             match at {
                 Some((entry, place)) if entry + 1 == parts.len() => parts[entry].2.push(place),
@@ -432,11 +542,11 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         }
         let Some(fresh) = fresh_list_closed() else {
+            if list.earlier.iter().any(|p| p.host.has_dxr()) {
+                crate::host::fail(format_args!("cannot detach a native RT producer"));
+            }
             continue;
         };
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -445,12 +555,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
         let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
         let single = earlier.is_empty() && gate.is_empty();
-        let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
+        let mut pieces: Vec<(Vec<ValueWait>, DetachedData)> = earlier
             .into_iter()
             .map(|part| {
                 (
                     part.waits,
-                    Detached {
+                    DetachedData {
                         host: part.host,
                         _uploads: Vec::new(),
                         _state: Default::default(),
@@ -460,12 +570,24 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             .collect();
         pieces.push((
             gate,
-            Detached {
+            DetachedData {
                 host,
                 _uploads: uploads,
                 _state: state,
             },
         ));
+        if crate::dxr::requested() && pieces.iter().any(|(_, d)| d.host.has_dxr()) {
+            let recording = pieces
+                .into_iter()
+                .map(|(waits, d)| {
+                    d.host.mark_dxr_reusable();
+                    (waits, std::sync::Arc::new(d))
+                })
+                .collect();
+            append_dxr_recording(&mut parts, &recording);
+            list.dxr_recording = Some(recording);
+            continue;
+        }
         let mut last = None;
         for (waits, detached) in pieces {
             if !waits.is_empty() {
@@ -475,7 +597,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             let (_, taken, order) = &mut parts[entry];
             let place = taken.len();
             order.push(place);
-            taken.push(detached);
+            taken.push(Detached::Owned(detached));
             last = Some((entry, place));
         }
         seen.push((this, if single { last } else { None }));
@@ -519,11 +641,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         order.push(taken.len());
         taken.push((
             this,
-            Detached {
+            Detached::Owned(DetachedData {
                 host,
                 _uploads: uploads,
                 _state: state,
-            },
+            }),
         ));
     }
     (taken.into_iter().map(|(_, d)| d).collect(), order)
@@ -644,6 +766,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         #[cfg(windows)]
         earlier: Vec::new(),
         #[cfg(windows)]
+        dxr_recording: None,
+        #[cfg(windows)]
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
@@ -705,6 +829,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
+        list.dxr_recording = None;
         list.gate.clear();
     }
     #[cfg(windows)]

@@ -124,7 +124,10 @@ impl Made {
     }
 }
 
+mod native;
+
 pub(crate) struct HostHeap {
+    native_slots: std::sync::OnceLock<native::Slots>,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1262,6 +1265,7 @@ impl TextureQueue {
 /// placed in memory, or a texture object.
 pub(crate) fn is_texture_view(view: &View) -> bool {
     match view {
+        v if native_tlas(v).is_some() => false,
         View::Placed(false, resource, _) => resource[0] != 1,
         View::Shader(r, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_none(),
         _ => false,
@@ -1679,7 +1683,23 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
+        // The old size probe deliberately issued invalid D3D12 calls on Ada.
+        // The sidecar needs a clean InfoQueue, including during heap setup.
+        let max_views = host.dxr.as_ref().map(|_| {
+            let mut limits = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+            let supported = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS19, (&raw mut limits).cast(), size_of_val(&limits) as u32,
+                )
+            };
+            if supported.is_ok() && limits.MaxViewDescriptorHeapSize != 0 {
+                limits.MaxViewDescriptorHeapSize
+            } else {
+                PORTABLE_VIEWS
+            }
+        });
         let fits = |count: u32| {
+            if let Some(max) = max_views { return count <= max; }
             // SAFETY: plain heap creation; the heap is released at once.
             let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
                 host.device
@@ -1894,6 +1914,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
+            native_slots: Default::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, Taken::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
@@ -2833,6 +2854,7 @@ impl HostHeap {
                 PLACED_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
             }
+            Some(v) if native_tlas(v).is_some() => false,
             Some(View::Shader(r, _)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
@@ -2947,6 +2969,9 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if (at as usize) < end {
+            if let Some(slots) = self.native_slots.get() {
+                slots.release(first, self.count + end as u32);
+            }
             let given = guard.1.set(at as usize, end, false) as u32;
             GIVEN[1].fetch_add(u64::from(given), std::sync::atomic::Ordering::Relaxed);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
@@ -2964,7 +2989,7 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
-        self.keep(index, kept.flatten());
+        self.keep_view(index, view, kept.flatten());
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2993,7 +3018,10 @@ impl HostHeap {
                 let step = if twins { 2 } else { 1 };
                 let at = step * views.made.len() as u32;
                 // (A constant buffer's bytes are copied for each draw.)
-                if at + step > ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                if at + step > ListViews::SLOTS
+                    || matches!(view, View::Constant(..))
+                    || native_tlas(&view).is_some()
+                {
                     return None;
                 }
                 let twin = twins && twinned(&view);
@@ -3075,6 +3103,13 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        if let Some(slots) = self.native_slots.get() {
+            slots.forget(index);
+        }
+        self.keep_resource(index, resource);
+    }
+
+    fn keep_resource(&self, index: u32, resource: Option<ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3095,7 +3130,7 @@ impl HostHeap {
     }
 
     /// What slot `index` views.
-    fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
+    pub(crate) fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -3583,7 +3618,7 @@ impl HostHeap {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
+            self.keep_view(index, &view, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -4472,6 +4507,49 @@ fn constant_twinned(
     true
 }
 
+/// Native RTAS descriptors have no pResource. The address is carried exclusively
+/// by the SRV union; keep the resource (and therefore its BLAS pins) in the slot.
+pub(crate) fn tlas_srv(
+    dev: &ID3D12Device,
+    target: &ID3D12Resource,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_UNKNOWN,
+        ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV {
+                Location: unsafe { target.GetGPUVirtualAddress() },
+            },
+        },
+    };
+    unsafe { dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at) };
+}
+
+fn native_tlas(view: &View) -> Option<u64> {
+    match view {
+        View::Shader(0, Some(d))
+            if d[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+                && crate::dxr::requested() =>
+        {
+            Some(u64::from(d[4]) | u64::from(d[5]) << 32)
+        }
+        _ => None,
+    }
+}
+
+fn empty_tlas_srv(
+    host: &crate::host::Host,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<ID3D12Resource> {
+    let empty = host.dxr.as_ref()?.srv(0)?;
+    tlas_srv(&host.device, &empty, at);
+    #[cfg(feature = "diagnostics")]
+    crate::replay::record::dxr_slot(at.ptr, 0);
+    Some(empty)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4488,6 +4566,19 @@ fn make_twinned(
 ) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
+    if let Some(key) = native_tlas(view) {
+        let target = if key != 0
+            && let Some(target) = host.dxr.as_ref()?.srv(key)
+        {
+            tlas_srv(device, &target, at);
+            target
+        } else {
+            empty_tlas_srv(host, at)?
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::replay::record::dxr_slot(at.ptr, key);
+        return Some(Some(target));
+    }
     match view {
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
@@ -5208,6 +5299,13 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+        && crate::dxr::requested()
+        && let Some(host) = host()
+        && empty_tlas_srv(host, at).is_some()
+    {
+        return;
+    }
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);

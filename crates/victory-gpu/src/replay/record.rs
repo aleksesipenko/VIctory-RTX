@@ -368,6 +368,36 @@ pub(super) fn recorder() -> Option<&'static Recorder> {
     RECORDER.get()
 }
 
+/// Position after the submitted producer prefix, shared by frame.bin and the
+/// DXR input packet. GPU reads in the packet are ordered at this exact boundary.
+pub(crate) fn dxr_boundary() -> Option<(&'static std::path::Path, u32, usize)> {
+    let r = recorder()?;
+    let (frame, after) = lock(&r.submits).dxr_boundary()?;
+    Some((&r.folder, frame, after))
+}
+
+/// The frame's relocatable resource ID and byte offset of a paged GPU buffer.
+pub(crate) fn dxr_buffer(address: u64) -> Option<(u32, u64)> {
+    match recorder()?.va(address) {
+        Va::At { res, offset } => Some((res, offset)),
+        _ => None,
+    }
+}
+
+/// The recorder's slot copies propagate this tag through CPU staging and visible heaps.
+pub(crate) fn dxr_slot(at: usize, guest: u64) {
+    if let Some(r) = recorder()
+        && let Some((h, i)) = read(&r.descriptors).cpu(at)
+    {
+        let mut slot = h.get(i);
+        if slot.kind == slot::SRV && slot.described != 0 {
+            slot.pad = 1;
+            slot.desc[44..52].copy_from_slice(&guest.to_le_bytes());
+            h.set(i, &slot);
+        }
+    }
+}
+
 /// Whether the recorder is on.
 pub fn on() -> bool {
     RECORDER.get().is_some()

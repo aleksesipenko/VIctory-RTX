@@ -57,6 +57,7 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    pub(crate) dxr: Option<crate::dxr::Sidecar>,
     /// Shader-visible heaps of one slot, bound where a list sets no view or
     /// no sampler heap ([`fallback_heaps`]).
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
@@ -893,8 +894,7 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The process's private bytes (diagnostics: around the making of lists).
-#[cfg(feature = "diagnostics")]
-fn private_bytes() -> u64 {
+pub(crate) fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
@@ -1101,7 +1101,18 @@ fn create() -> windows::core::Result<Host> {
             );
         }
         tracing::info!("host D3D12 device ready");
+        let dxr = if crate::dxr::requested() {
+            Some(
+                crate::dxr::Sidecar::new(&device, &queue, adapter.as_ref()).map_err(|why| {
+                    tracing::error!(why, "could not initialize native RT");
+                    windows::core::Error::new(windows::Win32::Foundation::E_FAIL, why)
+                })?,
+            )
+        } else {
+            None
+        };
         Ok(Host {
+            dxr,
             device,
             queue,
             fence,
@@ -2385,6 +2396,8 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    dxr: Option<std::sync::Arc<[crate::dxr::Work]>>,
+    dxr_reusable: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -5947,6 +5960,71 @@ impl Host {
         crate::descriptor::make_waiting();
         #[cfg(feature = "diagnostics")]
         split.part(15);
+        let dxr = self.dxr.as_ref().map(|dxr| {
+            dxr.collect();
+            let boundaries = runs
+                .iter()
+                .filter_map(|r| {
+                    let d = r.deferred();
+                    if d.dxr.is_none() && d.dxr_reusable.is_none() {
+                        return None;
+                    }
+                    Some((
+                        r.list
+                            .cast::<ID3D12CommandList>()
+                            .expect("host command list")
+                            .as_raw() as usize,
+                        (d.dxr.clone(), d.dxr_reusable.clone()),
+                    ))
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            (dxr, boundaries)
+        });
+        let execute = |group: &[Option<ID3D12CommandList>]| {
+            if group.is_empty() {
+                return;
+            }
+            if let Some((dxr, boundaries)) = &dxr {
+                let send = |lists: &[Option<ID3D12CommandList>]| {
+                    unsafe { self.queue.ExecuteCommandLists(lists) };
+                    #[cfg(feature = "diagnostics")]
+                    dxr.capture_initial();
+                };
+                crate::descriptor::refresh_native_slots(dxr);
+                let mut first = 0;
+                for (i, cmd) in group.iter().enumerate() {
+                    if let Some((batch, reused)) = cmd
+                        .as_ref()
+                        .and_then(|c| boundaries.get(&(c.as_raw() as usize)))
+                    {
+                        if reused
+                            .as_ref()
+                            .is_some_and(|seen| seen.swap(true, Ordering::Relaxed))
+                        {
+                            if first < i {
+                                send(&group[first..i]);
+                            }
+                            dxr.finish_slot_readers();
+                            first = i;
+                        }
+                        let Some(batch) = batch else { continue };
+                        // Execute boundary also decays producer buffers to COMMON. The
+                        // sidecar reads their GPU versions on this same DIRECT queue.
+                        send(&group[first..=i]);
+                        dxr.execute(batch.clone());
+                        first = i + 1;
+                        if first < group.len() {
+                            crate::descriptor::refresh_native_slots(dxr);
+                        }
+                    }
+                }
+                if first < group.len() {
+                    send(&group[first..]);
+                }
+            } else {
+                unsafe { self.queue.ExecuteCommandLists(group) };
+            }
+        };
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
         // When it runs on the card, for the timeline.
@@ -5976,7 +6054,7 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    execute(&lists[from..to]);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -6035,7 +6113,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                execute(group);
                 self.card_sent();
                 let waited = self
                     .queue
@@ -7086,7 +7164,8 @@ impl HostList {
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
-                && deferred.texture_backs.is_empty())
+                && deferred.texture_backs.is_empty()
+                && deferred.dxr.is_none())
             {
                 return false;
             }
@@ -7125,6 +7204,19 @@ impl HostList {
             deferred.kept.push(root.clone().into());
         }
         self.used_pipeline(name);
+    }
+
+    pub(crate) fn has_dxr(&self) -> bool {
+        self.deferred().dxr.is_some()
+    }
+
+    pub(crate) fn mark_dxr_reusable(&self) {
+        self.deferred().dxr_reusable = Some(Default::default());
+    }
+
+    pub(crate) fn set_dxr(&self, batch: crate::dxr::Captured) {
+        let work = crate::dxr::prepare(batch, self);
+        self.deferred().dxr = Some(work);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {

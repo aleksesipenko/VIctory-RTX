@@ -211,6 +211,23 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// Resource VAs for L1 relocation: directory first, then its numbered page
+/// buffers in the exact order used by the guest memory descriptor table.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dxr_page_buffers() -> Vec<u64> {
+    let m = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = m.as_ref() else {
+        return Vec::new();
+    };
+    std::iter::once(m.directory.1.gpu(m.directory.1.span().0))
+        .chain(
+            m.copies
+                .iter()
+                .map(|s| unsafe { s.buffer.GetGPUVirtualAddress() }),
+        )
+        .collect()
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,

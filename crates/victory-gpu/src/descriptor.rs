@@ -855,6 +855,20 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
+/// A descriptor can outlive several AS generations without another guest write.
+#[cfg(windows)]
+pub(crate) fn refresh_native_slots(side: &crate::dxr::Sidecar) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut fenced = false;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: the registry read lock keeps every registered heap alive.
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(h)) = heap.host.get() {
+            h.refresh_native_slots(side, &mut fenced);
+        }
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

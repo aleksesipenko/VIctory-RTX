@@ -5201,7 +5201,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup(address, len, false, None)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -5226,7 +5226,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, true, None)
 }
 
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
@@ -5235,7 +5235,19 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+/// DXR must admit a new whole shadow/window at its actual allocation size.
+/// An existing resident copy bypasses that admission entirely.
+pub(crate) fn dxr_input(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let budget = &host()?.dxr.as_ref()?.budget;
+    lookup(address, len, fine(), Some(budget))
+}
+
+fn lookup(
+    address: u64,
+    len: u64,
+    any: bool,
+    budget: Option<&crate::dxr::Budget>,
+) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
@@ -5255,7 +5267,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return loose(address, end, len <= 1, any, budget);
             }
         }
     }
@@ -5268,7 +5280,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any, budget);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5276,6 +5288,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
+        let reservation = budget.map(|b| b.reserve(size)).transpose().ok()?;
         // In place, if asked for and the memory can be opened
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
@@ -5330,6 +5343,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 len,
                 "buffer copied to the host"
             );
+        }
+        if let Some(r) = reservation {
+            r.finish_shadow(&buffer).ok()?;
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
@@ -5549,7 +5565,13 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+fn loose(
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    any: bool,
+    budget: Option<&crate::dxr::Budget>,
+) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
@@ -5594,6 +5616,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    let reservation = budget
+        .map(|b| b.reserve(len.checked_next_multiple_of(1 << 16).unwrap_or(u64::MAX)))
+        .transpose()
+        .ok()?;
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
@@ -5604,6 +5630,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
+        if let Some(r) = reservation { r.finish_shadow(&buffer).ok()?; }
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5642,6 +5669,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         len,
         "loose memory copied to the host"
     );
+    if let Some(r) = reservation {
+        r.finish_shadow(&buffer).ok()?;
+    }
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;

@@ -107,6 +107,15 @@ pub fn run(
     });
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
+    use victory_hle::modules::bvh_builder;
+    let native_rt = bvh_builder::requested();
+    if native_rt {
+        let (_, builder) = dlls
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(bvh_builder::DLL))
+            .context("VICTORY_NATIVE_RT=1 requires the title's XboxBvhBuilder.dll")?;
+        bvh_builder::install(builder)?;
+    }
     for (name, dll) in &dlls {
         if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER) {
             for sym in ["ffxCreateContext", "ffxDestroyContext", "ffxQuery", "ffxDispatch"] {
@@ -175,9 +184,18 @@ pub fn run(
     // hosts; the rest of that DLL stays the title's. Works on both Series S and
     // Series X (when `VICTORY_UPSCALER=7` selects FidelityFX). Unset: the
     // title's own, as before.
-    struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver, bool);
+    struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver, bool, bool);
     impl victory_loader::ImportResolver for TakeDispatch<'_> {
         fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+            if self.2 && dll.eq_ignore_ascii_case(bvh_builder::DLL)
+                && let victory_pe::ImportSymbol::Name { name, .. } = symbol
+                && let Some(address) = bvh_builder::resolve(name)
+            {
+                return victory_loader::Resolution::Found {
+                    address,
+                    provenance: victory_loader::Provenance::Hle,
+                };
+            }
             if self.1
                 && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
                 && let victory_pe::ImportSymbol::Name { name, .. } = symbol
@@ -195,7 +213,10 @@ pub fn run(
     if take {
         println!("upscale        the title's FidelityFX upscale API is ours (VICTORY_UPSCALE=stretch|dlss)");
     }
-    show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take), policy)?);
+    show(
+        &exe_name,
+        image.bind_imports(&TakeDispatch(&with_dlls, take, native_rt), policy)?,
+    );
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
