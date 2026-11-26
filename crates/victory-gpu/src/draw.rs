@@ -1256,6 +1256,9 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        // Part 2 after a command-list cut must allocate fresh dynamic CBV slots
+        // instead of aliasing Part 1's upload memory / card_steps pool slots.
+        self.fresh_tables.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }

@@ -1456,7 +1456,7 @@ impl Staging {
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
             size
-        } else if last.hash.is_none() && fill_unlocked() {
+        } else if last.hash.is_none() && no_wait() == 1 && fill_unlocked() {
             self.fill(last, size)
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
@@ -1502,7 +1502,7 @@ impl Staging {
         } else {
             crate::descriptor::host::read_all(start);
         }
-        size
+        if got == 0 { 0 } else { size }
     }
 
     /// `tiled`, read whole, was detiled: a texture of all its levels from

@@ -3339,10 +3339,13 @@ fn joins_asked() -> (usize, usize) {
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+    let ahead: Vec<&HostList> = ahead.collect();
+    if ahead.iter().any(|l| l.has_dxr()) || next.iter().any(|l| l.has_dxr()) {
+        return false;
+    }
     if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
         return false;
     }
-    let ahead: Vec<&HostList> = ahead.collect();
     let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
     for list in &ahead {
         let deferred = list.deferred();

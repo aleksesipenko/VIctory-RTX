@@ -516,7 +516,8 @@ fn completed_in_child() -> bool {
         .expect("launch isolated D3D12 node test");
     let log = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success() && log.contains("adapter=NVIDIA GeForce RTX 4070 Ti SUPER"),
+        output.status.success()
+            && (log.contains("adapter=") || log.contains("skipped: no SM 6.6")),
         "{name}: {log}\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -524,13 +525,32 @@ fn completed_in_child() -> bool {
     true
 }
 
-fn ada() -> Host {
-    super::host::enable_debug_layer().expect("Windows Graphics Tools required");
-    let name = "NVIDIA GeForce RTX 4070 Ti SUPER";
-    let host = Host::on_adapter(name).expect("required Ada adapter");
-    assert_eq!(host.adapter_name().as_deref(), Some(name));
+fn ada() -> Option<Host> {
+    let require = std::env::var_os("VICTORY_REQUIRE_DXR_TESTS").is_some_and(|v| v == "1");
+    if let Err(e) = super::host::enable_debug_layer() {
+        if require {
+            panic!("Windows Graphics Tools required: {e}");
+        }
+        eprintln!("skipped: no SM 6.6 debug layer ({e})");
+        return None;
+    }
+    let host = match std::env::var("VICTORY_D3D12_ADAPTER") {
+        Ok(name) if !name.trim().is_empty() => Host::on_adapter(name.trim()),
+        _ => Host::new(false),
+    };
+    let host = match host {
+        Ok(h) => h,
+        Err(e) => {
+            if require {
+                panic!("SM 6.6 hardware adapter required: {e}");
+            }
+            eprintln!("skipped: no SM 6.6 hardware adapter ({e})");
+            return None;
+        }
+    };
+    let name = host.adapter_name().unwrap_or_else(|| "unknown".to_owned());
     eprintln!("adapter={name}");
-    host
+    Some(host)
 }
 
 /// Runs every batch on the hardware adapter and WARP and compares with
@@ -581,7 +601,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             .any(|c| expected(&scene, c, true) != expected(&scene, c, false)),
         "no case tells sorted from unsorted"
     );
-    for (label, host) in [("Ada", Some(ada())), ("warp", Host::new(true).ok())] {
+    for (label, host) in [("Ada", ada()), ("warp", Host::new(true).ok())] {
         let Some(host) = host else { continue };
         let (root, pso) = host
             .compute_pipeline(&shader)
@@ -785,7 +805,7 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
     // Slot 2, the one picked; slot 0 as a decoy.
     table[at..at + 2].copy_from_slice(&[0xdead_0000, 0xdd]);
     table[at + 4..at + 6].copy_from_slice(&[0x1234_5600, 0x42]);
-    for (label, host) in [("Ada", Some(ada())), ("warp", Host::new(true).ok())] {
+    for (label, host) in [("Ada", ada()), ("warp", Host::new(true).ok())] {
         let Some(host) = host else { continue };
         let (root, pso) = host
             .compute_pipeline(&shader)
@@ -861,7 +881,9 @@ fn mask_operations_on_a_joined_number_give_the_number() {
     // The hardware device only: the program declares the console's 32
     // lanes (its wave operations), which WARP does not take.
     let label = "Ada";
-    let host = ada();
+    let Some(host) = ada() else {
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&shader).unwrap();
     let unused = [0u32; 4];
     for (constants, want) in [
@@ -901,7 +923,9 @@ fn box_straddling_real_guest_pages_and_missing_halves_on_ada() {
         return;
     }
     use super::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
-    let host = ada();
+    let Some(host) = ada() else {
+        return;
+    };
     let (mut shader, _) = build(true, WHOLE).unwrap();
     validator::Validator::load(validator::Validator::default_path().as_deref())
         .unwrap()

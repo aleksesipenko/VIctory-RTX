@@ -32,6 +32,11 @@ pub fn requested() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT").is_some_and(|v| v == "1"))
 }
 
+fn strict_tlas() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DXR_STRICT_TLAS").is_some_and(|v| v == "1"))
+}
+
 static UNRECORDED: AtomicU64 = AtomicU64::new(0);
 static EMPTY_TLAS_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
@@ -452,7 +457,18 @@ impl Engine {
                     let base = obs.offset as usize + 16;
                     let missing = u32::from_le_bytes(bytes[base..base + 4].try_into().unwrap());
                     self.stats.missing_blas += u64::from(missing);
-                    if missing != 0 {
+                    let mut deps = Vec::new();
+                    let mut pins = Vec::new();
+                    for (slot, key, entry) in &table.slots {
+                        if bytes[base + 8 + slot / 8] & (1 << (slot % 8)) != 0 {
+                            deps.push((*key, entry.serial));
+                            pins.push(entry.clone());
+                        }
+                    }
+                    // `patch.hlsl` already masks missing BLAS entries with `last.zw = 0`
+                    // (legal null instance in DXR). Reject the whole TLAS only when zero
+                    // valid instances survived or strict certification mode is requested.
+                    if missing != 0 && (deps.is_empty() || strict_tlas()) {
                         self.stats.reject(1, "TLAS references missing BLAS", false);
                         if self
                             .entries
@@ -462,14 +478,6 @@ impl Engine {
                             self.replace(obs.key, None);
                         }
                         continue;
-                    }
-                    let mut deps = Vec::new();
-                    let mut pins = Vec::new();
-                    for (slot, key, entry) in &table.slots {
-                        if bytes[base + 8 + slot / 8] & (1 << (slot % 8)) != 0 {
-                            deps.push((*key, entry.serial));
-                            pins.push(entry.clone());
-                        }
                     }
                     // A BLAS could already have been rebuilt by a later queued submission.
                     let current = deps
@@ -598,10 +606,14 @@ impl Engine {
         if key != 0 {
             self.replace(key, None);
         } else if matches!(&w.op, Op::Rejected { .. }) {
-            // No readable destination. Existing descriptors cannot certify which
-            // address the console call may have replaced; keep only the empty TLAS.
-            self.entries.retain(|&k, _| k == 0);
-            self.table = None;
+            // Do not wipe all already-built world BLAS entries on one rejected
+            // call in live gameplay; only strict certification clears the table.
+            if strict_tlas() {
+                self.entries.retain(|&k, _| k == 0);
+                self.table = None;
+            } else {
+                tracing::warn!(target: "victory_gpu::host", why, "native RT rejected batch without destination VA; keeping existing AS entries");
+            }
         }
     }
 

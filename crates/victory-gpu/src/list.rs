@@ -985,6 +985,8 @@ pub struct Upscale {
     pub near: f32,
     pub far: f32,
     pub frame_ms: f32,
+    /// `FFX_API_CREATE_CONTEXT_DESC_UPSCALE.flags` from `ffxCreateContext`.
+    pub create_flags: u32,
     /// DLSS where it can (`crate::dlss`, the `dlss` feature), else a stretch.
     pub dlss: bool,
 }
@@ -1005,7 +1007,7 @@ impl Upscale {
             pair(self.motion_scale[0], self.motion_scale[1]),
             pair(self.pre_exposure, self.frame_ms),
             pair(self.near, self.far),
-            u64::from(self.reset) | u64::from(self.dlss) << 1,
+            u64::from(self.reset) | u64::from(self.dlss) << 1 | u64::from(self.create_flags) << 32,
         ]
     }
 
@@ -1029,6 +1031,7 @@ impl Upscale {
             frame_ms,
             near,
             far,
+            create_flags: (w[10] >> 32) as u32,
             reset: w[10] & 1 != 0,
             dlss: w[10] & 2 != 0,
         })
@@ -1091,6 +1094,7 @@ pub(super) fn upscale_now(this: This, up: &Upscale) -> bool {
                 near: up.near,
                 far: up.far,
                 frame_ms: up.frame_ms,
+                create_flags: up.create_flags,
             };
             done = crate::dlss::record(&host.device, &list.list, &inputs);
         }

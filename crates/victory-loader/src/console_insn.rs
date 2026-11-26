@@ -113,6 +113,24 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
 static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
 pub(crate) const STUBS_LEN: usize = 64 << 10;
 
+/// Instruction addresses self-patched in-place by [`emulate`] (`clwb`,
+/// `monitorx`, `mwaitx`, `clzero` loop): if a sibling thread faults with `#UD`
+/// at `rip` right as this thread overwrites those bytes, `decode` returns
+/// `None`, and retrying execution at `rip` lets the sibling execute the patch
+/// instead of crashing with `STATUS_ILLEGAL_INSTRUCTION`.
+static PATCHED_SITES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn note_patched(rip: usize) {
+    let mut sites = PATCHED_SITES.lock().unwrap_or_else(|e| e.into_inner());
+    if !sites.contains(&rip) {
+        sites.push(rip);
+    }
+}
+
+fn is_patched(rip: usize) -> bool {
+    PATCHED_SITES.lock().unwrap_or_else(|e| e.into_inner()).contains(&rip)
+}
+
 /// Memory for code within reach of a `jmp rel32` at `at`.
 pub(crate) fn near(at: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
@@ -408,7 +426,14 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let Some((what, len)) = decode::decode(code) else {
+        // Another thread may have concurrently patched this exact instruction
+        // while this thread was entering the #UD handler; retry execution at `rip`.
+        if is_patched(rip) {
+            return CONTINUE_EXECUTION;
+        }
+        return 0;
+    };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -434,6 +459,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
                     std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
                     VirtualProtect(rip as *const _, len, old, &mut old);
+                    note_patched(rip);
                 }
             }
         }
@@ -446,6 +472,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 // replacements are waits that wait for nothing, as the emulation is.
                 && unsafe { patch(rip, [code[0], code[1], code[2]], new) }
             {
+                note_patched(rip);
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
             }
@@ -470,6 +497,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 // SAFETY: the title's code, where the loop's first instruction just faulted.
                 && unsafe { patch_clzero(rip, &code[..12]) }
             {
+                note_patched(rip);
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
             }

@@ -104,12 +104,30 @@ pub(crate) struct Inputs<'a> {
     pub near: f32,
     pub far: f32,
     pub frame_ms: f32,
+    /// `FFX_API_CREATE_CONTEXT_DESC_UPSCALE.flags` from `ffxCreateContext`.
+    pub create_flags: u32,
 }
 
 struct Feature {
     handle: *mut c_void,
     /// render width and height the feature was made for, output size, flags
     key: [u32; 5],
+}
+
+/// Defers `NVSDK_NGX_D3D12_ReleaseFeature` until in-flight GPU command lists
+/// that evaluated the previous feature have completed (`crate::host::retire`).
+struct RetiredFeature(*mut c_void);
+
+// SAFETY: NGX feature handle retired only after GPU submissions complete.
+unsafe impl Send for RetiredFeature {}
+
+impl Drop for RetiredFeature {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: handle created by `NVSDK_NGX_D3D12_CreateFeature`.
+            unsafe { NVSDK_NGX_D3D12_ReleaseFeature(self.0) };
+        }
+    }
 }
 
 struct Dlss {
@@ -250,7 +268,8 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
     let (in_w, in_h) = (colour.Width as u32, colour.Height);
     let hdr = env_flag("VICTORY_DLSS_HDR").unwrap_or(matches!(colour.Format.0, 2 | 10 | 26 | 24 | 9));
     let inverted = env_flag("VICTORY_DLSS_DEPTH_INVERTED").unwrap_or(inputs.near > inputs.far);
-    let mv_jittered = env_flag("VICTORY_DLSS_MV_JITTERED").unwrap_or(true);
+    // FFX bit 2 = ENABLE_MOTION_VECTORS_JITTER_CANCELLATION (1 = jittered MVs, 0 = unjittered).
+    let mv_jittered = env_flag("VICTORY_DLSS_MV_JITTERED").unwrap_or((inputs.create_flags & (1 << 2)) != 0);
     let mut flags = FLAG_MV_LOW_RES;
     if mv_jittered {
         flags |= FLAG_MV_JITTERED;
@@ -268,8 +287,7 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
     let p = dlss.params;
     if dlss.feature.as_ref().is_none_or(|f| f.key != key) {
         if let Some(old) = dlss.feature.take() {
-            // SAFETY: a handle the SDK made.
-            unsafe { NVSDK_NGX_D3D12_ReleaseFeature(old.handle) };
+            crate::host::retire(RetiredFeature(old.handle));
         }
         let quality = env_i("VICTORY_DLSS_QUALITY").unwrap_or_else(|| auto_quality(render[0], out.Width as u32));
         let preset = dlss_preset();
@@ -296,8 +314,7 @@ pub(crate) fn record(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, in
             NVSDK_NGX_D3D12_CreateFeature(list.as_raw(), FEATURE_SUPER_SAMPLING, p, &mut handle)
         };
         if r != SUCCESS || handle.is_null() {
-            tracing::warn!(result = format_args!("{r:#x}"), ?key, "DLSS: no feature for these sizes; the upscale stays a stretch");
-            *guard = Some(None);
+            tracing::warn!(result = format_args!("{r:#x}"), ?key, "DLSS: no feature for these sizes; this upscale stays a stretch");
             return false;
         }
         let preset_label = preset.as_ref().map_or("default", |(_, s)| s.as_str());

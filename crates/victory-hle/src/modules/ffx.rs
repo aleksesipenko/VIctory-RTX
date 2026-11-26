@@ -240,6 +240,8 @@ fn jitter_offset(index: i32, phase_count: i32) -> (f32, f32) {
     (halton(idx, 2) - 0.5, halton(idx, 3) - 0.5)
 }
 
+static CREATE_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 extern "system" fn create_context(
     context: *mut *mut c_void,
     desc: *const Header,
@@ -252,6 +254,7 @@ extern "system" fn create_context(
     {
         // SAFETY: an upscale creation descriptor, by its type.
         let c = unsafe { &*desc.cast::<CreateUpscale>() };
+        CREATE_FLAGS.store(c.flags, Ordering::Relaxed);
         // SAFETY: out pointer from caller.
         unsafe { *context = our_context_ptr() };
         tracing::info!(
@@ -447,6 +450,7 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     near: d.camera_near,
                     far: d.camera_far,
                     frame_ms: d.frame_time_delta,
+                    create_flags: CREATE_FLAGS.load(Ordering::Relaxed),
                     dlss: want_dlss(),
                 };
                 if victory_gpu::list::upscale(d.list, &up) {
@@ -462,6 +466,10 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 "another FidelityFX dispatch"
             );
         }
+    }
+    // Never pass our synthetic sentinel context pointer to the title's real FSR DLL.
+    if !context.is_null() && is_our_context(unsafe { *context }) {
+        return ERROR;
     }
     match REAL_DISPATCH.load(Ordering::Relaxed) {
         // Neither stretched nor passed on: the output was not written, and

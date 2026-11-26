@@ -3804,8 +3804,14 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        if block >= Bits::PIECES * Bits::WORDS * 64 {
+            return match ours {
+                Some(exit) => fail(exit),
+                None => EXCEPTION_CONTINUE_SEARCH,
+            };
+        }
         if ours.is_none()
-            && PROTECTED.any(block, block + 1)
+            && PROTECTED.any(block, block.saturating_add(1))
             // SAFETY: the context the system passes, to go on from.
             && crate::titlewrite::store(unsafe { &mut *context }, at)
         {
@@ -3816,7 +3822,7 @@ pub(crate) fn install() {
         // again since that (then it is ours again, not read-only for some
         // other reason).
         for _ in 0..3 {
-            if !PROTECTED.any(block, block + 1) && writable(at) {
+            if !PROTECTED.any(block, block.saturating_add(1)) && writable(at) {
                 #[cfg(feature = "diagnostics")]
                 crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
                 return EXCEPTION_CONTINUE_EXECUTION;
