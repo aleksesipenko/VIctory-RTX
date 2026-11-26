@@ -150,6 +150,9 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(backend.as_encoded_bytes());
             bytes.push(0);
         }
+        append_native_rt_key(&mut bytes, victory_shader::emit::native_rt(), |name| {
+            std::env::var_os(name)
+        });
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -158,6 +161,31 @@ fn build() -> [u8; 32] {
         hash.update(&value.to_le_bytes());
     }
     *hash.finalize().as_bytes()
+}
+
+/// Append nothing to the versioned legacy key unless the native sidecar is on.
+fn append_native_rt_key(
+    bytes: &mut Vec<u8>,
+    enabled: bool,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    if !enabled {
+        return;
+    }
+    bytes.extend_from_slice(b"VICTORY_NATIVE_RT=1\0");
+    for name in [
+        "VICTORY_NATIVE_RT_ANYHIT",
+        "VICTORY_NATIVE_RT_FILTER",
+        "VICTORY_NATIVE_RT_TWO_PASS",
+        "VICTORY_NATIVE_RT_FBT_TWOPASS",
+    ] {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        if let Some(value) = get(name) {
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        bytes.push(0);
+    }
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -469,6 +497,26 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_rt_cache_key_keeps_legacy_bytes_and_separates_each_override() {
+        let key = |on, knob: &str| {
+            let mut bytes = b"existing key".to_vec();
+            append_native_rt_key(&mut bytes, on, |name| (name == knob).then(|| "1".into()));
+            bytes
+        };
+        let mut keys = std::collections::HashSet::from([key(true, "")]);
+        for knob in [
+            "VICTORY_NATIVE_RT_ANYHIT",
+            "VICTORY_NATIVE_RT_FILTER",
+            "VICTORY_NATIVE_RT_TWO_PASS",
+            "VICTORY_NATIVE_RT_FBT_TWOPASS",
+        ] {
+            assert_eq!(key(false, knob), b"existing key");
+            assert!(keys.insert(key(true, knob)), "{knob} aliased another mode");
+        }
+        assert!(!keys.contains(b"existing key".as_slice()));
+    }
 
     fn shader() -> HostShader {
         HostShader {

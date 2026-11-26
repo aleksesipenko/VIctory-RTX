@@ -100,6 +100,9 @@ mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod ray_query;
+mod rayquery_lift;
+#[cfg(all(test, windows))]
+mod rayquery_tests;
 pub mod rt_replay;
 mod rect;
 mod sampler;
@@ -136,6 +139,60 @@ pub use shader::{
     USER_VIEW_ADDRESS, USER_VIEW_BIAS, constants_raw, raw_views, set_raw_views,
     set_view_heap_limit, view_heap_limit,
 };
+
+/// Native DXR uses the same explicit opt-in as the GPU sidecar.
+pub fn native_rt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT").is_some_and(|v| v == "1"))
+}
+
+// Ray loop policy adapted from maren-halv/VIctory-DXR @ cd87189 (GPL-3.0).
+fn native_rt_anyhit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT_ANYHIT").is_some_and(|v| v == "1"))
+}
+
+fn native_rt_two_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT_TWO_PASS").is_none_or(|v| v != "0"))
+}
+
+// Face-cull flags cannot override TRIANGLE_CULL_DISABLE on an instance.
+// The default single-pass candidate loop inspects the actual triangle face.
+fn native_rt_fbt_two_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT_FBT_TWOPASS").is_some_and(|v| v == "1"))
+}
+
+fn rt_filter() -> &'static [String] {
+    static FILTER: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| {
+        std::env::var("VICTORY_NATIVE_RT_FILTER")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    })
+}
+
+fn rt_selected(c: &Container) -> bool {
+    if !native_rt() {
+        return false;
+    }
+    let filter = rt_filter();
+    if filter.is_empty() {
+        return true;
+    }
+    // translate(), offline emit() and retries use the same short BLAKE3 ID
+    // as the run log. Also accept a substring of the original DXBC digest.
+    let id = blake3::hash(c.bytes).to_hex();
+    let digest: String = c.digest.iter().map(|b| format!("{b:02x}")).collect();
+    filter
+        .iter()
+        .any(|part| id[..16].contains(part) || digest.contains(part))
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -667,7 +724,8 @@ fn emit_forms(
         // (approximate: a tile-wide result becomes two half-tile ones),
         // with the exact paired form (`exactly`) always preferred first;
         // `VICTORY_WAVE_LOCAL=idiom` refuses approximate fallback instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let strict = (!res.bvh.is_empty() && rt_selected(c))
+            || std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
         let idiom = |p: &ir::Program, st: &structure::Structured| match idiom::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -1117,7 +1175,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -1127,7 +1185,12 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = if !res.bvh.is_empty() && native.stage == HwStage::Cs && rt_selected(c) {
+        lower::lower_rt(&parts)?
+    } else {
+        lower::lower(&parts)?
+    };
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

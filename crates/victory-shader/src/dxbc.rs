@@ -58,6 +58,8 @@ pub struct Part<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Container<'a> {
+    /// Exact extent for content identifiers, including when parsed from a larger archive.
+    pub(crate) bytes: &'a [u8],
     pub digest: [u8; 16],
     pub version: (u16, u16),
     /// Validated total byte length of the DXBC container from header offset `0x18`.
@@ -104,6 +106,7 @@ impl<'a> Container<'a> {
             });
         }
         Ok(Container {
+            bytes: data,
             digest,
             version,
             total_size: total,
