@@ -117,13 +117,31 @@ and run notes live outside git in `victory.toml` and `local/`.
   - `VICTORY_RESIDENCY=1` (`residency.rs`): monitors available RAM and Windows
     commit headroom, throttling speculative texture prefetch (64 MiB -> 16 MiB)
     and blocking speculative staging growth when commit drops below 1 GiB.
+  - `resource.rs` & `descriptor.rs` (`avatarmanz` PR #206): evicts idle host
+    textures after 5 s (instead of 10 min) while `residency::pressured()` is
+    true, zeroes stack-junk padding words in placed-view descriptions, and keys
+    `shape_index` by hash to prevent unbounded shape-table growth.
+  - `descriptor/host.rs`, `pool.rs`, `texture.rs` (`avatarmanz` PR #237):
+    replaces linear `Vec<bool>` dynamic-slot scans with a 64-bit word bitmask
+    (`Taken`) and guards aliasing barriers with `pool::pooled(texture)` so
+    committed/stand-in textures do not trigger `E_INVALIDARG`.
+  - `fence.rs` (`codec-d/cool_fox`): uses `WaitOnAddress` / `WakeByAddressAll`
+    for blocking fence waits instead of returning `E_NOTIMPL`.
   - `pipeline/make.rs`: caps automatic pipeline worker threads to 8 on hosts
     with <= 32 GB RAM (`worker_count_for` + `residency::limited_host_ram()`),
     avoiding parallel NVIDIA driver compiler RAM spikes (`codec-d/cool_fox`
     `8cc31ab`).
   - `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_DESCRIPTORS=1`,
-    `VICTORY_PORT_CBV=1` (from `avatarmanz/VIctory-7900XTX`): cut per-frame CPU
-    copies and mirror overhead regardless of GPU vendor.
+    `VICTORY_PORT_CBV=1`, `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`
+    (from `avatarmanz/VIctory-7900XTX` `c9c932c`): cut per-frame CPU copies,
+    mirroring, guard lock contention, and journal lock contention.
+  - `VICTORY_CARD_BUFFERS_MIN_KB=64` + `VICTORY_CARD_BUFFERS_MB=2048`: offloads
+    shader-written buffer comparisons from CPU to GPU (+43% avg / +58% median
+    FPS measured on RTX 4070 Ti SUPER 16 GB).
+  - **Warning on `VICTORY_LEVELS_ON_DEMAND=1`:** On NVIDIA + Series X, enabling
+    tiled on-demand mip uploads increased VRAM (`9.6 -> 14.2 GB`), private RAM
+    (`23.1 -> 29.2 GB`), and `heap buffers` CPU time (`1.1 -> 24.5 ms/frame`).
+    Leave `VICTORY_LEVELS_ON_DEMAND` off on Series X + NVIDIA.
 
 ---
 
@@ -178,10 +196,24 @@ and run notes live outside git in `victory.toml` and `local/`.
 
 ---
 
-## 9. Still Open (Expected on First Launch)
+## 9. Still Open (Observed in Live Runs)
 
-- Real ray-traced reflections and GI (deferred to Stage 2).
-- Occasional distant foliage/sign flicker inherited from upstream.
-- Streaming texture pop-in when moving rapidly through dense areas.
-- Frame-rate target tuning (`VICTORY_FRAME_INTERVAL_MS`, CPU vs GPU bottleneck
-  profiling on i5-14600K + RTX 4070 Ti SUPER) to be measured after first boot.
+- **Stage 1 RT reflection speckles:** Uninitialized RT reflection targets when
+  `CS_RaytracingResolve` is skipped can show RGB speckles on car glass and
+  magenta tint on foliage/white cloth; real ray-traced reflections & GI wait
+  for Stage 2.
+- **Series S dark hair/eye blocks:** Series S produces 32x32 dark blocks around
+  character hair/eyes on NVIDIA Wave32 even with `VICTORY_UPSCALER=6`; Series X
+  (`1920x1080` @ `0.67`, `VICTORY_UPSCALER=6`) renders faces and hair cleanly.
+- **12 refused compute host pipelines (`E_INVALIDARG` / `0x80070057`):**
+  Identical across Series X and Series S (`02384a60fda6f2d0`,
+  `0a5d4f9047b3dce4`, `0a5ecfee6b79e13b`, `369cbe906ea72764`,
+  `3c196d81eca7ff15`, `5dc3b25986622949`, `6b82bc7d22016cb5`,
+  `6f225b641c5b0708`, `71883e40620a567a`, `acf14a70f37fb012`,
+  `f0aa2b1e79275592`, `f79824724d8e2daf`).
+- **Remaining CPU bottleneck for native 30 FPS:** On RTX 4070 Ti SUPER 16 GB,
+  GPU wait is only ~1-6 ms (`~66%` util, `57 C`, `~97 W`) while CPU command
+  translation (`VICTORY_THIN`), `preparing` (~22 ms), and non-twin table CBV
+  copies (~6,200-8,600/frame on the 1M NVIDIA heap) set the ~20-25 FPS native
+  world ceiling. Native DLSS (`avatarmanz` PR #203) and NVIDIA Smooth Motion
+  (driver 621.40+ on RTX 40-series) are the next high-leverage steps.
