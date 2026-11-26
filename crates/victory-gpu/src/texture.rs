@@ -67,6 +67,10 @@ pub(crate) struct Staging {
     /// The title texture's shape, for `crate::texstore`.
     shape: crate::texstore::Shape,
     memory: *const u8,
+    /// Whether the write-watch guard may stand in for hashing this texture:
+    /// false for linear one-level R8 video planes written through another
+    /// mapping of the same pages (trustno1-coder/VIctory-NVIDIA 77e13a9).
+    guard_view: bool,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -112,6 +116,19 @@ struct Last {
 /// Frames a guarded texture is hashed at every check from its first check,
 /// and after the hash found a change the guard did not see.
 const HOT_FRAMES: u64 = 64;
+
+/// Frames a texture caught changing without a write-watch hit stays hot
+/// (`VICTORY_VIDEO_HOT_FRAMES`, default 1024) so intro video ring-buffer slots
+/// do not cool off and display stale frames (trustno1-coder/VIctory-NVIDIA 77e13a9).
+fn blind_hot_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_VIDEO_HOT_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024)
+    })
+}
 
 /// Whether a guarded texture whose memory the hash found changed although
 /// the guard saw no write is hashed at every check for a while
@@ -794,8 +811,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
-    // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    // frame was recorded before that check). Video planes (`guard_view` false)
+    // always record their copy so ring-buffer frames never show out of order.
+    if staging.guard_view && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1277,6 +1295,7 @@ impl Staging {
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
         if !alone
+            && self.guard_view
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -1301,7 +1320,7 @@ impl Staging {
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
             if blind && hot_textures() {
-                last.hot_until = crate::frame::current() + HOT_FRAMES;
+                last.hot_until = crate::frame::current() + blind_hot_frames();
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
             }
@@ -1869,6 +1888,17 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // Software-decoded movie planes are linear single-level R8 textures that
+    // the decoder writes through another mapping of the same pages; bypass the
+    // write-watch guard and hash/copy every frame so the 3-frame ring never
+    // shows out of order (`VICTORY_VIDEO_PLANES=0` restores previous behavior).
+    static PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let guard_view = !(*PLANES.get_or_init(|| std::env::var_os("VICTORY_VIDEO_PLANES").is_none_or(|v| v != "0"))
+        && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
     let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
@@ -1939,6 +1969,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         bytes: total,
         shape: desc.shape(),
         memory,
+        guard_view,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),

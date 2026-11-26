@@ -112,6 +112,17 @@ fn air() -> f32 {
     })
 }
 
+/// How many times the estimate the title's own diffuse resolve may keep
+/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4.0 when unset; from trustno1-coder/VIctory-NVIDIA 77e13a9).
+/// Lowering to ~2.0 prevents overbright/beige interiors when rays are off.
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
+    })
+}
+
 /// How the slow mean of the light around follows the frames
 /// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
 /// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is 25
@@ -325,6 +336,8 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // Scrub NaN/infinity in fog volume before view-ray summation (trustno1-coder 77e13a9).
+    if (any(isnan(c)) || any(isinf(c))) { scattered[at] = 0; return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
@@ -568,7 +581,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
