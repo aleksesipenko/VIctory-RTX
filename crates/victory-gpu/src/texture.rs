@@ -1636,6 +1636,15 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 /// Largest texture [`fingerprint_for`] reads whole when its slot is live.
 const LIVE_WHOLE_BYTES: u64 = 4 << 20;
 
+/// Bytes [`fingerprint_for`] reads from title memory for `(len, whole)`.
+pub(crate) fn fingerprint_bytes(len: u64, whole: bool) -> u64 {
+    if whole && len <= LIVE_WHOLE_BYTES {
+        len
+    } else {
+        len.min(3 * (16 << 10))
+    }
+}
+
 /// [`fingerprint`], or for a live slot (one found changing after its upload)
 /// no larger than 4 MiB, one of all of its memory (GPL-3.0 provenance:
 /// avatarmanz/VIctory-7900XTX #390). The three 16 KiB windows miss a video

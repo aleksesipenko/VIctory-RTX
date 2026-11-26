@@ -737,20 +737,155 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a texture found changed after its upload with nothing to tell
-/// of it is kept live: looked at every frame, fingerprinted whole
-/// (`VICTORY_LIVE_TEXTURES=0`: backs off along [`RECHECK_FRAMES`] as
-/// before; GPL-3.0 provenance: avatarmanz/VIctory-7900XTX #390). A TV's
-/// news video showed a colour ghost of an earlier frame: its luma and
-/// chroma planes each waited 12-44 frames on their own count.
+/// Whether a texture found changed repeatedly (>= 2 times) after its upload
+/// with nothing to tell of it is kept live: looked at every frame,
+/// fingerprinted whole (`VICTORY_LIVE_TEXTURES=0`: backs off along
+/// [`RECHECK_FRAMES`] as before; GPL-3.0 base: avatarmanz/VIctory-7900XTX #390).
+/// Requiring >= 2 changes prevents one-shot streaming arrivals from burning
+/// whole-texture hashing; after [`LIVE_LOOKS`] unchanged frames a live slot
+/// drops to periodic polling ([`LIVE_PAUSED_FRAMES`]) so paused videos wake up
+/// cleanly when playback resumes.
 fn live_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIVE_TEXTURES").is_none_or(|v| v != "0"))
 }
 
-/// Unchanged looks in a row after which a live slot goes back to the plain
-/// looks: some seconds at the world's frame rate.
+/// Short per-frame cheap (3-strip) poll window after a slot's first post-upload
+/// change so a 24/30 fps video's second frame promotes it to `Live`, while a
+/// one-shot streaming texture backs off along [`RECHECK_FRAMES`] and exits
+/// without ever doing whole-texture hashing.
+const CHANGED_ONCE_FAST_LOOKS: u8 = 4;
+
+/// Unchanged looks in a row after which a live slot switches from per-frame
+/// polling to periodic paused polling ([`LIVE_PAUSED_FRAMES`]).
 const LIVE_LOOKS: u8 = 120;
+
+/// Periodic recheck interval (frames) for a confirmed live slot that paused
+/// for [`LIVE_LOOKS`] frames: stays registered (~2 s at 30 fps) until
+/// overwritten or removed so resumed video wakes back into per-frame `Live`.
+const LIVE_PAUSED_FRAMES: u64 = 60;
+
+/// Maximum bytes of whole-texture live fingerprinting per `heap_textures` pass
+/// (~16 MiB): excess live/paused slots are deferred fairly to the next frame
+/// without starving normal textures.
+const LIVE_PASS_BUDGET_BYTES: u64 = 16 << 20;
+
+/// Outcome of checking a previously uploaded texture slot in `heap_textures`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecheckAction {
+    /// Deferred to `due` because the per-pass live whole-fingerprint budget
+    /// is full; slot stays in queue with its existing poll rank.
+    Defer(u64),
+    /// Memory unchanged: reschedule recheck with `(due, print, looks, state)`.
+    Recheck {
+        due: u64,
+        print: u64,
+        looks: u8,
+        state: crate::descriptor::host::LiveState,
+    },
+    /// Memory unchanged and schedule exhausted: remove from queue.
+    Done,
+    /// Memory changed: upload and re-arm with `(again_in, next_state)`.
+    Upload {
+        again_in: u64,
+        next_state: crate::descriptor::host::LiveState,
+    },
+}
+
+/// Evaluates one due recheck slot against the live-texture state machine and
+/// per-pass whole-fingerprint byte budget.
+#[allow(clippy::too_many_arguments)]
+fn decide_recheck(
+    frame: u64,
+    at: u64,
+    len: u64,
+    print: u64,
+    looks: u8,
+    was_state: crate::descriptor::host::LiveState,
+    live_on: bool,
+    soon: bool,
+    live_hashed_bytes: &mut u64,
+    fingerprint: impl FnOnce(u64, u64, bool) -> u64,
+) -> RecheckAction {
+    use crate::descriptor::host::LiveState;
+    let whole = was_state.whole_fingerprint();
+    if whole {
+        let cost = crate::texture::fingerprint_bytes(len, true);
+        if *live_hashed_bytes > 0
+            && live_hashed_bytes.saturating_add(cost) > LIVE_PASS_BUDGET_BYTES
+        {
+            return RecheckAction::Defer(frame + 1);
+        }
+        *live_hashed_bytes = live_hashed_bytes.saturating_add(cost);
+    }
+    if fingerprint(at, len, whole) == print {
+        return match was_state {
+            LiveState::Live => {
+                if looks < LIVE_LOOKS {
+                    RecheckAction::Recheck {
+                        due: frame + 1,
+                        print,
+                        looks: looks + 1,
+                        state: LiveState::Live,
+                    }
+                } else {
+                    RecheckAction::Recheck {
+                        due: frame + LIVE_PAUSED_FRAMES,
+                        print,
+                        looks: 0,
+                        state: LiveState::Paused,
+                    }
+                }
+            }
+            LiveState::Paused => RecheckAction::Recheck {
+                due: frame + LIVE_PAUSED_FRAMES,
+                print,
+                looks: 0,
+                state: LiveState::Paused,
+            },
+            LiveState::ChangedOnce => {
+                if looks < CHANGED_ONCE_FAST_LOOKS {
+                    RecheckAction::Recheck {
+                        due: frame + 1,
+                        print,
+                        looks: looks + 1,
+                        state: LiveState::ChangedOnce,
+                    }
+                } else {
+                    let step = usize::from(looks - CHANGED_ONCE_FAST_LOOKS);
+                    match RECHECK_FRAMES.get(step) {
+                        Some(&wait) => RecheckAction::Recheck {
+                            due: frame + wait,
+                            print,
+                            looks: looks + 1,
+                            state: LiveState::ChangedOnce,
+                        },
+                        None => RecheckAction::Done,
+                    }
+                }
+            }
+            LiveState::Plain => match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                Some(&wait) => RecheckAction::Recheck {
+                    due: frame + wait,
+                    print,
+                    looks: looks + 1,
+                    state: LiveState::Plain,
+                },
+                None => RecheckAction::Done,
+            },
+        };
+    }
+    let again_in = if soon { 1 } else { RECHECK_FRAMES[0] };
+    let next_state = if live_on {
+        match was_state {
+            LiveState::Plain => LiveState::ChangedOnce,
+            LiveState::ChangedOnce | LiveState::Live | LiveState::Paused => LiveState::Live,
+        }
+    } else {
+        LiveState::Plain
+    };
+    RecheckAction::Upload { again_in, next_state }
+}
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -2477,6 +2612,7 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
+        let mut live_hashed_bytes = 0u64;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
@@ -2507,57 +2643,46 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            // A slot found changed after its upload stays live (looked at
-            // every frame, fingerprinted whole) across its uploads again.
-            let mut live = false;
-            if let Some((at, len, print, looks, uploaded, was_live)) =
+            // A slot changed >= 2 times after upload stays live (looked at
+            // every frame, fingerprinted whole within LIVE_PASS_BUDGET_BYTES)
+            // and drops to periodic paused checks after LIVE_LOOKS static frames.
+            let mut live_state = crate::descriptor::host::LiveState::Plain;
+            if let Some((at, len, print, looks, uploaded, was_state)) =
                 host.texture_slot_checked(index)
             {
-                if crate::texture::fingerprint_for(at, len, was_live) == print {
-                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    if was_live {
-                        // Unchanged this frame (a 30 fps video between two of
-                        // its frames): looked at in the next one again. Backing
-                        // off to 12 and 40 frames showed each plane of a TV's
-                        // video that late, each on its own count. After
-                        // LIVE_LOOKS unchanged looks in a row (the screen is
-                        // off) it goes back to the plain looks.
-                        if looks < LIVE_LOOKS {
-                            let next = frame + 1;
-                            let looks = looks + 1;
-                            host.texture_slot_recheck(
-                                index, write, next, (at, len), print, looks, uploaded, true,
-                            );
-                        } else {
-                            let print = crate::texture::fingerprint(at, len);
-                            let next = frame + RECHECK_FRAMES[1];
-                            host.texture_slot_recheck(
-                                index, write, next, (at, len), print, 1, uploaded, false,
-                            );
-                        }
+                match decide_recheck(
+                    frame,
+                    at,
+                    len,
+                    print,
+                    looks,
+                    was_state,
+                    live_textures(),
+                    recheck_soon(),
+                    &mut live_hashed_bytes,
+                    crate::texture::fingerprint_for,
+                ) {
+                    RecheckAction::Defer(next) => {
+                        host.texture_slot_defer_live(index, write, next);
                         continue;
                     }
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(
-                                index,
-                                write,
-                                frame + wait,
-                                (at, len),
-                                print,
-                                looks + 1,
-                                uploaded,
-                                false,
-                            )
-                        }
-                        None => host.texture_slot_done(index, write, None),
+                    RecheckAction::Recheck { due, print, looks, state } => {
+                        HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_recheck(
+                            index, write, due, (at, len), print, looks, uploaded, state,
+                        );
+                        continue;
                     }
-                    continue;
+                    RecheckAction::Done => {
+                        HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_done(index, write, None);
+                        continue;
+                    }
+                    RecheckAction::Upload { again_in: wait, next_state } => {
+                        again_in = wait;
+                        live_state = next_state;
+                    }
                 }
-                if recheck_soon() {
-                    again_in = 1;
-                }
-                live = live_textures();
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2729,9 +2854,21 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::fingerprint_for(at, len, live);
+                        let whole = live_state.whole_fingerprint();
+                        let print = crate::texture::fingerprint_for(at, len, whole);
+                        if whole {
+                            live_hashed_bytes = live_hashed_bytes
+                                .saturating_add(crate::texture::fingerprint_bytes(len, true));
+                        }
                         host.texture_slot_recheck(
-                            index, write, frame + again_in, (at, len), print, 0, frame, live,
+                            index,
+                            write,
+                            frame + again_in,
+                            (at, len),
+                            print,
+                            0,
+                            frame,
+                            live_state,
                         );
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2856,9 +2993,21 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint_for(at, len, live);
+                    let whole = live_state.whole_fingerprint();
+                    let print = crate::texture::fingerprint_for(at, len, whole);
+                    if whole {
+                        live_hashed_bytes = live_hashed_bytes
+                            .saturating_add(crate::texture::fingerprint_bytes(len, true));
+                    }
                     host.texture_slot_recheck(
-                        index, write, frame + again_in, (at, len), print, 0, frame, live,
+                        index,
+                        write,
+                        frame + again_in,
+                        (at, len),
+                        print,
+                        0,
+                        frame,
+                        live_state,
                     );
                 }
                 None => host.texture_slot_done(index, write, again),
@@ -4872,6 +5021,176 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    /// 1st post-upload change keeps cheap 3-strip checks (`ChangedOnce`) so
+    /// one-shot streaming textures back off and exit without whole-texture
+    /// hashing; a 2nd change promotes to `Live`; > `LIVE_LOOKS` static frames
+    /// park in periodic `Paused` (never dropped forever); a change after a
+    /// long pause immediately wakes back into per-frame `Live`.
+    #[test]
+    fn live_recheck_requires_two_changes_pauses_periodically_and_resumes() {
+        use super::{
+            CHANGED_ONCE_FAST_LOOKS, LIVE_LOOKS, LIVE_PAUSED_FRAMES, RECHECK_FRAMES,
+            RecheckAction, decide_recheck,
+        };
+        use crate::descriptor::host::LiveState;
+
+        let len = 2 << 20; // 2 MiB video plane
+        // 1) Plain -> 1st change does NOT enable Live (stays ChangedOnce, cheap strip hash).
+        let mut budget = 0u64;
+        let mut saw_whole = None;
+        let act = decide_recheck(5, 0x1000, len, 10, 0, LiveState::Plain, true, true, &mut budget, |_, _, whole| {
+            saw_whole = Some(whole);
+            20
+        });
+        assert_eq!(saw_whole, Some(false));
+        assert_eq!(budget, 0, "Plain check must not consume live whole-hash budget");
+        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::ChangedOnce });
+
+        // 2) One-shot streaming texture (no 2nd change): 4 fast cheap looks, then RECHECK_FRAMES, then Done.
+        let mut frame = 6u64;
+        let mut looks = 0u8;
+        for step in 0..CHANGED_ONCE_FAST_LOOKS {
+            budget = 0;
+            let act = decide_recheck(frame, 0x1000, len, 20, looks, LiveState::ChangedOnce, true, true, &mut budget, |_, _, whole| {
+                assert!(!whole, "ChangedOnce must use cheap 3-strip fingerprint");
+                20
+            });
+            assert_eq!(budget, 0);
+            assert_eq!(act, RecheckAction::Recheck { due: frame + 1, print: 20, looks: step + 1, state: LiveState::ChangedOnce });
+            frame += 1;
+            looks += 1;
+        }
+        for &wait in &RECHECK_FRAMES {
+            budget = 0;
+            let act = decide_recheck(frame, 0x1000, len, 20, looks, LiveState::ChangedOnce, true, true, &mut budget, |_, _, whole| {
+                assert!(!whole);
+                20
+            });
+            assert_eq!(budget, 0);
+            assert_eq!(act, RecheckAction::Recheck { due: frame + wait, print: 20, looks: looks + 1, state: LiveState::ChangedOnce });
+            frame += wait;
+            looks += 1;
+        }
+        assert_eq!(
+            decide_recheck(frame, 0x1000, len, 20, looks, LiveState::ChangedOnce, true, true, &mut budget, |_, _, whole| {
+                assert!(!whole);
+                20
+            }),
+            RecheckAction::Done,
+            "one-shot texture leaves queue after backoff without ever entering Live"
+        );
+
+        // 3) Real video: 2nd change from ChangedOnce (even after an unchanged 30fps frame) promotes to Live.
+        budget = 0;
+        let act = decide_recheck(8, 0x1000, len, 20, 1, LiveState::ChangedOnce, true, true, &mut budget, |_, _, whole| {
+            assert!(!whole);
+            30
+        });
+        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::Live });
+
+        // 4) Live: unchanged for LIVE_LOOKS frames stays per-frame Live, then enters periodic Paused.
+        let mut frame = 10u64;
+        let mut looks = 0u8;
+        for _ in 0..LIVE_LOOKS {
+            budget = 0;
+            let act = decide_recheck(frame, 0x1000, len, 30, looks, LiveState::Live, true, true, &mut budget, |_, _, whole| {
+                assert!(whole, "Live must use whole-texture fingerprint");
+                30
+            });
+            assert_eq!(budget, len);
+            assert_eq!(act, RecheckAction::Recheck { due: frame + 1, print: 30, looks: looks + 1, state: LiveState::Live });
+            frame += 1;
+            looks += 1;
+        }
+        budget = 0;
+        let act = decide_recheck(frame, 0x1000, len, 30, looks, LiveState::Live, true, true, &mut budget, |_, _, whole| {
+            assert!(whole);
+            30
+        });
+        assert_eq!(
+            act,
+            RecheckAction::Recheck {
+                due: frame + LIVE_PAUSED_FRAMES,
+                print: 30,
+                looks: 0,
+                state: LiveState::Paused,
+            }
+        );
+
+        // 5) Paused: stays in periodic polling across long static pauses (never dropped).
+        frame += LIVE_PAUSED_FRAMES;
+        for _ in 0..5 {
+            budget = 0;
+            let act = decide_recheck(frame, 0x1000, len, 30, 0, LiveState::Paused, true, true, &mut budget, |_, _, whole| {
+                assert!(whole, "Paused periodic check uses whole-texture fingerprint");
+                30
+            });
+            assert_eq!(budget, len);
+            assert_eq!(
+                act,
+                RecheckAction::Recheck {
+                    due: frame + LIVE_PAUSED_FRAMES,
+                    print: 30,
+                    looks: 0,
+                    state: LiveState::Paused,
+                }
+            );
+            frame += LIVE_PAUSED_FRAMES;
+        }
+
+        // 6) Video resumes after long pause: immediately wakes back into per-frame Live.
+        budget = 0;
+        let act = decide_recheck(frame, 0x1000, len, 30, 0, LiveState::Paused, true, true, &mut budget, |_, _, whole| {
+            assert!(whole);
+            40
+        });
+        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::Live });
+
+        // 7) VICTORY_LIVE_TEXTURES=0 (`live_on = false`) stays Plain.
+        budget = 0;
+        let act = decide_recheck(5, 0x1000, len, 10, 0, LiveState::Plain, false, true, &mut budget, |_, _, _| 20);
+        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::Plain });
+    }
+
+    /// Whole-texture live fingerprinting caps per-pass bytes at
+    /// `LIVE_PASS_BUDGET_BYTES`, deferring excess live slots to the next frame
+    /// without skipping fingerprint checks on normal `Plain`/`ChangedOnce` slots.
+    #[test]
+    fn live_recheck_pass_budget_defers_excess_without_starving_plain_slots() {
+        use super::{LIVE_PASS_BUDGET_BYTES, RecheckAction, decide_recheck};
+        use crate::descriptor::host::LiveState;
+
+        let plane_len = 2 << 20; // 2 MiB -> 8 fit in 16 MiB budget
+        let fit = (LIVE_PASS_BUDGET_BYTES / plane_len) as usize;
+        assert_eq!(fit, 8);
+        let mut budget = 0u64;
+        for i in 0..10 {
+            let mut hashed = false;
+            let act = decide_recheck(100, 0x1000, plane_len, 7, 0, LiveState::Live, true, true, &mut budget, |_, _, whole| {
+                assert!(whole);
+                hashed = true;
+                7
+            });
+            if i < fit {
+                assert!(hashed, "slot {i} within budget must be hashed");
+                assert_eq!(act, RecheckAction::Recheck { due: 101, print: 7, looks: 1, state: LiveState::Live });
+            } else {
+                assert!(!hashed, "slot {i} over budget must be deferred without hashing");
+                assert_eq!(act, RecheckAction::Defer(101));
+            }
+        }
+        assert_eq!(budget, LIVE_PASS_BUDGET_BYTES);
+        // Normal Plain slot in the same pass still runs unblocked.
+        let mut plain_hashed = false;
+        let act = decide_recheck(100, 0x9000, plane_len, 9, 0, LiveState::Plain, true, true, &mut budget, |_, _, whole| {
+            assert!(!whole);
+            plain_hashed = true;
+            9
+        });
+        assert!(plain_hashed, "Plain slot must never starve when live budget is full");
+        assert_eq!(act, RecheckAction::Recheck { due: 112, print: 9, looks: 1, state: LiveState::Plain });
     }
 }
 

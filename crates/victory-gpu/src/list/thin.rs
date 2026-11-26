@@ -256,6 +256,10 @@ impl Recording {
 
     /// Translates what there is.
     fn run(&self) {
+        self.run_with(crate::pipeline::bound);
+    }
+
+    fn run_with(&self, mut on_pipeline: impl FnMut(This)) {
         loop {
             let (chunk, back) = {
                 let mut inner = held(&self.inner);
@@ -274,13 +278,20 @@ impl Recording {
                     && chunk[2] == CLOSE
                 {
                     let pipeline = chunk[1] as This;
+                    drop(inner);
+                    // Record pipeline bind before publishing `done` so the queue
+                    // cannot retire the submission and let the title free
+                    // `pipeline` while `bound` dereferences it.
+                    if !self.abandoned.load(Acquire) {
+                        on_pipeline(pipeline);
+                    }
+                    give_back(vec![chunk]);
+                    let mut inner = held(&self.inner);
                     inner.closed = true;
                     inner.scheduled = false;
                     self.done.store(true, Release);
                     self.moved.notify_all();
                     drop(inner);
-                    crate::pipeline::bound(pipeline);
-                    give_back(vec![chunk]);
                     STATS[2].fetch_add(1, Relaxed);
                     crate::queue::line_moved();
                     return;
@@ -1068,5 +1079,39 @@ mod tests {
         assert!(rec.back().is_null(), "no backing list allocated");
         let inner = held(&rec.inner);
         assert!(inner.closed && !inner.scheduled && inner.chunks.is_empty());
+    }
+
+    /// Empty RESET+CLOSE fast-path calls `pipeline::bound` strictly before
+    /// publishing `done`, and skips binding if the recording was abandoned.
+    #[test]
+    fn empty_reset_close_binds_pipeline_before_publishing_done() {
+        let sentinel = 0x1234_5678usize as This;
+        let rec = Arc::new(Recording::new(0));
+        {
+            let mut inner = held(&rec.inner);
+            inner.chunks.push_back(vec![RESET | (1 << 16), sentinel as u64, CLOSE]);
+            inner.scheduled = true;
+        }
+        let mut saw_pipeline = None;
+        rec.run_with(|p| {
+            assert!(!rec.done(), "pipeline::bound must run before done is published");
+            saw_pipeline = Some(p);
+        });
+        assert_eq!(saw_pipeline, Some(sentinel));
+        assert!(rec.done());
+        assert!(rec.back().is_null());
+
+        let abandoned = Arc::new(Recording::new(0));
+        abandoned.abandoned.store(true, Release);
+        {
+            let mut inner = held(&abandoned.inner);
+            inner.chunks.push_back(vec![RESET | (1 << 16), sentinel as u64, CLOSE]);
+            inner.scheduled = true;
+        }
+        let mut called = false;
+        abandoned.run_with(|_| called = true);
+        assert!(!called, "abandoned recording must not dereference pipeline");
+        assert!(abandoned.done());
+        assert!(abandoned.back().is_null());
     }
 }

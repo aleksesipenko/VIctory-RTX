@@ -1007,6 +1007,37 @@ struct Waiting {
     away: u64,
 }
 
+/// Recheck policy for a texture slot uploaded whole (`crate::draw`,
+/// `VICTORY_LIVE_TEXTURES`; GPL-3.0 base: avatarmanz/VIctory-7900XTX #390).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LiveState {
+    /// Never changed after upload: cheap 3-strip fingerprint along
+    /// `RECHECK_FRAMES`, then exits the queue.
+    #[default]
+    Plain,
+    /// Changed once after upload (one-shot streaming arrival or 1st video
+    /// frame): cheap 3-strip fingerprint with a short initial poll window,
+    /// then backs off along `RECHECK_FRAMES` and exits unless a 2nd change
+    /// promotes it to [`Self::Live`].
+    ChangedOnce,
+    /// Changed at least twice: confirmed in-place video/dynamic texture,
+    /// polled every frame with whole-texture fingerprinting (budgeted).
+    Live,
+    /// Previously [`Self::Live`], stayed unchanged for `LIVE_LOOKS` frames
+    /// (paused video / static screen): polled periodically with whole-texture
+    /// fingerprinting (budgeted) until overwritten or removed; any change
+    /// immediately returns it to [`Self::Live`].
+    Paused,
+}
+
+impl LiveState {
+    /// Whether this state fingerprints the whole texture (up to 4 MiB)
+    /// instead of the three 16 KiB strips.
+    pub(crate) const fn whole_fingerprint(self) -> bool {
+        matches!(self, Self::Live | Self::Paused)
+    }
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -1021,12 +1052,14 @@ pub(crate) struct TextureQueue {
     /// Which slots are in `slots`, for those who only want one out
     /// ([`Queued`]).
     queued: std::sync::Arc<Queued>,
-    /// Slots found changed after their upload with nothing to tell of it:
-    /// textures the title rewrites in place all the time (the planes of a
-    /// video on a TV or phone screen), looked at every frame
+    /// Recheck state and last-poll sequence for slots past [`LiveState::Plain`]
     /// (`crate::draw`, `VICTORY_LIVE_TEXTURES`; GPL-3.0 provenance:
     /// avatarmanz/VIctory-7900XTX #390).
-    live: std::collections::HashSet<u32>,
+    live: std::collections::HashMap<u32, (LiveState, u64)>,
+    /// Monotonic sequence bumped whenever a whole-fingerprint (`Live`/`Paused`)
+    /// slot is hashed, so deferred over-budget slots rotate fairly ahead of
+    /// recently hashed slots on the next pass.
+    live_polls: u64,
 }
 
 /// A bit for each slot of a heap's [`TextureQueue`], changed under its lock
@@ -1133,7 +1166,12 @@ impl TextureQueue {
     fn all_due(&self, frame: u64) -> Due {
         let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+            let poll = self
+                .live
+                .get(&index)
+                .filter(|&&(state, _)| state.whole_fingerprint())
+                .map_or(0, |&(_, poll)| poll);
+            due[usize::from(w.looks == 0 && w.mapped == 0)].push((poll, index, w.write));
         }
         due
     }
@@ -1141,10 +1179,16 @@ impl TextureQueue {
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
+        // Whole-fingerprint (`Live`/`Paused`) slots run first in oldest-polled
+        // round-robin order so budget deferrals rotate fairly without starvation;
+        // other re-checked slots follow newest-first as before.
+        again.sort_unstable_by(|a, b| match (a.0 > 0, b.0 > 0) {
+            (true, true) => a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => b.2.cmp(&a.2),
+        });
+        fresh.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
@@ -1178,6 +1222,8 @@ impl TextureQueue {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
             w.away = crate::host::now_ms();
+            w.checked = (0, 0, 0, 0, 0);
+            self.live.remove(&index);
         }
     }
 
@@ -1217,16 +1263,18 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            w.checked = (0, 0, 0, 0, 0);
+            self.live.remove(&index);
         }
     }
 
     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
     /// with fingerprint `print`: looked at again from frame `due`, for a
     /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame; `live`: one
-    /// the title keeps rewriting, see [`TextureQueue::live`]).
+    /// `looks`-th such look; `uploaded` is the upload's frame; `state`:
+    /// [`LiveState`]).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(
+    pub(crate) fn recheck(
         &mut self,
         index: u32,
         write: u64,
@@ -1235,25 +1283,41 @@ impl TextureQueue {
         print: u64,
         looks: u8,
         uploaded: u64,
-        live: bool,
+        state: LiveState,
     ) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
-            if live {
-                self.live.insert(index);
-            } else {
+            if state == LiveState::Plain {
                 self.live.remove(&index);
+            } else {
+                let poll = if state.whole_fingerprint() {
+                    self.live_polls += 1;
+                    self.live_polls
+                } else {
+                    0
+                };
+                self.live.insert(index, (state, poll));
             }
         }
     }
 
+    /// Defers a whole-fingerprint (`Live`/`Paused`) slot to `due` when the
+    /// pass's live-hash byte budget is exhausted, preserving its `checked`
+    /// state, `looks`, and older `live_polls` rank so it runs first next pass.
+    pub(crate) fn defer_live(&mut self, index: u32, write: u64, due: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.due = w.due.max(due);
+        }
+    }
+
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look, and whether it is live.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, bool)> {
+    /// waiting for such a look, and its [`LiveState`].
+    pub(crate) fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, LiveState)> {
         let (at, len, print, looks, uploaded) =
             self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)?;
-        Some((at, len, print, looks, uploaded, self.live.contains(&index)))
+        let state = self.live.get(&index).map_or(LiveState::Plain, |&(s, _)| s);
+        Some((at, len, print, looks, uploaded, state))
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -2202,17 +2266,25 @@ impl HostHeap {
         print: u64,
         looks: u8,
         uploaded: u64,
-        live: bool,
+        state: LiveState,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded, live);
+        textures.recheck(index, write, due, at, print, looks, uploaded, state);
+    }
+
+    /// See [`TextureQueue::defer_live`].
+    pub(crate) fn texture_slot_defer_live(&self, index: u32, write: u64, due: u64) {
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .defer_live(index, write, due);
     }
 
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(
         &self,
         index: u32,
-    ) -> Option<(u64, u64, u64, u8, u64, bool)> {
+    ) -> Option<(u64, u64, u64, u8, u64, LiveState)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
@@ -5917,32 +5989,53 @@ mod tests {
         }
     }
 
-    /// A slot rechecked as live says so when it is looked at, a plain
-    /// recheck of it clears that, and so does its leaving the queue or being
-    /// overwritten.
+    /// A slot rechecked with a live state says so when it is looked at, a plain
+    /// recheck clears it, leaving the queue or overwriting clears it, and
+    /// deferred over-budget live slots rotate ahead of recently hashed ones.
     #[test]
     fn live_slots_say_so_until_they_are_rechecked_plain_or_taken_out() {
         let mut q = TextureQueue::default();
         q.written(7, 1, 0, false);
         let write = q.due(1, 10)[0].1;
-        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, true);
-        assert_eq!(q.checked(7), Some((0x1000, 0x2000, 5, 0, 1, true)));
+        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, LiveState::Live);
+        assert_eq!(q.checked(7), Some((0x1000, 0x2000, 5, 0, 1, LiveState::Live)));
         assert!(q.due(1, 10).is_empty(), "due again from frame 2");
         assert_eq!(q.due(2, 10), [(7, write)], "a recheck is served");
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 1, 1, false);
-        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, true);
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 1, 1, LiveState::Plain);
+        assert_eq!(q.checked(7).map(|c| c.5), Some(LiveState::Plain));
+        assert!(q.live.is_empty(), "Plain removes map entry");
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, LiveState::Paused);
+        assert_eq!(q.checked(7).map(|c| c.5), Some(LiveState::Paused));
         q.done(7, write);
         assert_eq!(q.checked(7), None);
         assert!(q.live.is_empty(), "a slot out of the queue is not live");
         // Another write: a fresh slot, not live, whatever it was.
         q.written(7, 4, 4, false);
         let write = q.due(4, 10)[0].1;
-        q.recheck(7, write, 5, (0x1000, 0x2000), 6, 0, 4, true);
+        q.recheck(7, write, 5, (0x1000, 0x2000), 6, 0, 4, LiveState::Live);
         q.written(7, 5, 5, false);
         assert!(q.live.is_empty(), "overwritten slot clears stale live entry");
-        q.recheck(7, q.due(5, 10)[0].1, 6, (0x1000, 0x2000), 6, 0, 5, false);
-        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
+        q.recheck(7, q.due(5, 10)[0].1, 6, (0x1000, 0x2000), 6, 0, 5, LiveState::Plain);
+        assert_eq!(q.checked(7).map(|c| c.5), Some(LiveState::Plain));
+
+        // Round-robin fairness across budget deferrals: deferred slot 12 keeps
+        // its older poll rank and comes before newly hashed slots 10 and 11 next frame.
+        let mut rr = TextureQueue::default();
+        for slot in [10u32, 11, 12] {
+            rr.written(slot, 1, 0, false);
+        }
+        let writes: Vec<(u32, u64)> = rr.due(1, 10);
+        let w = |slot: u32| writes.iter().find(|&&(s, _)| s == slot).unwrap().1;
+        rr.recheck(10, w(10), 2, (0x1000, 0x2000), 1, 0, 1, LiveState::Live);
+        rr.recheck(11, w(11), 2, (0x3000, 0x2000), 2, 0, 1, LiveState::Live);
+        rr.recheck(12, w(12), 2, (0x5000, 0x2000), 3, 0, 1, LiveState::Live);
+        assert_eq!(rr.due(2, 10), [(10, w(10)), (11, w(11)), (12, w(12))]);
+        // Frame 2: hash 10 and 11, defer 12 for budget.
+        rr.recheck(10, w(10), 3, (0x1000, 0x2000), 1, 1, 1, LiveState::Live);
+        rr.recheck(11, w(11), 3, (0x3000, 0x2000), 2, 1, 1, LiveState::Live);
+        rr.defer_live(12, w(12), 3);
+        assert_eq!(rr.due(3, 10), [(12, w(12)), (10, w(10)), (11, w(11))]);
+        assert_eq!(rr.checked(12).map(|c| c.3), Some(0), "deferred slot keeps looks count");
     }
 
     /// The queue of textures picked by index serves the slots looked at
