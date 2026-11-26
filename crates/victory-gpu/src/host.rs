@@ -1335,6 +1335,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// True after [`HostList::reset_closed`] already cleared state and reset
+    /// the allocator into a closed empty list, so the next [`HostList::reset`]
+    /// only re-opens the command list without a second `allocator.Reset()`.
+    empty_closed: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4309,6 +4313,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+            empty_closed: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6606,6 +6611,26 @@ impl HostList {
         }
     }
 
+    /// Releases CPU-side state, resets the command allocator and leaves the
+    /// D3D12 command list closed and completely empty so it is safe even if
+    /// submitted without a subsequent title `Reset()`, and marks `empty_closed`
+    /// so the title's next [`HostList::reset`] skips the redundant
+    /// `allocator.Reset()` and CPU-state clears.
+    pub(crate) fn reset_closed(&self) {
+        self.clear_state();
+        // SAFETY: the list is not executing (landed + bury_lag).
+        let reset = unsafe {
+            self.allocator
+                .Reset()
+                .and_then(|()| self.list.Reset(&self.allocator, None))
+                .and_then(|()| self.list.Close())
+        };
+        if let Err(e) = reset {
+            fail(format_args!("a host command list did not reset for idle ({e})"));
+        }
+        self.empty_closed.store(true, Ordering::Release);
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -6613,12 +6638,19 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
-        self.clear_state();
+        let already_empty = self.empty_closed.swap(false, Ordering::AcqRel);
+        if !already_empty {
+            self.clear_state();
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+            if already_empty {
+                self.list.Reset(&self.allocator, None)
+            } else {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            }
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));

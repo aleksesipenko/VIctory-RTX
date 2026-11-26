@@ -308,9 +308,10 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         if !ran.contains(&i) || IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) >= IDLE_MOST.0 {
             continue;
         }
-        // Release held textures, deferred steps, pipelines and scratch chunks,
-        // leaving the command list closed so `detach` does not reset + close twice.
-        host.clear_state();
+        // Reset allocator & leave an empty closed D3D12 list so recycled lists
+        // never retain stale commands if submitted without Reset(), while the
+        // next Reset() skips the redundant allocator.Reset() via `empty_closed`.
+        host.reset_closed();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {

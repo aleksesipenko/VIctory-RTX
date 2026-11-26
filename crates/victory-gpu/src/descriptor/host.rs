@@ -2925,9 +2925,10 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && let Some(shadow) = self.stride_shadow.get(index as usize)
         {
-            if shadow.swap(word, std::sync::atomic::Ordering::Relaxed) == word {
+            if shadow.load(std::sync::atomic::Ordering::Relaxed) == word {
                 return;
             }
+            shadow.store(word, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: inside the mapping; shaders read it while we write (a
             // single aligned dword: either value is one the slot had, and
             // dynamic slots are exclusively owned until submission finishes).
