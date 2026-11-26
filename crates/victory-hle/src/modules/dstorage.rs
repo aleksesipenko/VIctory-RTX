@@ -593,6 +593,8 @@ struct Job {
     seq: u64,
     request: Request,
     note: Note,
+    name: Option<String>,
+    _file: Option<HeldFile>,
     staging: u64,
 }
 
@@ -783,7 +785,7 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = execute(&job.request, job.name.as_deref());
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
@@ -845,14 +847,16 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (seq, staging) = {
+            let &(seq, ref read) = lane.reads.front()?;
+            (seq, staging_bytes(&read.request))
+        };
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (_, Read { request, note, name, file }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -865,6 +869,8 @@ impl Lanes {
             seq,
             request,
             note,
+            name,
+            _file: file,
             staging,
         })
     }
@@ -1039,11 +1045,25 @@ enum Command {
     Status(Status),
 }
 
+/// Keeps a file-backed `Request::source` COM instance alive until the read
+/// completes or is dropped.
+struct HeldFile(*const Instance<File>);
+
+// SAFETY: `Instance<File>` refcount is atomic and `File` is `Sync`.
+unsafe impl Send for HeldFile {}
+
+impl Drop for HeldFile {
+    fn drop(&mut self) {
+        release(self.0.cast_mut());
+    }
+}
+
 /// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
 struct Read {
     request: Request,
     note: Note,
+    name: Option<String>,
+    file: Option<HeldFile>,
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1266,11 +1286,19 @@ impl Status {
 
 extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     // SAFETY: the title passes its request (null tolerated).
-    let Some(&request) = (unsafe { request.as_ref() }) else {
+    let Some(&(mut request)) = (unsafe { request.as_ref() }) else {
         return;
     };
+    let name = (!request.name.is_null()).then(|| text(request.name));
+    // Never dereference the caller's temporary `name` pointer on a worker thread.
+    request.name = std::ptr::null();
+    let file = (request.options & MEMORY_SOURCE == 0 && !request.source.is_null()).then(|| {
+        let f = request.source.cast::<Instance<File>>();
+        add_ref_instance(f);
+        HeldFile(f)
+    });
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    queue(this, Command::Read(Read { request, note, name, file }));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1373,7 +1401,7 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, name: Option<&str>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1383,7 +1411,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             destination_size = request.destination_size,
             intermediate_size = request.intermediate_size,
             tag = request.tag,
-            name = text(request.name),
+            name = name.unwrap_or(""),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -2116,7 +2144,7 @@ mod tests {
             protect(PAGE_READWRITE)
         });
         let r = request(0, at as *mut c_void, plain.len(), file, 0, plain.len());
-        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(execute(&r, None), Ok(()));
         assert_ne!(opener.join().unwrap(), 0);
         // SAFETY: as above, all of it readable.
         assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, plain.len()) }, plain);
@@ -2226,7 +2254,7 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read { request: r, note, name: None, file: None }));
     }
 
     #[test]

@@ -5365,7 +5365,6 @@ fn lookup(
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
-        let reservation = budget.map(|b| b.reserve(size)).transpose().ok()?;
         // In place, if asked for and the memory can be opened
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
@@ -5384,9 +5383,18 @@ fn lookup(
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+        // memory, and the one just made is the CPU's side. Reserve LOCAL VRAM
+        // only when allocating a card-resident buffer so system-RAM DXR inputs
+        // are never falsely rejected by the LOCAL VRAM peak guard.
+        let card_budget = budget.map(|b| b.reserve(size)).transpose();
+        let (buffer, card) = match card_budget
+            .ok()
+            .and_then(|res| card_for(size).map(|on_card| (res, on_card)))
+        {
+            Some((reservation, on_card)) => {
+                if let Some(r) = reservation {
+                    r.finish_shadow(&on_card).ok()?;
+                }
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -5420,9 +5428,6 @@ fn lookup(
                 len,
                 "buffer copied to the host"
             );
-        }
-        if let Some(r) = reservation {
-            r.finish_shadow(&buffer).ok()?;
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
@@ -5704,10 +5709,7 @@ fn loose(
         note(shadow);
         return Some(shadow.clone());
     }
-    let reservation = budget
-        .map(|b| b.reserve(len.checked_next_multiple_of(1 << 16).unwrap_or(u64::MAX)))
-        .transpose()
-        .ok()?;
+    let charge = len.checked_next_multiple_of(1 << 16).unwrap_or(u64::MAX);
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
@@ -5717,8 +5719,14 @@ fn loose(
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
-        if let Some(r) = reservation { r.finish_shadow(&buffer).ok()?; }
+    // Reserve LOCAL VRAM only for card-resident paths; if DXR VRAM is at cap,
+    // fall through to a system-RAM shared buffer instead of failing the lookup.
+    if let Ok(reservation) = budget.map(|b| b.reserve(charge)).transpose()
+        && let Some((buffer, data)) = window_mapped_for(len)
+    {
+        if let Some(r) = reservation {
+            r.finish_shadow(&buffer).ok()?;
+        }
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5734,8 +5742,15 @@ fn loose(
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
+    let card_budget = budget.map(|b| b.reserve(charge)).transpose();
+    let (buffer, card) = match card_budget
+        .ok()
+        .and_then(|res| window_card_for(len).map(|on_card| (res, on_card)))
+    {
+        Some((reservation, on_card)) => {
+            if let Some(r) = reservation {
+                r.finish_shadow(&on_card).ok()?;
+            }
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
                 staging: buffer,
@@ -5757,9 +5772,6 @@ fn loose(
         len,
         "loose memory copied to the host"
     );
-    if let Some(r) = reservation {
-        r.finish_shadow(&buffer).ok()?;
-    }
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
