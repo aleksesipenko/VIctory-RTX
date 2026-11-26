@@ -2073,16 +2073,26 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        let n = count as usize;
+        if one_range != 0 && !handles.is_null() {
+            // SAFETY: the title passes the first handle.
+            let first = unsafe { *handles };
+            if n <= 8 {
+                let mut buf = [0u64; 8];
+                for (i, slot) in buf[..n].iter_mut().enumerate() {
+                    *slot = first + 128 * (i as u64);
+                }
+                with_state(this, |list, s| s.set_targets(list, &buf[..n], depth));
+            } else {
+                let vec: Vec<u64> = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                with_state(this, |list, s| s.set_targets(list, &vec, depth));
+            }
+        } else {
+            let slice = items(handles, count);
+            with_state(this, |list, s| s.set_targets(list, slice, depth));
+        }
     }
     pub(super) extern "system" fn draw(
         this: This,

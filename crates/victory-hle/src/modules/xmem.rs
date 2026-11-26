@@ -761,6 +761,9 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
+        for p in slice.index..slice.index + n {
+            slice.section.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+        }
         Some(view)
     }
 
@@ -1164,6 +1167,8 @@ fn arrange(base: usize, pages: &[usize]) {
         {
             slice.index = have;
             owner.insert(have, other);
+        } else {
+            owner.remove(&have);
         }
         if let Some(slice) = table.pages.get_mut(number) {
             slice.index = want;

@@ -3060,7 +3060,11 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            // Most draws find their slot holding it already: avoid redundant COM
+            // AddRef/Release (provenance: avatarmanz/VIctory-7900XTX #376, GPL-3.0).
+            if !self.holds(index, made.kept.as_ref()) {
+                self.keep(index, made.kept.clone());
+            }
             Some(made.listed)
         })
     }
@@ -3143,6 +3147,15 @@ impl HostHeap {
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
+    }
+
+    /// Whether slot `index` views `resource` (or nothing, with `None`).
+    fn holds(&self, index: u32, resource: Option<&ID3D12Resource>) -> bool {
+        use windows::core::Interface;
+        self.kept.get(index as usize).is_some_and(|slot| {
+            slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Interface::as_raw)
+                == resource.map(Interface::as_raw)
+        })
     }
 
     /// What slot `index` views.

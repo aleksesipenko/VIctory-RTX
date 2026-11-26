@@ -580,7 +580,8 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         }
         voice.ended = false;
         if context.field(2, 26, 5) == INPUT_INVALID {
-            context.set_field(2, 26, 5, 0);
+            // Clear both INPUT_INVALID (bits 26..31) and error flag (bit 31).
+            context.set_field(2, 26, 6, 0);
         }
     }
     let channels = context.channels();
@@ -610,6 +611,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     };
     let Some(data) = heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
         context.set_field(0, 20 + current, 1, 0);
+        context.set_field(2, 0, 26, 0);
         return true;
     };
     let mut at = context.field(2, 0, 26) as usize;
@@ -619,6 +621,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let Some(frame) = xma::read_frame(data, at) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
+        context.set_field(2, 0, 26, 0);
         return true;
     };
     let decoder = voice.decoder.get_or_insert_with(|| {
@@ -664,7 +667,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         // this one, its last.
         voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
     }
-    if next == 0 {
+    if !looping && next == 0 {
         context.set_field(0, 20 + current, 1, 0);
     }
     context.set_field(2, 0, 26, next as u32);

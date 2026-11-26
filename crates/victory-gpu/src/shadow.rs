@@ -1816,14 +1816,9 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     // SAFETY: inside the copy's mapping and its snapshot
                     // (which holds the copy's bytes at the copy's offsets);
                     // nothing writes either while a submission's results
-                    // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
-                    };
-                    if now != old {
+                    // are compared. AVX2 compare via `safecopy::differ`
+                    // (provenance: avatarmanz/VIctory-7900XTX #376, GPL-3.0).
+                    if unsafe { crate::safecopy::differ((data + at) as *const u8, (before + at) as *const u8, n) } {
                         pieces.push((at, n));
                     }
                     at += n;

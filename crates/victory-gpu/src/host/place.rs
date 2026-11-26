@@ -311,11 +311,12 @@ impl HostList {
         from.refresh(self, src as u64, len as u64);
         STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
+        // The COPY_DEST -> COPY_SOURCE transition on `between` already orders
+        // this copy before any subsequent CopyTextureRegion reading `between`.
         unsafe {
             wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
             self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            wait_for_all(host, &self.list);
         }
         Some(between)
     }
