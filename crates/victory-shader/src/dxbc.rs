@@ -60,6 +60,8 @@ pub struct Part<'a> {
 pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
+    /// Validated total byte length of the DXBC container from header offset `0x18`.
+    pub total_size: usize,
     pub parts: Vec<Part<'a>>,
 }
 
@@ -104,6 +106,7 @@ impl<'a> Container<'a> {
         Ok(Container {
             digest,
             version,
+            total_size: total,
             parts,
         })
     }

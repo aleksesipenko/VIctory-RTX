@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
+    /// Actual GPU compute dispatches recorded for this shader (distinct from `first bind`).
+    #[cfg(windows)]
+    pub(crate) dispatches: std::sync::atomic::AtomicU64,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -121,6 +124,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
+                #[cfg(windows)]
+                dispatches: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

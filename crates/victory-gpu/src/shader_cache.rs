@@ -141,6 +141,15 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // RT backend selector (`VICTORY_RT_BACKEND=miss|sw|dxr`): only hashed
+        // when explicitly set so existing v2 caches remain valid when unset.
+        if let Some(backend) = std::env::var_os("VICTORY_RT_BACKEND")
+            && !backend.is_empty()
+        {
+            bytes.extend_from_slice(b"VICTORY_RT_BACKEND=");
+            bytes.extend_from_slice(backend.as_encoded_bytes());
+            bytes.push(0);
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
