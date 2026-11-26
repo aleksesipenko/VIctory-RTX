@@ -33,7 +33,7 @@ the pre-launch fixes already integrated here:
 | Faces & indirect draws | `SLOT_TABLE_STRIDES` + dynamic-slot stride mirroring (preserving `VICTORY_PORT_CBV`), opt-in `VICTORY_INDIRECT_REST` | `codec-d/cool_fox` (`f4b48ad`) |
 | 32 GB RAM & cold compiles | `VICTORY_RESIDENCY=1`, 8-worker cap on <=32 GB RAM, `VICTORY_PIPELINE_WAIT_ONCE=1`, `scene_input` + 7 bake shader hashes, opt-in `VICTORY_NO_WATCHDOG=1` | `codec-d/cool_fox` (`8cc31ab`, `f4b48ad`), `trustno1-coder/VIctory-NVIDIA` (`77e13a9`), `cool-fox-12gb` (`6d28e9b`) |
 | Intro video flicker | Always-copy linear 1-mip R8 video planes (`VICTORY_VIDEO_PLANES`, `VICTORY_VIDEO_HOT_FRAMES`) | `trustno1-coder/VIctory-NVIDIA` (`77e13a9`) |
-| Renderer port patches | `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_DESCRIPTORS=1`, `VICTORY_PORT_CBV=1`, `VICTORY_OUTPUT`, `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER` | `avatarmanz/VIctory-7900XTX` (`0dec5dc`) |
+| Renderer port patches | `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_DESCRIPTORS=1`, `VICTORY_PORT_CBV=1`, `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`, `VICTORY_OUTPUT`, `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER` | `avatarmanz/VIctory-7900XTX` (`c9c932c`) |
 
 ## How to Build and Run
 
