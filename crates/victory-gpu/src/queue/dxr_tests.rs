@@ -1,12 +1,43 @@
 use super::*;
 use crate::dxr::{Captured, GuestBatchedDesc2, capture_build};
-use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5, D3D12_RAYTRACING_TIER_1_1,
+    ID3D12GraphicsCommandList,
+};
 use windows::core::{IUnknown, Interface};
 
 #[test]
 fn dxr_thin_submission_order_and_abandonment() {
     const NAME: &str = "queue::dxr_tests::dxr_thin_submission_order_and_abandonment";
     if std::env::var_os("VICTORY_TEST_DXR_THIN").is_none() {
+        let require = std::env::var_os("VICTORY_REQUIRE_DXR_TESTS").is_some_and(|v| v == "1");
+        let probe = match std::env::var("VICTORY_D3D12_ADAPTER") {
+            Ok(name) if !name.trim().is_empty() => {
+                victory_shader::emit::host::Host::on_adapter(name.trim())
+            }
+            _ => victory_shader::emit::host::Host::new(false),
+        };
+        let tier_ok = probe.as_ref().is_ok_and(|h| {
+            let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+            // SAFETY: plain feature support query on a live device.
+            let ok = unsafe {
+                h.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS5,
+                        (&raw mut o5).cast(),
+                        size_of_val(&o5) as u32,
+                    )
+                    .is_ok()
+            };
+            ok && o5.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0
+        });
+        if !tier_ok {
+            if require {
+                panic!("DXR 1.1 hardware adapter required");
+            }
+            eprintln!("skipping {NAME}: no DXR Tier 1.1 hardware adapter");
+            return;
+        }
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         #[cfg(feature = "diagnostics")]
         let dir = tempfile::tempdir().unwrap();

@@ -1196,17 +1196,18 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
-    if port_on()
-        && let Some(pages) = &pages
-    {
-        arrange(base, pages);
-    }
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
     let _busy = Busy::begin();
     let mut physical = physical();
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
+    }
+    // Keep `arrange` serialized under `physical` (maren-halv/VIctory-DXR f1d9f52, GPL-3.0).
+    if port_on()
+        && let Some(pages) = &pages
+    {
+        arrange(base, pages);
     }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation

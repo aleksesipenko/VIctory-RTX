@@ -1564,6 +1564,35 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
+/// Whether the threads kept for [`wide`] run above normal priority, as the
+/// submitting thread does (`VICTORY_WIDE_PRIORITY=1`; off by default).
+/// Provenance (GPL-3.0): Peppacodes/playablegames-peppa #6 (6f713ab).
+fn wide_priority() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_PRIORITY").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_WIDE_PRIORITY").unwrap_or(on);
+    on
+}
+
+fn helper_priority(above: &mut bool) {
+    let wanted = wide_priority();
+    if wanted == *above {
+        return;
+    }
+    *above = wanted;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+    };
+    let priority = if wanted {
+        THREAD_PRIORITY_ABOVE_NORMAL
+    } else {
+        THREAD_PRIORITY_NORMAL
+    };
+    // SAFETY: sets this worker thread's own scheduling priority.
+    unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+}
+
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
@@ -1582,7 +1611,9 @@ fn workers() -> &'static Workers {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
+                let mut above = false;
                 loop {
+                    helper_priority(&mut above);
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.

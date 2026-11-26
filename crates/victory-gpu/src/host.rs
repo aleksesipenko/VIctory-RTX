@@ -628,8 +628,19 @@ fn bury_lag() -> u64 {
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
+///
+/// With `VICTORY_BURY_ASIDE=1` (off by default; provenance: fxceless #1224 &
+/// Peppacodes/playablegames-peppa #6, GPL-3.0), drained objects are dropped on
+/// a dedicated `victory-bury` thread so COM releases never stall landing or
+/// submission threads.
 fn bury(finished: u64) {
+    static ASIDE: OnceLock<bool> = OnceLock::new();
+    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
+    let aside = *ASIDE.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let aside = crate::ab::pick("VICTORY_BURY_ASIDE").unwrap_or(aside);
     let finished = finished.saturating_sub(bury_lag());
+    let mut deferred = Vec::new();
     for part in &RETIRED {
         let done: Vec<(u64, Retired)> = {
             let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
@@ -639,7 +650,34 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        if aside {
+            deferred.extend(done);
+        } else {
+            drop(done);
+        }
+    }
+    if deferred.is_empty() {
+        return;
+    }
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                for done in from {
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(to))
+    });
+    match to {
+        Some(to) => {
+            if let Err(e) = to.lock().unwrap_or_else(|e| e.into_inner()).send(deferred) {
+                drop(e.0);
+            }
+        }
+        None => drop(deferred),
     }
 }
 
