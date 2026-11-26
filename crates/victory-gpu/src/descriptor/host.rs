@@ -138,6 +138,7 @@ pub(crate) struct HostHeap {
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -1689,21 +1690,19 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        // The old size probe deliberately issued invalid D3D12 calls on Ada.
-        // The sidecar needs a clean InfoQueue, including during heap setup.
-        let max_views = host.dxr.as_ref().map(|_| {
+        // Query D3D12_OPTIONS19 unconditionally instead of probing oversized
+        // 4M/2M heaps, keeping D3D12 Debug Layer clean on NVIDIA 1M heaps in
+        // both RT-off and native DXR modes.
+        let max_views = {
             let mut limits = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
             let supported = unsafe {
                 host.device.CheckFeatureSupport(
                     D3D12_FEATURE_D3D12_OPTIONS19, (&raw mut limits).cast(), size_of_val(&limits) as u32,
                 )
             };
-            if supported.is_ok() && limits.MaxViewDescriptorHeapSize != 0 {
-                limits.MaxViewDescriptorHeapSize
-            } else {
-                PORTABLE_VIEWS
-            }
-        });
+            (supported.is_ok() && limits.MaxViewDescriptorHeapSize != 0)
+                .then_some(limits.MaxViewDescriptorHeapSize)
+        };
         let fits = |count: u32| {
             if let Some(max) = max_views { return count <= max; }
             // SAFETY: plain heap creation; the heap is released at once.
@@ -1906,6 +1905,7 @@ impl HostHeap {
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -3259,10 +3259,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 

@@ -105,9 +105,18 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Whether the stand-in is on: set, and neither the console BVH builder nor
+/// full native DXR 1.1 is active (a narrow `VICTORY_NATIVE_RT_FILTER` run keeps
+/// the stand-in so non-filtered GI passes remain lit).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    static FULL_NATIVE_RT: OnceLock<bool> = OnceLock::new();
+    let full_native_rt = *FULL_NATIVE_RT.get_or_init(|| {
+        crate::dxr::requested()
+            && std::env::var("VICTORY_NATIVE_RT_FILTER")
+                .ok()
+                .is_none_or(|v| v.trim().is_empty())
+    });
+    set() != Set::Off && !crate::pipeline::builder_runs() && !full_native_rt
 }
 
 /// The most the air scatters, as a multiple of the light around

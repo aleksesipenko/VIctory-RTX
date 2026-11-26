@@ -471,14 +471,18 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
         // SAFETY: the faulting thread's context, for the exception being dispatched.
-        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
+        let ctx = unsafe { &mut *(*info).ContextRecord };
+        let r = unsafe { crate::console_insn::emulate(ctx) };
         if r != 0 {
             return r;
         }
-    }
-    // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
-        return -1; // EXCEPTION_CONTINUE_EXECUTION
+        // `console_insn::emulate` owns all `clzero` forms (including
+        // `zero_through_fault`); if it refused a `clzero` (e.g. `MEM_FREE`),
+        // never fall through to the unchecked legacy `crash::clzero`.
+        let is_clzero = unsafe { (ctx.Rip as *const [u8; 3]).read_unaligned() == [0x0f, 0x01, 0xfc] };
+        if !is_clzero && unsafe { emulate_amd_only(info) } {
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
     }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
