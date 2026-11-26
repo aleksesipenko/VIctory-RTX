@@ -433,9 +433,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, that heap's identity
+    /// (`HostHeap::id`), first, count; given back when the list has run, is
+    /// reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -452,8 +453,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -474,8 +475,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -1920,7 +1921,7 @@ impl State {
                 }) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1994,7 +1995,7 @@ impl State {
                 }) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2931,6 +2932,13 @@ impl State {
                 "first gpu dispatch"
             );
         }
+        self.after_dispatch(list, p);
+    }
+
+    /// What follows a dispatch of `p`, direct or indirect: the stand-in for
+    /// the indirect light and the light probe.
+    /// Provenance (GPL-3.0): kitty-core/Kitty6 1f95b3a.
+    fn after_dispatch(&mut self, list: &HostList, p: &HostPipeline) {
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -2945,31 +2953,46 @@ impl State {
 
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
+    /// Provenance (GPL-3.0): trustno1-coder #2 (`depth: Option`, strict SRV/UAV
+    /// view match — fixes D3D12 Debug Layer error 646) + kitty-core/Kitty6 1f95b3a.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
         use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
         let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
-        let at = match role {
-            Role::Resolve => LIGHT,
-            Role::Radiance => RADIANCE,
-            Role::Air => AIR,
-            Role::Reflect => REFLECTIONS,
+        let image = match role {
+            Role::Resolve => entry(ResourceType::Uav, LIGHT),
+            Role::Radiance => entry(ResourceType::Uav, RADIANCE),
+            Role::Air => entry(ResourceType::Uav, AIR),
+            Role::Reflect => REFLECTIONS.iter().find_map(|&at| {
+                entry(ResourceType::Uav, at).filter(|(d, _)| {
+                    d.Format.0 == 42 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                })
+            }),
         };
-        let image = entry(ResourceType::Uav, at);
-        let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflect => image,
-        };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
+        let Some((of, image)) = image else {
+            once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
+        };
+        let depth = match role {
+            Role::Resolve => {
+                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                    once!(?role, "no stand-in for the indirect light: missing depth SRV");
+                    return false;
+                };
+                if (seen.Width, seen.Height) != (of.Width, of.Height) {
+                    once!(?role, "no stand-in for the indirect light: depth dimensions differ");
+                    return false;
+                }
+                Some(depth)
+            }
+            Role::Radiance | Role::Air | Role::Reflect => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -2999,8 +3022,9 @@ impl State {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return None;
         };
-        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-            View::Shader(r, _) | View::Unordered(r, ..) => r,
+        let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+            (ResourceType::Srv, View::Shader(r, _))
+            | (ResourceType::Uav, View::Unordered(r, ..)) => r,
             _ => return None,
         };
         let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -3614,7 +3638,7 @@ impl State {
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -4247,6 +4271,8 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // (The reflections' resolve is dispatched via ExecuteIndirect.)
+            self.after_dispatch(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

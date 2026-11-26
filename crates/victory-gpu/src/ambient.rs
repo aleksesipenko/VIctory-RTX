@@ -51,23 +51,23 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
-    /// Writes the title's specular reflections for the last time in a frame
-    /// (`CS_UpdateHistory`, R9G9B9E5 packed in R32_UINT): clamped to a
-    /// multiple of the surrounding light when `VICTORY_AMBIENT_REFLECT` is set.
+    /// Resolves the traced reflections (`CS_TemporalResolve2_Opaque_*` /
+    /// `CS_TemporalResolve1_Alpha_*`, R9G9B9E5 packed in R32_UINT).
+    /// Provenance (GPL-3.0): kitty-core/Kitty6 1f95b3a (after beloooo 44dcd437).
     Reflect,
 }
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
-    if has(b"CS_ScreenProbes_TemporalResolve") {
+    if has(b"CS_TemporalResolve2_Opaque") || has(b"CS_TemporalResolve1_Alpha") {
+        Some(Role::Reflect)
+    } else if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
     } else if has(b"CS_CacheScreenSpaceRadiance") {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
-    } else if has(b"CS_UpdateHistory") {
-        Some(Role::Reflect)
     } else {
         None
     }
@@ -81,8 +81,8 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
-/// Where `CS_UpdateHistory` writes specular reflections (R9G9B9E5 in R32_UINT).
-pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// Where the reflections' resolves write them: opaque at first, alpha at second.
+pub(crate) const REFLECTIONS: [(u8, u32); 2] = [(1, 128), (1, 136)];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -120,15 +120,32 @@ fn air() -> f32 {
     })
 }
 
-/// The most glossy reflections may hold after `CS_UpdateHistory`, as a
-/// multiple of the slow mean of the light around (`VICTORY_AMBIENT_REFLECT`;
-/// unset or 0: leave the title's reflections alone).
+/// The most a reflection may hold, as a multiple of the light around
+/// (`VICTORY_AMBIENT_REFLECT=<multiple>`; `0` or `off`: the title's own;
+/// unset: [`REFLECT`]). Acts only while `VICTORY_AMBIENT` is set and the
+/// builder does not run.
 fn reflect() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+        let held = std::env::var("VICTORY_AMBIENT_REFLECT").map_or(REFLECT, |v| parse_reflect(&v));
+        if held > 0.0 && set() != Set::Off {
+            tracing::info!(
+                held,
+                "reflections held to a multiple of the light around (VICTORY_AMBIENT_REFLECT)"
+            );
+        }
+        held
     })
+}
+
+const REFLECT: f32 = 1.0;
+
+fn parse_reflect(set: &str) -> f32 {
+    let set = set.trim();
+    if set.is_empty() {
+        return REFLECT;
+    }
+    set.parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
 }
 
 /// How many times the estimate the title's own diffuse resolve may keep
@@ -474,13 +491,28 @@ uint pack_r(float3 c) {
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void hold_reflections(uint3 at : SV_DispatchThreadID) {
-    if (at.x >= width || at.y >= height) return;
-    int2 p = int2(at.xy);
-    float3 c = unpack_r(reflections[p]);
-    if (any(isnan(c)) || any(isinf(c))) { reflections[p] = 0; return; }
-    float cap = max(dot(cells[CELLS].rgb, LUMA) * level * reflect_cap, 1e-6);
+    uint w, h;
+    reflections.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float3 around = float3(1.0, 0.98, 0.94) * constant;
+    if (constant <= 0.0) {
+        float2 g = (float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY) - 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        around = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            uint at0 = (q.y * PX + q.x) * 3;
+            around += b.x * b.y * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        }
+        around = lerp(around, cells[CELLS].rgb, 0.2);
+    }
+    float top = max(reflect_cap * dot(around, LUMA), 1e-6);
+    float3 c = unpack_r(reflections[at.xy]);
+    if (any(isnan(c)) || any(isinf(c))) { reflections[at.xy] = 0; return; }
     float has = dot(c, LUMA);
-    if (has > cap) reflections[p] = pack_r(c * (cap / has));
+    if (has > top) reflections[at.xy] = pack_r(c * (top / has));
 }
 #endif
 "#;
@@ -585,7 +617,9 @@ pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
-    pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// Provenance (GPL-3.0): trustno1-coder #2 — omit binding `t0` for non-Resolve
+    /// roles so the D3D12 Debug Layer does not see a UAV bound to an SRV table (error 646).
+    pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
@@ -610,7 +644,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    if role == Role::Reflect && (constant > 0.0 || reflect() == 0.0) {
+    if role == Role::Reflect && reflect() == 0.0 {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -648,7 +682,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, views.depth);
+        if let Some(depth) = views.depth {
+            l.SetComputeRootDescriptorTable(1, depth);
+        }
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
@@ -690,6 +726,10 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert_eq!(parse_reflect(""), REFLECT);
+        assert_eq!(parse_reflect("off"), 0.0);
+        assert_eq!(parse_reflect("0"), 0.0);
+        assert_eq!(parse_reflect("1.5"), 1.5);
     }
 
     #[test]
@@ -697,7 +737,8 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
-        assert_eq!(role(b"CS_UpdateHistory_12345678"), Some(Role::Reflect));
+        assert_eq!(role(b"CS_TemporalResolve2_Opaque_FrameStatistics_357e0818"), Some(Role::Reflect));
+        assert_eq!(role(b"CS_TemporalResolve1_Alpha_68979fba"), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 

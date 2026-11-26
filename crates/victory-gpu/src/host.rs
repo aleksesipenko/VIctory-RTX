@@ -1999,8 +1999,10 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
+/// The most bytes of chunks kept while no list holds them, unless
+/// `VICTORY_SCRATCH_SPARE_MB` says otherwise ([`spare_most`]).
+/// Provenance (GPL-3.0): fxceless #1367 (512 MiB cap + any-size reuse).
+const SPARE_MOST: u64 = 512 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
@@ -2051,28 +2053,53 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
+/// one, and its actual size.
+/// Provenance (GPL-3.0): fxceless #1367 — allow a small first chunk
+/// (`SCRATCH_FIRST`) to reuse a kept 4 MiB chunk to avoid creating and
+/// freeing ~35 committed upload buffers per frame on NVIDIA GPUs.
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = spare.take(size).map(|c| (c, size)).or_else(|| {
+            let any = size == SCRATCH_FIRST && scratch_any_size();
+            any.then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK))).flatten()
+        });
+        if let Some((chunk, size)) = kept {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
-        buffer,
-        data: data as usize,
+    Some((
+        Chunk {
+            buffer,
+            data: data as usize,
+        },
+        size,
+    ))
+}
+
+fn scratch_any_size() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_ANY_SIZE").is_none_or(|v| v != "0"))
+}
+
+fn spare_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SCRATCH_SPARE_MB").ok();
+        mb.and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST, |mb| mb << 20)
     })
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -2083,7 +2110,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
+                let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { spare_most() };
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
@@ -4041,12 +4068,18 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    use crate::land::{count, spent, stat};
+    let started = std::time::Instant::now();
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
+        count(stat::RB_TEXTURE_COUNT, 1);
     }
+    let textures_done = spent(stat::RB_TEXTURES, started);
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+        count(stat::RB_BUFFER_COUNT, 1);
+        count(stat::RB_BUFFER_BYTES, (*row * *rows) as u64);
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -4074,6 +4107,7 @@ fn read_backs(list: &HostList) {
             }
         }
     }
+    spent(stat::RB_BUFFERS, textures_done);
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
@@ -5168,6 +5202,7 @@ impl Host {
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
+                    let done_from = std::time::Instant::now();
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -5177,6 +5212,7 @@ impl Host {
                     for detached in &mut flight.lists {
                         detached.release_tables();
                     }
+                    crate::land::spent(crate::land::stat::RB_DONE, done_from);
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
@@ -5944,11 +5980,11 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            #[cfg(feature = "diagnostics")]
-            marks.push((lists.len(), crate::copystat::Timed::Compare));
-            lists.push(Some(check));
-        }
+        // Provenance (GPL-3.0): trustno1-coder #1 — a title list can leave a
+        // buffer promoted to COPY_DEST; buffers decay to COMMON between
+        // ExecuteCommandLists calls, so submit the compare separately before
+        // signalling this submission's fence (fixes D3D12 Debug Layer error 538).
+        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6057,6 +6093,9 @@ impl Host {
                     execute(&lists[from..to]);
                     from = to;
                 }
+                if let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
@@ -6092,28 +6131,35 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        // (Each list on its own: a run's prelude, which brings its copies up
-        // to date, apart from the run's commands; the compare apart from the
-        // last run.)
-        let groups: Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)> = if timing() {
-            marks
+        let (groups, check_inline): (Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)>, bool) = if timing() {
+            let mut g: Vec<_> = marks
                 .iter()
                 .zip(marks.iter().skip(1).map(|m| m.0).chain([lists.len()]))
                 .filter(|&(&(a, _), b)| a < b)
                 .map(|(&(a, kind), b)| (&lists[a..b], kind))
-                .collect()
+                .collect();
+            if let Some(check) = &check {
+                g.push((check.as_slice(), crate::copystat::Timed::Compare));
+            }
+            (g, false)
         } else {
-            vec![(&lists[..], crate::copystat::Timed::Other)]
+            (vec![(&lists[..], crate::copystat::Timed::Other)], true)
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [(&lists[..], ())];
+        let (groups, check_inline) = ([(&lists[..], ())], true);
         submitting(2, runs.len());
-        for (_i, &(group, _kind)) in groups.iter().enumerate() {
+        for (i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 execute(group);
+                if check_inline
+                    && i + 1 == groups.len()
+                    && let Some(check) = &check
+                {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6165,7 +6211,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (_i, started);
+            let _ = (i, started);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -7385,7 +7431,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }

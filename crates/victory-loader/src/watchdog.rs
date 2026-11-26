@@ -20,7 +20,7 @@ use crate::resolution::Site;
 /// Environment variable that enables the watchdog disarm hook (`=1`).
 pub const NO_WATCHDOG_ENV: &str = "VICTORY_NO_WATCHDOG";
 
-/// First 16 hex digits of the BLAKE3 hash of GTA VI 1.0.2.1 (`game_scarlett_master.exe`).
+/// First 16 hex digits of the BLAKE3 hash of supported build 1.0.2.1.
 const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
 
 const SKIP_CALL_AND_FALLBACK: Site = Site {
