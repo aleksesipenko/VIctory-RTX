@@ -3497,6 +3497,70 @@ fn land() {
     }
 }
 
+/// [`land`] at the end of a submission, on a dedicated thread when
+/// `VICTORY_LAND_ASIDE=1` (off by default; flips with the in-run A/B in
+/// diagnostics builds): resetting the lists of landed flights is host and
+/// driver allocator work that the following submission does not wait for.
+///
+/// Safe with the DXR 1.1 sidecar (`crate::dxr`): DXR owns its own command
+/// allocators and private fence; guest lists only enter `line.landed` after
+/// GPU completion + [`bury_lag`]; reusable shared lists are skipped by
+/// `recycle` while still referenced; and `clear_state` only drops the list's
+/// `Arc<[Work]>` clone while DXR's in-flight `Flight` retains its own.
+///
+/// The `victory-land-aside` worker uses the same process-lifetime `OnceLock`
+/// daemon pattern as `VICTORY_BURY_ASIDE` (`Host` has no shutdown hook; the
+/// thread sleeps on `asked.recv()`, coalesces queued wakeups, and exits with
+/// the process).
+///
+/// Provenance (GPL-3.0): fxceless/victory-fork #1146 (beamdotdev) &
+/// Peppacodes/playablegames-peppa #6.
+fn land_after_submission() {
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    static ASIDE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<()>>>> = OnceLock::new();
+    let wanted = *WANTED.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let (wanted, ab_forced_off) = match crate::ab::pick("VICTORY_LAND_ASIDE") {
+        Some(on) => (on, !on),
+        None => (wanted, false),
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let ab_forced_off = false;
+    if wanted {
+        let aside = ASIDE.get_or_init(|| {
+            let (send, asked) = std::sync::mpsc::channel::<()>();
+            std::thread::Builder::new()
+                .name("victory-land-aside".to_owned())
+                .spawn(move || {
+                    while asked.recv().is_ok() {
+                        // One landing for all the asks so far.
+                        while asked.try_recv().is_ok() {}
+                        let _landing = crate::timeline::span("landed lists reset and given back");
+                        land();
+                    }
+                })
+                .ok()
+                .map(|_| Mutex::new(send))
+        });
+        if let Some(send) = aside
+            && send.lock().unwrap_or_else(|e| e.into_inner()).send(()).is_ok()
+        {
+            return;
+        }
+    } else if !ab_forced_off
+        && relay()
+        && LATE_HELPER_UP.load(Ordering::Acquire)
+        && !crate::list::idle_low()
+    {
+        // With relay active, `victory-late-wait` recycles landed lists
+        // asynchronously on `poke`; only drain synchronously if the helper is
+        // unavailable or idle runs low.
+        return;
+    }
+    let _landing = crate::timeline::span("landed lists reset and given back");
+    land();
+}
+
 /// Whether the `victory-late-wait` helper thread is running and ready to
 /// recycle landed lists asynchronously off `victory-submit`.
 static LATE_HELPER_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -5548,12 +5612,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        // With relay active, `victory-late-wait` recycles landed lists asynchronously
-        // on `poke`; only drain synchronously if the helper is unavailable or idle runs low.
-        if !relay() || !LATE_HELPER_UP.load(Ordering::Acquire) || crate::list::idle_low() {
-            let _landing = crate::timeline::span("landed lists reset and given back");
-            land();
-        }
+        land_after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a

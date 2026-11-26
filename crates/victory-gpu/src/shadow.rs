@@ -43,6 +43,11 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Per page index (`page - base`) that has only been copied in part:
+    /// sorted, non-overlapping byte spans `(lo, hi, stamp)` within the 64 KiB
+    /// page that are current as of `stamp`. Locked inside `copied`'s lock.
+    /// Provenance (GPL-3.0): fxceless/victory-fork #1388.
+    partial: Mutex<std::collections::HashMap<usize, Vec<(u32, u32, u64)>>>,
     /// Two ranges of title memory taken whole, the last one and the longest,
     /// and the asking after which each was ([`Shadow::copy_stale`]). A page
     /// a range holds in part cannot say so in `copied`. Locked inside
@@ -309,8 +314,10 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory, each with its title address span
+/// `(start, end, weak)` so [`send_copied`] upgrades only copies overlapping
+/// the bytes copied (GPL-3.0 provenance: Peppacodes/playablegames-peppa #6).
+static CARDED: Mutex<Vec<(usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(Vec::new());
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -332,7 +339,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, _, w)| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -622,6 +629,7 @@ impl SentRuns {
 /// be merged came after are dropped.
 /// Copies in the card's memory whose CPU side changed since [`card_dirty`] last
 /// drained them (push-on-touch queue, replacing a full [`CARDED`] scan per send).
+/// Provenance (GPL-3.0): Peppacodes/playablegames-peppa #6 (touched-list).
 static CARD_DIRTY_QUEUE: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// Registers a newly created card-backed shadow in [`CARDED`] and stores its
@@ -631,17 +639,30 @@ fn register_carded(shadow: &Arc<Shadow>) {
     if let Some(card) = &shadow.card {
         let _ = card.self_weak.set(weak.clone());
     }
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    carded.push(weak);
+    carded.push((start, end, weak));
     if carded.len() > 512 && carded.len().is_multiple_of(64) {
-        carded.retain(|w| w.strong_count() > 0);
+        carded.retain(|(_, _, w)| w.strong_count() > 0);
     }
 }
 
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    // Periodically compact gone entries from `CARDED` (as in Peppa #6).
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(512) {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, _, w)| w.strong_count() > 0);
+    }
     let pending = {
         let mut q = CARD_DIRTY_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *q)
+    };
+    // In-run A/B (`VICTORY_CARD_TOUCHED` off in diagnostics builds): scan every copy as before.
+    #[cfg(feature = "diagnostics")]
+    let pending: Vec<std::sync::Weak<Shadow>> = if crate::ab::pick("VICTORY_CARD_TOUCHED") == Some(false) {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(_, _, w)| w.clone()).collect()
+    } else {
+        pending
     };
     if pending.is_empty() {
         return Vec::new();
@@ -751,9 +772,19 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    // Only upgrade copies whose title range overlaps `[dst, dst + len)`
+    // (GPL-3.0 provenance: Peppacodes/playablegames-peppa #6).
+    let dst_end = dst.saturating_add(len);
+    let holding: Vec<Arc<Shadow>> = CARDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|&&(start, end, _)| dst < end && dst_end > start)
+        .filter_map(|(_, _, weak)| weak.upgrade())
+        .collect();
+    for shadow in holding {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
-        let (from, to) = (dst.max(start), (dst + len).min(end));
+        let (from, to) = (dst.max(start), dst_end.min(end));
         if from >= to {
             continue;
         }
@@ -767,7 +798,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|(_, _, w)| w.upgrade()).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -1575,7 +1606,7 @@ fn wide_priority() -> bool {
     on
 }
 
-fn helper_priority(above: &mut bool) {
+pub(crate) fn helper_priority(above: &mut bool) {
     let wanted = wide_priority();
     if wanted == *above {
         return;
@@ -2863,14 +2894,20 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
         return runs;
     }
     let mut out: Vec<(usize, usize, bool)> = Vec::with_capacity(runs.len() + pages.len());
-    let mut pages = pages.iter().zip(parts).peekable();
+    let mut p = 0;
     for (from, to, known) in runs {
         if !known {
             out.push((from, to, known));
             continue;
         }
-        while let Some((&(page, _), &parts)) = pages.next_if(|((page, _), _)| page * PAGE < to) {
-            for k in (0..16).filter(|k| parts >> k & 1 != 0) {
+        while p < pages.len() && (pages[p].0 + 1) * PAGE <= from {
+            p += 1;
+        }
+        let mut q = p;
+        while q < pages.len() && pages[q].0 * PAGE < to {
+            let (page, _) = pages[q];
+            let mask = parts[q];
+            for k in (0..16).filter(|k| mask >> k & 1 != 0) {
                 let (a, b) = ((page * PAGE + k * PART).max(from), (page * PAGE + (k + 1) * PART).min(to));
                 if a >= b {
                     continue;
@@ -2880,6 +2917,10 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
                     _ => out.push((a, b, true)),
                 }
             }
+            q += 1;
+        }
+        while p < q && (pages[p].0 + 1) * PAGE <= to {
+            p += 1;
         }
     }
     out
@@ -2973,6 +3014,318 @@ mod stale_tests {
         // Part of a page counts as the page; pages outside the copy do not.
         assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
         assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+    }
+
+    #[test]
+    fn partial_page_refresh_skips_unchanged_and_reuploads_written_spans() {
+        let base = 0x100usize;
+        let start = base * PAGE;
+        let len = 3 * PAGE;
+        let end = start + len;
+        let mut title = vec![0xAAu8; len];
+        let mut shadow = vec![0u8; len];
+        let mut copied = vec![0u64; 3];
+        let mut partial = std::collections::HashMap::new();
+
+        // Unaligned span crossing both a 4 KiB subpage boundary and the
+        // 64 KiB boundary between page 0x100 and page 0x101.
+        let from = start + 0xF500;
+        let to = start + PAGE + 0x1300;
+        let do_refresh = |copied: &mut [u64],
+                          partial: &mut std::collections::HashMap<usize, Vec<(u32, u32, u64)>>,
+                          title: &[u8],
+                          shadow: &mut [u8],
+                          now: u64,
+                          written: &[(usize, u64)]| {
+            copy_stale_with(
+                start,
+                end,
+                copied,
+                partial,
+                0,
+                from,
+                to,
+                now,
+                written,
+                |pages| vec![u16::MAX; pages.len()],
+                |runs| {
+                    let mut total = 0;
+                    for (lo, hi, _) in runs {
+                        shadow[lo - start..hi - start].copy_from_slice(&title[lo - start..hi - start]);
+                        total += hi - lo;
+                    }
+                    total
+                },
+            )
+        };
+
+        // 1st refresh: copies the entire unaligned span across the boundary.
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 10, &[]), to - from);
+        assert_eq!(copied, [0, 0, 0]);
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 2nd refresh with no CPU writes: skips every already-covered byte.
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 11, &[]), 0);
+
+        // CPU writes to the second page only; 3rd refresh uploads only that page's covered span.
+        title[PAGE + 0x200..PAGE + 0x400].fill(0x55);
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 13, &[(base + 1, 12)]), 0x1300);
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 4th refresh with no new write: skips again.
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 14, &[(base + 1, 12)]), 0);
+    }
+
+    #[test]
+    fn partial_page_refresh_handles_overlapping_extension_and_whole_promotion() {
+        let base = 0x200usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = vec![0u64; 1];
+        let mut partial = std::collections::HashMap::new();
+        let mut ranges = Vec::new();
+
+        // First partial refresh [0x100, 0x500).
+        let n1 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            0,
+            start + 0x100,
+            start + 0x500,
+            10,
+            &[],
+            |p| vec![u16::MAX; p.len()],
+            |runs| {
+                let mut total = 0;
+                for (lo, hi, _) in runs {
+                    ranges.push((lo - start, hi - start));
+                    total += hi - lo;
+                }
+                total
+            },
+        );
+        assert_eq!(n1, 0x400);
+        assert_eq!(ranges, vec![(0x100, 0x500)]);
+        ranges.clear();
+
+        // Extended refresh [0x100, 0x800): copies only [0x500, 0x800).
+        let n2 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            0,
+            start + 0x100,
+            start + 0x800,
+            11,
+            &[],
+            |p| vec![u16::MAX; p.len()],
+            |runs| {
+                let mut total = 0;
+                for (lo, hi, _) in runs {
+                    ranges.push((lo - start, hi - start));
+                    total += hi - lo;
+                }
+                total
+            },
+        );
+        assert_eq!(n2, 0x300);
+        assert_eq!(ranges, vec![(0x500, 0x800)]);
+        ranges.clear();
+
+        // Full-page refresh promotes to whole-page stamp and clears partial entry.
+        let n3 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            0,
+            start,
+            end,
+            12,
+            &[],
+            |p| vec![u16::MAX; p.len()],
+            |runs| {
+                let mut total = 0;
+                for (lo, hi, _) in runs {
+                    ranges.push((lo - start, hi - start));
+                    total += hi - lo;
+                }
+                total
+            },
+        );
+        assert_eq!(n3, PAGE - 0x700);
+        assert_eq!(ranges, vec![(0, 0x100), (0x800, PAGE)]);
+        assert_eq!(copied[0], 12);
+        assert!(partial.is_empty());
+    }
+
+    #[test]
+    fn partial_page_refresh_with_parts_skips_clean_subpages_and_handles_multiple_gaps() {
+        let base = 0x300usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = vec![5u64; 1];
+        let mut partial = std::collections::HashMap::new();
+        let mut ranges = Vec::new();
+
+        // Whole page copied at 5, then written at 12 with 4 KiB subpages 0 and 2 dirty
+        // (0x0000..0x1000 and 0x2000..0x3000) and subpage 1 clean.
+        let n1 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            0,
+            start + 0x0800,
+            start + 0x2400,
+            13,
+            &[(base, 12)],
+            |pages| {
+                assert_eq!(pages, [(base, 5)]);
+                vec![(1u16 << 0) | (1u16 << 2)]
+            },
+            |runs| {
+                let mut total = 0;
+                for (lo, hi, known) in runs {
+                    assert!(known);
+                    ranges.push((lo - start, hi - start));
+                    total += hi - lo;
+                }
+                total
+            },
+        );
+        assert_eq!(n1, 0x800 + 0x400);
+        assert_eq!(ranges, vec![(0x0800, 0x1000), (0x2000, 0x2400)]);
+        ranges.clear();
+
+        // Second partial refresh of the same range skips completely without calling parts_of.
+        let n2 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            0,
+            start + 0x0800,
+            start + 0x2400,
+            14,
+            &[(base, 12)],
+            |_| unreachable!("no stale gaps remain"),
+            |_| unreachable!("nothing to copy"),
+        );
+        assert_eq!(n2, 0);
+
+        // Wider partial refresh [0x0000, 0x3400) has TWO disjoint gaps around
+        // [0x0800, 0x2400) on the same page; `by_parts` must narrow BOTH gaps.
+        let n3 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            0,
+            start,
+            start + 0x3400,
+            15,
+            &[(base, 12)],
+            |pages| {
+                assert_eq!(pages, [(base, 5)]);
+                vec![(1u16 << 0) | (1u16 << 2)]
+            },
+            |runs| {
+                let mut total = 0;
+                for (lo, hi, known) in runs {
+                    assert!(known);
+                    ranges.push((lo - start, hi - start));
+                    total += hi - lo;
+                }
+                total
+            },
+        );
+        assert_eq!(n3, 0x800 + 0xC00);
+        assert_eq!(ranges, vec![(0x0000, 0x0800), (0x2400, 0x3000)]);
+        assert_eq!(partial_cover_stamp(partial.get(&0).unwrap(), 0, 0x3400), 13);
+    }
+
+    #[test]
+    fn owner_partial_span_advances_on_clean_landing() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        struct MappedView {
+            section: usize,
+            addr: usize,
+            len: usize,
+        }
+        impl Drop for MappedView {
+            fn drop(&mut self) {
+                crate::watch::title_memory_remapped(self.addr, self.len);
+                // SAFETY: mapped below and unregistered before unmapping.
+                unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.addr as *mut _ }) };
+                crate::inplace::title_memory_section_gone(self.section);
+                // SAFETY: handle returned by `CreateFileMappingW`.
+                unsafe { CloseHandle(self.section as HANDLE) };
+            }
+        }
+
+        // SAFETY: fresh 64 KiB pagefile section for CPU-only test view.
+        let section = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        let section_id = section as usize;
+        crate::inplace::title_memory_section(section_id, PAGE as u64, true);
+        // SAFETY: offset 0, length `PAGE` in the section just created.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        let v_owner = view.Value as usize;
+        crate::watch::title_memory_remapped(v_owner, PAGE);
+        crate::inplace::title_memory_view(v_owner, PAGE, section_id, 0);
+        let _mapped = MappedView { section: section_id, addr: v_owner, len: PAGE };
+
+        // SAFETY: writable 1-page view.
+        unsafe {
+            std::ptr::write_bytes(v_owner as *mut u8, 0x21, PAGE);
+        }
+        let mut backing = vec![0u8; PAGE].into_boxed_slice();
+        let owner = Shadow::unbacked(v_owner as u64, backing.as_mut_ptr(), PAGE as u64, false);
+
+        // Partial refresh only `[0x100, 0x500)` (whole page remains unstamped in `copied`).
+        assert_eq!(owner.update(v_owner + 0x100, 0x400), 0x400);
+        assert_eq!(owner.copied.lock().unwrap()[0], 0);
+        assert_eq!(owner.update(v_owner + 0x100, 0x400), 0);
+        assert!(owner.nothing_new(v_owner + 0x100, 0x400));
+
+        // Clean relay merge into `[0x200, 0x210)` updates owner & advances its partial stamp.
+        assert!(crate::safecopy::on());
+        let merged = [0x99u8; 16];
+        let mut notes = crate::land::Notes::default();
+        // SAFETY: `[v_owner + 0x200, v_owner + 0x210)` lies inside the view and `owner`.
+        unsafe {
+            crate::land::piece(
+                v_owner + 0x200,
+                merged.as_ptr(),
+                owner.data.add(0x200),
+                &[(0, merged.len())],
+                true,
+                &mut notes,
+                std::ptr::from_ref(owner.as_ref()),
+            );
+        }
+        notes.flush();
+        assert_eq!(&backing[0x200..0x210], &merged);
+        assert!(owner.nothing_new(v_owner + 0x100, 0x400));
+        assert_eq!(owner.update(v_owner + 0x100, 0x400), 0);
+
+        // A subsequent title write opens the guard so `nothing_new` is false and refresh sees it.
+        // SAFETY: title write faults and opens the page guard.
+        unsafe { ((v_owner + 0x300) as *mut u8).write(0xE7) };
+        assert!(!owner.nothing_new(v_owner + 0x100, 0x400));
+        assert!(owner.update(v_owner + 0x100, 0x400) > 0);
+        assert_eq!(backing[0x300], 0xE7);
     }
 }
 
@@ -3288,6 +3641,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            partial: Mutex::default(),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -3933,9 +4287,11 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
+                        *at = (*at).max(now);
+                        partial.remove(&(page - base));
                     }
                 }
             }
@@ -4103,7 +4459,26 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+        let ranged = self.ranged(from, to);
+        let base = start / PAGE;
+        let same = if partial.is_empty() {
+            crate::watch::nothing_new(from, to, base, &copied, ranged)
+        } else {
+            crate::watch::nothing_new_by(from, to, |page| {
+                let Some(idx) = page.checked_sub(base) else {
+                    return 0;
+                };
+                let mut stamp = copied.get(idx).copied().unwrap_or(0).max(ranged);
+                if let Some(spans) = partial.get(&idx) {
+                    let page_base = page * PAGE;
+                    let r_lo = (page_base.max(from) - page_base) as u32;
+                    let r_hi = ((page_base + PAGE).min(to) - page_base) as u32;
+                    stamp = stamp.max(partial_cover_stamp(spans, r_lo, r_hi));
+                }
+                stamp
+            })
+        };
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4209,60 +4584,26 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// asking), whole pages within the buffer, recording per-span stamps for
+    /// partial boundary pages so unchanged sub-ranges are not re-copied.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
-        let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        // Pages the range holds in part are never noted in `copied`, and
-        // were copied again at every refresh of the range, written or not:
-        // of the heap's buffer views alone two ends for each of 4,400
-        // copies, every frame. A range that was taken whole, and not written
-        // since, is as it was.
+        let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
         let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
-        let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
-        // Pages taken before and written since: in the order of their runs.
-        let mut again_at: Vec<(usize, u64)> = Vec::new();
-        let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
-            let at = &mut copied[page - base];
-            let taken = (*at).max(ranged);
-            if taken == 0 || write > taken {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                // Cut where pages taken before meet pages never taken.
-                let again = taken != 0;
-                if again {
-                    again_at.push((page, taken));
-                }
-                if let Some((first, known)) = run
-                    && known != again
-                {
-                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
-                    run = None;
-                }
-                run.get_or_insert((page, again));
-            } else if let Some((first, known)) = run.take() {
-                runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
-            }
-        }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some((first, known)) = run {
-            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
-        }
-        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
-        let bytes = self.take_all(runs);
+        let bytes = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            ranged,
+            from,
+            to,
+            now,
+            written,
+            crate::watch::parts_written,
+            |runs| self.take_all(runs),
+        );
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
@@ -4273,6 +4614,217 @@ impl Shadow {
         }
         bytes
     }
+}
+
+/// Inserts a disjoint byte span `(lo, hi, stamp)` into `spans` (kept sorted
+/// and non-overlapping), merging with adjacent spans that share `stamp`.
+/// Provenance (GPL-3.0): fxceless/victory-fork #1388.
+fn insert_partial_span(spans: &mut Vec<(u32, u32, u64)>, lo: u32, hi: u32, stamp: u64) {
+    if lo >= hi {
+        return;
+    }
+    let pos = spans.partition_point(|&(a, _, _)| a < lo);
+    spans.insert(pos, (lo, hi, stamp));
+    if pos + 1 < spans.len() && spans[pos].1 == spans[pos + 1].0 && spans[pos].2 == spans[pos + 1].2 {
+        spans[pos].1 = spans[pos + 1].1;
+        spans.remove(pos + 1);
+    }
+    if pos > 0 && spans[pos - 1].1 == spans[pos].0 && spans[pos - 1].2 == spans[pos].2 {
+        spans[pos - 1].1 = spans[pos].1;
+        spans.remove(pos);
+    }
+    const MAX_SPANS: usize = 64;
+    if spans.len() > MAX_SPANS {
+        // Conservatively coalesce adjacent spans with `min(stamp)` so memory
+        // stays bounded without ever over-stating freshness.
+        let mut merged: Vec<(u32, u32, u64)> = Vec::with_capacity(spans.len());
+        for &(a, b, s) in spans.iter() {
+            if let Some(last) = merged.last_mut()
+                && last.1 == a
+            {
+                last.1 = b;
+                last.2 = last.2.min(s);
+            } else {
+                merged.push((a, b, s));
+            }
+        }
+        *spans = merged;
+        if spans.len() > MAX_SPANS
+            && let Some((oldest, _)) = spans.iter().enumerate().min_by_key(|(_, span)| span.2)
+        {
+            spans.remove(oldest);
+        }
+    }
+}
+
+/// Prunes partial spans invalidated by `write` (`stamp < write`) and returns
+/// the sorted gaps inside `[req_lo, req_hi)` not covered by remaining spans.
+fn stale_gaps_in_page(spans: &mut Vec<(u32, u32, u64)>, write: u64, req_lo: u32, req_hi: u32) -> Vec<(u32, u32)> {
+    spans.retain(|&(_, _, stamp)| write <= stamp);
+    let mut gaps = Vec::new();
+    let mut cursor = req_lo;
+    for &(a, b, _) in spans.iter() {
+        if b <= cursor {
+            continue;
+        }
+        if a >= req_hi {
+            break;
+        }
+        if a > cursor {
+            gaps.push((cursor, a));
+        }
+        cursor = cursor.max(b);
+        if cursor >= req_hi {
+            break;
+        }
+    }
+    if cursor < req_hi {
+        gaps.push((cursor, req_hi));
+    }
+    gaps
+}
+
+/// Minimum stamp covering all of `[req_lo, req_hi)` from sorted,
+/// non-overlapping partial spans; `0` if any byte in `[req_lo, req_hi)` is
+/// uncovered.
+fn partial_cover_stamp(spans: &[(u32, u32, u64)], req_lo: u32, req_hi: u32) -> u64 {
+    let mut cursor = req_lo;
+    let mut min_stamp = u64::MAX;
+    for &(a, b, stamp) in spans {
+        if b <= cursor {
+            continue;
+        }
+        if a > cursor {
+            return 0;
+        }
+        min_stamp = min_stamp.min(stamp);
+        cursor = cursor.max(b);
+        if cursor >= req_hi {
+            return if min_stamp == u64::MAX { 0 } else { min_stamp };
+        }
+    }
+    0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_stale_with(
+    start: usize,
+    end: usize,
+    copied: &mut [u64],
+    partial: &mut std::collections::HashMap<usize, Vec<(u32, u32, u64)>>,
+    ranged: u64,
+    from: usize,
+    to: usize,
+    now: u64,
+    written: &[(usize, u64)],
+    parts_of: impl FnOnce(&[(usize, u64)]) -> Vec<u16>,
+    take_runs: impl FnOnce(Vec<(usize, usize, bool)>) -> usize,
+) -> usize {
+    if from >= to {
+        return 0;
+    }
+    let base = start / PAGE;
+    let mut writes = written.iter().peekable();
+    let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
+    // Pages taken before and written since: in the order of their runs.
+    let mut again_at: Vec<(usize, u64)> = Vec::new();
+    let last = (to - 1) / PAGE;
+    for page in from / PAGE..=last {
+        let write = match writes.peek() {
+            Some(&&(p, w)) if p == page => {
+                writes.next();
+                w
+            }
+            _ => 0,
+        };
+        let idx = page - base;
+        let at = &mut copied[idx];
+        let taken = (*at).max(ranged);
+        if taken == 0 || write > taken {
+            let page_base = page * PAGE;
+            let page_lo = page_base.max(start);
+            let page_hi = (page_base + PAGE).min(end);
+            let req_lo = page_lo.max(from);
+            let req_hi = page_hi.min(to);
+            let r_lo = (req_lo - page_base) as u32;
+            let r_hi = (req_hi - page_base) as u32;
+            let full_page = req_lo == page_lo && req_hi == page_hi;
+
+            let gaps = match partial.get_mut(&idx) {
+                Some(spans) => {
+                    let g = stale_gaps_in_page(spans, write, r_lo, r_hi);
+                    if spans.is_empty() {
+                        partial.remove(&idx);
+                    }
+                    g
+                }
+                None => vec![(r_lo, r_hi)],
+            };
+            if gaps.is_empty() {
+                if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), page_base.min(to), known));
+                }
+                continue;
+            }
+
+            let again = taken != 0;
+            if again {
+                again_at.push((page, taken));
+            }
+            if full_page {
+                *at = now;
+                partial.remove(&idx);
+            } else {
+                let spans = partial.entry(idx).or_default();
+                for &(g_lo, g_hi) in &gaps {
+                    insert_partial_span(spans, g_lo, g_hi, now);
+                }
+                let p_lo = (page_lo - page_base) as u32;
+                let p_hi = (page_hi - page_base) as u32;
+                if spans.len() == 1 && spans[0].0 == p_lo && spans[0].1 == p_hi {
+                    *at = (*at).max(spans[0].2);
+                    partial.remove(&idx);
+                }
+            }
+
+            if gaps.len() == 1 && gaps[0] == (r_lo, r_hi) {
+                // Cut where pages taken before meet pages never taken.
+                if let Some((first, known)) = run
+                    && known != again
+                {
+                    runs.push(((first * PAGE).max(from), page_base.min(to), known));
+                    run = None;
+                }
+                run.get_or_insert((page, again));
+            } else {
+                if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), page_base.min(to), known));
+                }
+                for &(g_lo, g_hi) in &gaps {
+                    runs.push((page_base + g_lo as usize, page_base + g_hi as usize, again));
+                }
+            }
+        } else if let Some((first, known)) = run.take() {
+            runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+        }
+    }
+    // Cut to the range: next to it shaders may be writing the copy.
+    if let Some((first, known)) = run {
+        runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
+    }
+    let runs = if again_at.is_empty() {
+        runs
+    } else {
+        let parts = parts_of(&again_at);
+        by_parts(runs, &again_at, &parts)
+    };
+    if runs.is_empty() {
+        return 0;
+    }
+    take_runs(runs)
+}
+
+impl Shadow {
 
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
     /// they are long: the big heap's copy has some 4 MB of them in each of
@@ -4490,20 +5042,19 @@ impl Shadow {
         if runs.peek().is_none() {
             return;
         }
-        let notify = {
-            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            dirty.reserve(most);
-            for (from, to) in runs {
-                match dirty.last_mut() {
-                    Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-                    _ => dirty.push((from, to)),
-                }
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.reserve(most);
+        for (from, to) in runs {
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
             }
-            // Under `dirty`'s lock: `card_dirty` clears `touched` under the same
-            // lock, so flipping false -> true here can never miss a drain.
-            !card.touched.swap(true, Ordering::AcqRel)
-        };
-        if notify
+        }
+        // Enqueue under `dirty`'s lock (`dirty` -> `CARD_DIRTY_QUEUE`;
+        // `card_dirty` releases `CARD_DIRTY_QUEUE` before locking any `dirty`),
+        // so a concurrent caller observing `touched == true` can never race
+        // ahead of the queue push and miss an upload (Peppa #6 lock rule).
+        if !card.touched.swap(true, Ordering::AcqRel)
             && let Some(weak) = card.self_weak.get()
         {
             CARD_DIRTY_QUEUE
@@ -4937,9 +5488,20 @@ impl Shadow {
         let Some(at) = copied.get_mut(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        if !crate::watch::block_published(block) {
+            return false;
+        }
+        let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+        let held = *at != 0 && *at >= before;
         if held {
             *at = (*at).max(now);
+            partial.remove(&page);
+        } else if let Some(spans) = partial.get_mut(&page) {
+            for (_, _, stamp) in spans.iter_mut() {
+                if *stamp >= before {
+                    *stamp = (*stamp).max(now);
+                }
+            }
         }
         held
     }
