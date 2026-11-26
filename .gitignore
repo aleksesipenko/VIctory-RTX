@@ -13,6 +13,8 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+# Machine-specific launchers, hardware constraints, and local run notes
+/local/
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/
