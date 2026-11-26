@@ -507,6 +507,18 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// Incoming edges of the emitted CFG, including branches introduced by
+    /// lowering. Query validity follows those actual edges through guest joins.
+    pub(super) fn predecessors(&self) -> Vec<Vec<usize>> {
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for (b, block) in self.blocks.iter().enumerate() {
+            for &next in successors(block.term).iter() {
+                preds[next].push(b);
+            }
+        }
+        preds
+    }
+
     pub fn terminate(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
     }

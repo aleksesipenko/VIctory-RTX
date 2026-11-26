@@ -1,5 +1,32 @@
 //! SM 6.6 inline ray queries. State access is valid only after Proceed has
 //! exposed a candidate or CommittedStatus has identified a triangle.
+//! Adapted from maren-halv/VIctory-DXR @ cd87189 (GPL-3.0).
+
+/// DXIL SM 6.6 `RayQuery` state query opcodes (`dx.op.rayQuery_State*`).
+pub(super) mod rq_op {
+    pub const COMMITTED_STATUS: u32 = 184;
+    pub const CANDIDATE_TYPE: u32 = 185;
+    pub const CANDIDATE_OBJECT_TO_WORLD_3X4: u32 = 186;
+    pub const COMMITTED_OBJECT_TO_WORLD_3X4: u32 = 188;
+    pub const COMMITTED_WORLD_TO_OBJECT_3X4: u32 = 189;
+    pub const CANDIDATE_TRIANGLE_FRONT_FACE: u32 = 191;
+    pub const COMMITTED_TRIANGLE_FRONT_FACE: u32 = 192;
+    pub const CANDIDATE_TRIANGLE_BARYCENTRICS: u32 = 193;
+    pub const COMMITTED_TRIANGLE_BARYCENTRICS: u32 = 194;
+    pub const CANDIDATE_TRIANGLE_RAY_T: u32 = 199;
+    pub const COMMITTED_RAY_T: u32 = 200;
+    pub const CANDIDATE_INSTANCE_INDEX: u32 = 201;
+    pub const CANDIDATE_INSTANCE_ID: u32 = 202;
+    pub const CANDIDATE_GEOMETRY_INDEX: u32 = 203;
+    pub const CANDIDATE_PRIMITIVE_INDEX: u32 = 204;
+    pub const COMMITTED_INSTANCE_INDEX: u32 = 207;
+    pub const COMMITTED_INSTANCE_ID: u32 = 208;
+    pub const COMMITTED_GEOMETRY_INDEX: u32 = 209;
+    pub const COMMITTED_PRIMITIVE_INDEX: u32 = 210;
+    pub const CANDIDATE_INSTANCE_CONTRIBUTION: u32 = 214;
+    pub const COMMITTED_INSTANCE_CONTRIBUTION: u32 = 215;
+}
+
 use super::bitcode::{Attr, V};
 use super::shader::{Shader, flags};
 
@@ -12,8 +39,8 @@ pub(super) struct Ray {
     pub mask: V,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct RayQuery(V);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RayQuery(V);
 
 pub(super) enum Intersection {
     Candidate,
@@ -94,14 +121,14 @@ impl RayQuery {
     }
 
     pub fn candidate_type(self, s: &mut Shader, b: usize) -> V {
-        self.integer(s, b, 185)
+        self.integer(s, b, rq_op::CANDIDATE_TYPE)
     }
 
     pub fn status(self, s: &mut Shader, b: usize) -> V {
-        self.integer(s, b, 184)
+        self.integer(s, b, rq_op::COMMITTED_STATUS)
     }
 
-    fn integer(self, s: &mut Shader, b: usize, opcode: u32) -> V {
+    pub(super) fn integer(self, s: &mut Shader, b: usize, opcode: u32) -> V {
         s.op(
             b,
             "rayQuery_StateScalar.i32",
@@ -112,44 +139,86 @@ impl RayQuery {
         )
     }
 
+    pub(super) fn scalar_bit(self, s: &mut Shader, b: usize, op: u32) -> V {
+        s.op(
+            b,
+            "rayQuery_StateScalar.i1",
+            Attr::ReadOnly,
+            s.t.i1,
+            op,
+            &[self.0],
+        )
+    }
+
+    pub(super) fn scalar_float(self, s: &mut Shader, b: usize, op: u32) -> V {
+        s.op(
+            b,
+            "rayQuery_StateScalar.f32",
+            Attr::ReadOnly,
+            s.t.f32,
+            op,
+            &[self.0],
+        )
+    }
+
+    pub(super) fn vector(self, s: &mut Shader, b: usize, op: u32, component: u8) -> V {
+        let c = s.m.i8(component);
+        s.op(
+            b,
+            "rayQuery_StateVector.f32",
+            Attr::ReadOnly,
+            s.t.f32,
+            op,
+            &[self.0, c],
+        )
+    }
+
+    pub(super) fn matrix(self, s: &mut Shader, b: usize, op: u32, row: u32, col: u8) -> V {
+        let r = s.m.i32(row);
+        let c = s.m.i8(col);
+        s.op(
+            b,
+            "rayQuery_StateMatrix.f32",
+            Attr::ReadOnly,
+            s.t.f32,
+            op,
+            &[self.0, r, c],
+        )
+    }
+
     pub fn triangle(self, s: &mut Shader, b: usize, state: Intersection) -> TriangleHit {
+        use rq_op::*;
         let (t, uv, id, index, contribution, geometry, primitive, front) = match state {
-            Intersection::Candidate => (199, 193, 202, 201, 214, 203, 204, 191),
-            Intersection::Committed => (200, 194, 208, 207, 215, 209, 210, 192),
+            Intersection::Candidate => (
+                CANDIDATE_TRIANGLE_RAY_T,
+                CANDIDATE_TRIANGLE_BARYCENTRICS,
+                CANDIDATE_INSTANCE_ID,
+                CANDIDATE_INSTANCE_INDEX,
+                CANDIDATE_INSTANCE_CONTRIBUTION,
+                CANDIDATE_GEOMETRY_INDEX,
+                CANDIDATE_PRIMITIVE_INDEX,
+                CANDIDATE_TRIANGLE_FRONT_FACE,
+            ),
+            Intersection::Committed => (
+                COMMITTED_RAY_T,
+                COMMITTED_TRIANGLE_BARYCENTRICS,
+                COMMITTED_INSTANCE_ID,
+                COMMITTED_INSTANCE_INDEX,
+                COMMITTED_INSTANCE_CONTRIBUTION,
+                COMMITTED_GEOMETRY_INDEX,
+                COMMITTED_PRIMITIVE_INDEX,
+                COMMITTED_TRIANGLE_FRONT_FACE,
+            ),
         };
         TriangleHit {
-            t: s.op(
-                b,
-                "rayQuery_StateScalar.f32",
-                Attr::ReadOnly,
-                s.t.f32,
-                t,
-                &[self.0],
-            ),
-            uv: std::array::from_fn(|n| {
-                let c = s.m.i8(n as u8);
-                s.op(
-                    b,
-                    "rayQuery_StateVector.f32",
-                    Attr::ReadOnly,
-                    s.t.f32,
-                    uv,
-                    &[self.0, c],
-                )
-            }),
+            t: self.scalar_float(s, b, t),
+            uv: std::array::from_fn(|n| self.vector(s, b, uv, n as u8)),
             instance: self.integer(s, b, id),
             index: self.integer(s, b, index),
             contribution: self.integer(s, b, contribution),
             geometry: self.integer(s, b, geometry),
             primitive: self.integer(s, b, primitive),
-            front: s.op(
-                b,
-                "rayQuery_StateScalar.i1",
-                Attr::ReadOnly,
-                s.t.i1,
-                front,
-                &[self.0],
-            ),
+            front: self.scalar_bit(s, b, front),
         }
     }
 }

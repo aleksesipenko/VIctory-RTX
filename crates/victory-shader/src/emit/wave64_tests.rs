@@ -53,7 +53,7 @@ fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
 }
 
 /// [`native_of`] with `lds` bytes of LDS (512-byte granules).
-fn native_with(body: &[u32], wave64: bool, threads: u32, lds: u32) -> NativeProgram {
+pub(super) fn native_with(body: &[u32], wave64: bool, threads: u32, lds: u32) -> NativeProgram {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
