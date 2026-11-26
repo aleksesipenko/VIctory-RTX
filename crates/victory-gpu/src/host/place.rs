@@ -254,8 +254,17 @@ impl HostList {
         let at = to.offset(dst as u64);
         // What the title's CPU wrote around and under it so far goes first.
         to.refresh(self, dst as u64, len as u64);
-        // SAFETY (both): an open list; live buffers (the list holds the
+        let (common, source, dest) = (
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        // SAFETY (all): an open list; live buffers (the list holds the
         // copies and its scratch memory), ranges inside them.
+        // Host copies are created in COMMON and implicitly promoted by
+        // CopyBufferRegion; transition them back to COMMON afterwards so later
+        // copies or shader reads in the same list never hit COPY_DEST/COPY_SOURCE
+        // (GPL-3.0 provenance: Rubenpannen/VIctory-RTX5070 40f904b).
         unsafe { wait_for_all(host, &self.list) };
         match (&own, &scratch) {
             (Some(from), _) => {
@@ -267,12 +276,19 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        self.list.ResourceBarrier(&[
+                            transition(&between, dest, source),
+                            // A promoted read state cannot be implicitly promoted to a write state.
+                            transition(&from.buffer, source, dest),
+                        ]);
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
                 } else {
-                    unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
+                    unsafe {
+                        self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64);
+                        self.list.ResourceBarrier(&[transition(&from.buffer, source, common)]);
+                    }
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
@@ -281,7 +297,10 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        unsafe {
+            self.list.ResourceBarrier(&[transition(&to.buffer, dest, common)]);
+            wait_for_all(host, &self.list);
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -312,11 +331,15 @@ impl HostList {
         STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
         // The COPY_DEST -> COPY_SOURCE transition on `between` already orders
-        // this copy before any subsequent CopyTextureRegion reading `between`.
+        // this copy before any subsequent CopyTextureRegion reading `between`,
+        // and `from.buffer` returns to COMMON for later commands in the list.
         unsafe {
             wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            self.list.ResourceBarrier(&[
+                transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            ]);
         }
         Some(between)
     }

@@ -294,7 +294,15 @@ impl Drop for Recording {
                 // unsubmitted backing list now instead of parking it in BACKS.
                 super::list_release(inner.back as This);
             } else {
-                held(&BACKS).push(inner.back);
+                // Cap pooled backing lists to avoid unbounded memory growth
+                // (GPL-3.0 provenance: maren-halv/VIctory-DXR d5efb36).
+                let mut backs = held(&BACKS);
+                if backs.len() < 64 {
+                    backs.push(inner.back);
+                } else {
+                    drop(backs);
+                    super::list_release(inner.back as This);
+                }
             }
         }
     }

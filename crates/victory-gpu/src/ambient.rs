@@ -57,10 +57,20 @@ pub(crate) enum Role {
     Reflect,
 }
 
-/// The program's part in this, by its name in the container.
-pub(crate) fn role(container: &[u8]) -> Option<Role> {
+/// Whether to also clamp the transparent/alpha reflection layer
+/// (`CS_TemporalResolve1_Alpha_*`). Off by default: transparent surfaces
+/// (foam, wakes, glass) sample the opaque depth behind them, which outdoors on
+/// water is the seabed and produces dark ragged patches around boats
+/// (`VICTORY_AMBIENT_SPECULAR_ALPHA=1` to opt in; GPL-3.0 provenance:
+/// readmet3xt-lab/foxhound 9f6fb77).
+fn reflect_alpha() -> bool {
+    static ALPHA: OnceLock<bool> = OnceLock::new();
+    *ALPHA.get_or_init(|| std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn role_inner(container: &[u8], alpha_reflect: bool) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
-    if has(b"CS_TemporalResolve2_Opaque") || has(b"CS_TemporalResolve1_Alpha") {
+    if has(b"CS_TemporalResolve2_Opaque") || (alpha_reflect && has(b"CS_TemporalResolve1_Alpha")) {
         Some(Role::Reflect)
     } else if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
@@ -71,6 +81,11 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
     } else {
         None
     }
+}
+
+/// The program's part in this, by its name in the container.
+pub(crate) fn role(container: &[u8]) -> Option<Role> {
+    role_inner(container, reflect_alpha())
 }
 
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
@@ -809,8 +824,9 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
-        assert_eq!(role(b"CS_TemporalResolve2_Opaque_FrameStatistics_357e0818"), Some(Role::Reflect));
-        assert_eq!(role(b"CS_TemporalResolve1_Alpha_68979fba"), Some(Role::Reflect));
+        assert_eq!(role_inner(b"CS_TemporalResolve2_Opaque_FrameStatistics_357e0818", false), Some(Role::Reflect));
+        assert_eq!(role_inner(b"CS_TemporalResolve1_Alpha_68979fba", false), None);
+        assert_eq!(role_inner(b"CS_TemporalResolve1_Alpha_68979fba", true), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
