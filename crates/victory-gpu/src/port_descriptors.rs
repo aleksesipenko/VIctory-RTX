@@ -115,10 +115,31 @@ fn adopt_now(start: u64, count: u32) -> bool {
     }
     let count = count as usize;
     let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
-    // (Never freed: a store of the title's may be marking while the heap
-    // goes; a few MB at most.)
-    let slots = leak(count);
-    let chunks = leak(count.div_ceil(CHUNK));
+    // Keep leaked mark arrays monotonically non-shrinking across re-adoptions
+    // so concurrent readers observing a larger `MARKS.len` never write OOB
+    // (GPL-3.0 provenance: maren-halv/VIctory-DXR f1d9f52).
+    static LEAKED: std::sync::Mutex<Option<(&'static [AtomicU8], &'static [AtomicU8])>> = std::sync::Mutex::new(None);
+    let (slots, chunks) = {
+        let mut kept = LEAKED.lock().unwrap_or_else(|e| e.into_inner());
+        let chunk_count = count.div_ceil(CHUNK);
+        match *kept {
+            Some((s, c)) if s.len() >= count && c.len() >= chunk_count => {
+                for a in &s[..count] {
+                    a.store(0, Relaxed);
+                }
+                for a in &c[..chunk_count] {
+                    a.store(0, Relaxed);
+                }
+                (&s[..count], &c[..chunk_count])
+            }
+            _ => {
+                let s = leak(count);
+                let c = leak(chunk_count);
+                *kept = Some((s, c));
+                (s, c)
+            }
+        }
+    };
     let writers: &'static [AtomicUsize] = Box::leak((0..(count * 32).div_ceil(1 << 16)).map(|_| AtomicUsize::new(0)).collect());
     MARKS.slots.store(slots.as_ptr().cast_mut(), Release);
     MARKS.chunks.store(chunks.as_ptr().cast_mut(), Release);
@@ -489,10 +510,14 @@ mod tests {
         32
     }
 
+    /// Serializes tests that touch the process-global `ADOPTED`/`MARKS` state.
+    static ADOPT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Slots marked as the stores mark them, and by our calls, come out once
     /// each, as runs; outside the heap nothing is marked.
     #[test]
     fn marked_slots_are_taken_once_as_runs() {
+        let _guard = ADOPT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let start = 0x1000_0000u64;
         assert!(adopt_now(start, 1000));
         assert!(adopted(start) && !adopted(start + 32));
@@ -515,5 +540,35 @@ mod tests {
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
+    }
+
+    /// Re-adopting a smaller heap reuses the existing mark arrays without
+    /// shrinking them and clears stale marks; a larger heap grows them.
+    #[test]
+    fn re_adoption_keeps_mark_arrays_monotonically_non_shrinking() {
+        let _guard = ADOPT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start_a = 0x2000_0000u64;
+        assert!(adopt_now(start_a, 1024));
+        let slots_a = MARKS.slots.load(Acquire);
+        let chunks_a = MARKS.chunks.load(Acquire);
+        mark(start_a + 10 * 32);
+        let_go(start_a);
+
+        let start_b = 0x3000_0000u64;
+        assert!(adopt_now(start_b, 256));
+        assert_eq!(MARKS.slots.load(Acquire), slots_a, "smaller re-adoption reuses slots");
+        assert_eq!(MARKS.chunks.load(Acquire), chunks_a, "smaller re-adoption reuses chunks");
+        assert_eq!(take(start_b).unwrap(), [], "stale marks cleared on re-adoption");
+        mark(start_b + 3 * 32);
+        assert_eq!(take(start_b).unwrap(), [(3, 1)]);
+        let_go(start_b);
+
+        let start_c = 0x4000_0000u64;
+        assert!(adopt_now(start_c, 2048));
+        assert_ne!(MARKS.slots.load(Acquire), slots_a, "larger re-adoption allocates larger slots");
+        assert_ne!(MARKS.chunks.load(Acquire), chunks_a, "larger re-adoption allocates larger chunks");
+        mark(start_c + 2047 * 32);
+        assert_eq!(take(start_c).unwrap(), [(2047, 1)]);
+        let_go(start_c);
     }
 }

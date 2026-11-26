@@ -1633,6 +1633,47 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
+/// Largest texture [`fingerprint_for`] reads whole when its slot is live.
+const LIVE_WHOLE_BYTES: u64 = 4 << 20;
+
+/// [`fingerprint`], or for a live slot (one found changing after its upload)
+/// no larger than 4 MiB, one of all of its memory (GPL-3.0 provenance:
+/// avatarmanz/VIctory-7900XTX #390). The three 16 KiB windows miss a video
+/// plane's change when its start, middle and end rows are a still background
+/// (a TV news shot: the reporter moves between them), so a plane looked
+/// unchanged and waited while the other planes of the same video frame were
+/// uploaded: one frame's luma under another's chroma.
+pub(crate) fn fingerprint_for(at: u64, len: u64, live: bool) -> u64 {
+    if !live || len > LIVE_WHOLE_BYTES {
+        return fingerprint(at, len);
+    }
+    const CHUNK: usize = 64 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    let mut print = 0u128;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(CHUNK, 0);
+        let mut from = 0;
+        while from < len {
+            let bytes = CHUNK.min(len - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(
+                read.as_mut_ptr(),
+                (at as usize).wrapping_add(from) as *const u8,
+                bytes,
+                false,
+            );
+            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            from += bytes;
+        }
+    });
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+    u64::from_le_bytes(first) | 1
+}
+
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
 /// For the frame listing: whether a list has uploaded `resource`'s staging
@@ -2110,6 +2151,31 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    /// A live fingerprint sees a change between the three 16 KiB strips that
+    /// the plain fingerprint misses, and stays non-zero.
+    #[test]
+    fn fingerprint_for_catches_changes_between_strips_when_live() {
+        let mut plane = vec![0x22u8; 256 << 10];
+        let at = plane.as_ptr() as u64;
+        let len = plane.len() as u64;
+        let plain_before = super::fingerprint_for(at, len, false);
+        let live_before = super::fingerprint_for(at, len, true);
+        assert_ne!(plain_before, 0);
+        assert_ne!(live_before, 0);
+        // Offset 48 KiB lies strictly between the start (0..16 KiB) and
+        // middle (128..144 KiB) strips.
+        plane[48 << 10] ^= 0xff;
+        assert_eq!(super::fingerprint_for(at, len, false), plain_before);
+        assert_ne!(super::fingerprint_for(at, len, true), live_before);
+        // Oversized (> 4 MiB) falls back to the three-strip fingerprint.
+        let mut big = vec![0x11u8; (super::LIVE_WHOLE_BYTES as usize) + (64 << 10)];
+        let big_at = big.as_ptr() as u64;
+        let big_len = big.len() as u64;
+        let big_before = super::fingerprint_for(big_at, big_len, true);
+        big[48 << 10] ^= 0xff;
+        assert_eq!(super::fingerprint_for(big_at, big_len, true), big_before);
     }
 }
 

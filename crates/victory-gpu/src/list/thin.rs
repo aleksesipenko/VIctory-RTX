@@ -263,6 +263,28 @@ impl Recording {
                     inner.scheduled = false;
                     return;
                 };
+                // Empty RESET+CLOSE recording: finish without allocating a backing
+                // host command list (GPL-3.0 provenance: maren-halv/VIctory-DXR f1d9f52).
+                if inner.back == 0
+                    && !inner.closed
+                    && inner.chunks.is_empty()
+                    && inner.dxr.is_empty()
+                    && chunk.len() == 3
+                    && chunk[0] == (RESET | (1 << 16))
+                    && chunk[2] == CLOSE
+                {
+                    let pipeline = chunk[1] as This;
+                    inner.closed = true;
+                    inner.scheduled = false;
+                    self.done.store(true, Release);
+                    self.moved.notify_all();
+                    drop(inner);
+                    crate::pipeline::bound(pipeline);
+                    give_back(vec![chunk]);
+                    STATS[2].fetch_add(1, Relaxed);
+                    crate::queue::line_moved();
+                    return;
+                }
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
                 }
@@ -1029,5 +1051,22 @@ mod tests {
         assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// An empty RESET+CLOSE recording completes via the fast-path without
+    /// allocating a backing host command list.
+    #[test]
+    fn empty_reset_close_fast_path_skips_back_list() {
+        let rec = Arc::new(Recording::new(0));
+        {
+            let mut inner = held(&rec.inner);
+            inner.chunks.push_back(vec![RESET | (1 << 16), 0, CLOSE]);
+            inner.scheduled = true;
+        }
+        rec.run();
+        assert!(rec.done(), "empty recording finishes immediately");
+        assert!(rec.back().is_null(), "no backing list allocated");
+        let inner = held(&rec.inner);
+        assert!(inner.closed && !inner.scheduled && inner.chunks.is_empty());
     }
 }
