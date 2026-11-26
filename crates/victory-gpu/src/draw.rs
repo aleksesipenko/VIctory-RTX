@@ -884,6 +884,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
         slots.extend(changed);
+        slots.sort_unstable();
+        slots.dedup();
         slots
     } else {
         changed

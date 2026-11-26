@@ -193,6 +193,8 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// CPU-RAM shadow of `strides` dwords to skip redundant Write-Combined writes.
+    stride_shadow: Box<[std::sync::atomic::AtomicU32]>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1864,6 +1866,13 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let stride_shadow: Box<[std::sync::atomic::AtomicU32]> = if strides.is_some() {
+            (0..victory_shader::emit::SLOT_STRIDES_COUNT)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect()
+        } else {
+            Box::new([])
+        };
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
             buffer_sweep: Mutex::default(),
@@ -1890,6 +1899,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            stride_shadow,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
@@ -2913,8 +2923,11 @@ impl HostHeap {
     #[inline]
     fn write_stride(&self, index: u32, word: u32) {
         if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+            && let Some(shadow) = self.stride_shadow.get(index as usize)
         {
+            if shadow.swap(word, std::sync::atomic::Ordering::Relaxed) == word {
+                return;
+            }
             // SAFETY: inside the mapping; shaders read it while we write (a
             // single aligned dword: either value is one the slot had, and
             // dynamic slots are exclusively owned until submission finishes).
@@ -2968,20 +2981,22 @@ impl HostHeap {
                 *views = Some(ListViews::new()?);
             }
             let views = views.as_mut()?;
-            if views.recording != recording {
+            let twins = self.twins.get(index as usize).is_some();
+            if views.recording != recording || views.twins != twins {
                 views.recording = recording;
+                views.twins = twins;
                 views.made.clear();
             }
-            let twins = self.twins.get(index as usize).is_some();
             if !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
+                let step = if twins { 2 } else { 1 };
+                let at = step * views.made.len() as u32;
                 // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                if at + step > ListViews::SLOTS || matches!(view, View::Constant(..)) {
                     return None;
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let twin = twins && twinned(&view);
+                let kept = make_twinned(&view, views.slot(at), twin.then(|| views.slot(at + 1)))?;
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -6239,6 +6254,7 @@ struct ListView {
 /// copies its descriptor.
 struct ListViews {
     recording: u64,
+    twins: bool,
     heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
@@ -6262,7 +6278,7 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews { recording: 0, twins: false, heap, step, start, made: Default::default() })
         }
     }
 

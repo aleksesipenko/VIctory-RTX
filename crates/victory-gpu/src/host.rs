@@ -572,6 +572,16 @@ pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
+/// Submission stamp to tag a retired resource with before it may be reused.
+pub(crate) fn retire_stamp() -> u64 {
+    STARTED.load(Ordering::Acquire) + crate::queue::queued()
+}
+
+/// Highest retired submission stamp safe to reuse after [`bury_lag`].
+pub(crate) fn safe_reuse_stamp() -> u64 {
+    FINISHED.load(Ordering::Acquire).saturating_sub(bury_lag())
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -1296,8 +1306,9 @@ pub(crate) struct HostList {
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// when the list first has such transitions ([`lazy_prelude`]), sharing
+    /// `self.allocator` so no second command allocator is created or reset.
+    prelude: OnceLock<Option<ID3D12GraphicsCommandList>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1336,7 +1347,7 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
-/// A list's prelude: an allocator and a closed list.
+/// A standalone allocator and closed list pair (used by card work and probes).
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 /// Whether a host list's prelude is made when the list first needs one. A
@@ -3397,6 +3408,10 @@ fn land() {
     }
 }
 
+/// Whether the `victory-late-wait` helper thread is running and ready to
+/// recycle landed lists asynchronously off `victory-submit`.
+static LATE_HELPER_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3412,6 +3427,7 @@ fn late_helper() {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
+    LATE_HELPER_UP.store(true, Ordering::Release);
     loop {
         let target = {
             let mut line = line();
@@ -4190,7 +4206,7 @@ impl Host {
         list
     }
 
-    /// An allocator and a closed list for a prelude.
+    /// An allocator and a closed list (for card work, fetch, and probes).
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
@@ -4202,6 +4218,29 @@ impl Host {
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                 list.Close()?;
                 Ok((allocator, list))
+            })()
+        };
+        LISTS[1].fetch_add(1, Ordering::Relaxed);
+        match made {
+            Ok(prelude) => Some(prelude),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host list for a prelude");
+                None
+            }
+        }
+    }
+
+    /// A closed prelude list sharing `allocator` with its [`HostList`].
+    fn make_shared_prelude(&self, allocator: &ID3D12CommandAllocator) -> Option<ID3D12GraphicsCommandList> {
+        // SAFETY: plain object creation; the main list using `allocator` is closed
+        // before the prelude is reset and recorded.
+        let made: windows::core::Result<ID3D12GraphicsCommandList> = unsafe {
+            (|| {
+                let list: ID3D12GraphicsCommandList =
+                    self.device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, None)?;
+                list.Close()?;
+                Ok(list)
             })()
         };
         LISTS[1].fetch_add(1, Ordering::Relaxed);
@@ -4228,7 +4267,7 @@ impl Host {
             )?;
             let prelude = OnceLock::new();
             if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+                let _ = prelude.set(self.make_shared_prelude(&allocator));
             }
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
@@ -5410,8 +5449,12 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        // With relay active, `victory-late-wait` recycles landed lists asynchronously
+        // on `poke`; only drain synchronously if the helper is unavailable or idle runs low.
+        if !relay() || !LATE_HELPER_UP.load(Ordering::Acquire) || crate::list::idle_low() {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -6538,13 +6581,10 @@ impl HostList {
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
     }
 
-    /// Only after the list's last submission finished (every one is waited
-    /// for).
-    pub(crate) fn reset(&self) {
-        self.changed_something();
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        let _resetting = crate::timeline::span("resetting a host list");
+    /// Releases CPU-side state, texture holds, and pooled scratch chunks after
+    /// the list's last submission finished, leaving the D3D12 command list and
+    /// allocator closed until the next [`HostList::reset`].
+    pub(crate) fn clear_state(&self) {
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -6564,6 +6604,16 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+    }
+
+    /// Only after the list's last submission finished (every one is waited
+    /// for).
+    pub(crate) fn reset(&self) {
+        self.changed_something();
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let _resetting = crate::timeline::span("resetting a host list");
+        self.clear_state();
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -6916,18 +6966,18 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
+        let Some(list) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| h.make_shared_prelude(&self.allocator)))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // SAFETY: the main list is already closed, so `self.allocator` has no
+        // open list while the prelude records and closes; both execute together
+        // and `self.allocator` resets once in `HostList::reset()`.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
+            list.Reset(&self.allocator, None).and_then(|()| {
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }

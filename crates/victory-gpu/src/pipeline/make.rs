@@ -76,11 +76,9 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
+        // Keep CS_ScreenProbes_ActivateRays enabled by default so reflection
+        // probes initialize cleanly; set VICTORY_ACTIVATE_RAYS=0 to opt out.
+        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0")
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");

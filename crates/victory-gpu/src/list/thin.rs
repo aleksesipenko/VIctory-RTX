@@ -144,7 +144,13 @@ impl Front {
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
-            held(&READY).push_back(recording.clone());
+            let mut ready = held(&READY);
+            if recording.urgent.load(Acquire) {
+                ready.push_front(recording.clone());
+            } else {
+                ready.push_back(recording.clone());
+            }
+            drop(ready);
             WORK.notify_one();
         }
     }
@@ -185,6 +191,8 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// Already submitted to a queue (`submitted`); prioritize ahead of speculative work.
+    urgent: AtomicBool,
 }
 
 #[derive(Default)]
@@ -208,6 +216,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            urgent: AtomicBool::new(false),
         }
     }
 
@@ -330,17 +339,40 @@ fn start() {
 /// The recordings of submitted lists, in order (one that was not begun is left
 /// out).
 pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
-    lists
+    let recordings: Arc<[Arc<Recording>]> = lists
         .iter()
         .filter(|l| !l.is_null())
         .filter_map(|&l| {
             // SAFETY: the title passes its lists, which nobody records into now.
             let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+            if let Some(recording) = &front.recording {
+                recording.urgent.store(true, Release);
+            }
             front.close();
             front.submitted = true;
             front.recording.clone()
         })
-        .collect()
+        .collect();
+    // Promote any already-queued submitted recordings ahead of unsubmitted work.
+    let pending: Vec<Arc<Recording>> = recordings.iter().filter(|r| !r.done()).cloned().collect();
+    if !pending.is_empty() {
+        let mut ready = held(&READY);
+        let mut promoted = 0usize;
+        for rec in pending.into_iter().rev() {
+            if let Some(pos) = ready.iter().position(|q| Arc::ptr_eq(q, &rec))
+                && pos > 0
+                && let Some(item) = ready.remove(pos)
+            {
+                ready.push_front(item);
+                promoted += 1;
+            }
+        }
+        drop(ready);
+        if promoted > 0 {
+            WORK.notify_all();
+        }
+    }
+    recordings
 }
 
 /// For the frame-rate line.

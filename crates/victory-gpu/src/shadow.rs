@@ -126,6 +126,9 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// Self back-reference set at registration so `card_changed_runs` can enqueue
+    /// this shadow onto [`CARD_DIRTY_QUEUE`] without scanning all of [`CARDED`].
+    self_weak: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -617,34 +620,56 @@ impl SentRuns {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
+/// Copies in the card's memory whose CPU side changed since [`card_dirty`] last
+/// drained them (push-on-touch queue, replacing a full [`CARDED`] scan per send).
+static CARD_DIRTY_QUEUE: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Registers a newly created card-backed shadow in [`CARDED`] and stores its
+/// weak handle for push-on-touch dirty tracking.
+fn register_carded(shadow: &Arc<Shadow>) {
+    let weak = Arc::downgrade(shadow);
+    if let Some(card) = &shadow.card {
+        let _ = card.self_weak.set(weak.clone());
+    }
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.push(weak);
+    if carded.len() > 512 && carded.len().is_multiple_of(64) {
+        carded.retain(|w| w.strong_count() > 0);
+    }
+}
+
+pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    let pending = {
+        let mut q = CARD_DIRTY_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *q)
+    };
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(pending.len());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
+    for weak in pending {
         let Some(shadow) = weak.upgrade() else {
-            return false;
+            continue;
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.forget(fetched);
-                    sent.note_joined(sent_as, ranges.clone());
-                }
-                ranges
-            })
-            .unwrap_or_default();
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        let ranges = {
+            let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            c.touched.store(false, Ordering::Release);
+            let ranges = joined(std::mem::take(&mut *dirty));
+            if relay() && !ranges.is_empty() {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.forget(fetched);
+                sent.note_joined(sent_as, ranges.clone());
+            }
+            ranges
+        };
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
-        true
-    });
+    }
     out
 }
 
@@ -4388,16 +4413,27 @@ impl Shadow {
         if runs.peek().is_none() {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        dirty.reserve(most);
-        for (from, to) in runs {
-            match dirty.last_mut() {
-                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-                _ => dirty.push((from, to)),
+        let notify = {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            dirty.reserve(most);
+            for (from, to) in runs {
+                match dirty.last_mut() {
+                    Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                    _ => dirty.push((from, to)),
+                }
             }
+            // Under `dirty`'s lock: `card_dirty` clears `touched` under the same
+            // lock, so flipping false -> true here can never miss a drain.
+            !card.touched.swap(true, Ordering::AcqRel)
+        };
+        if notify
+            && let Some(weak) = card.self_weak.get()
+        {
+            CARD_DIRTY_QUEUE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(weak.clone());
         }
-        // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4694,6 +4730,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                self_weak: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -4849,7 +4886,8 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
-                touched: Default::default(),
+            touched: Default::default(),
+            self_weak: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5270,7 +5308,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
-                touched: Default::default(),
+                    touched: Default::default(),
+                    self_weak: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5296,7 +5335,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            register_carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5499,10 +5538,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        self_weak: Default::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    register_carded(&shadow);
     Some(shadow)
 }
 
@@ -5588,6 +5628,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                self_weak: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5606,7 +5647,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        register_carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
@@ -5614,12 +5655,82 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
-#[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+/// bytes), each with the asking that last took it.
+type ExactMap = std::collections::HashMap<(u64, u64), (Arc<Shadow>, AtomicU64)>;
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static EXACT: std::sync::OnceLock<std::sync::RwLock<ExactMap>> = std::sync::OnceLock::new();
+static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
+static EXACT_MISSES: AtomicU64 = AtomicU64::new(0);
+
+fn exact_map() -> &'static std::sync::RwLock<ExactMap> {
+    EXACT.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::with_capacity(2048)))
+}
+
+/// Already-resident, already-mapped shared buffer retired from [`EXACT`] for
+/// safe reuse once `retired_at <= safe_reuse_stamp()` and COM refcount == 1.
+struct ExactBuf {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    cap: u64,
+    retired_at: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded and persistent write-back mappings stay valid.
+unsafe impl Send for ExactBuf {}
+
+#[allow(clippy::type_complexity)]
+static EXACT_POOL: Mutex<(u64, BTreeMap<u64, std::collections::VecDeque<ExactBuf>>)> =
+    Mutex::new((0, BTreeMap::new()));
+
+/// Max individual buffer size and total pooled bytes kept in [`EXACT_POOL`].
+const EXACT_POOL_MAX_ITEM: u64 = 4 << 20;
+const EXACT_POOL_MAX_BYTES: u64 = 64 << 20;
+
+fn exact_pool_take(cap: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if cap > EXACT_POOL_MAX_ITEM {
+        return None;
+    }
+    let safe = crate::host::safe_reuse_stamp();
+    let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = None;
+    let mut freed = 0u64;
+    if let Some(bucket) = pool.1.get_mut(&cap) {
+        while let Some(front) = bucket.front() {
+            if front.retired_at > safe {
+                break;
+            }
+            let entry = bucket.pop_front().unwrap();
+            freed += entry.cap;
+            if crate::host::references(&entry.buffer) == 1 {
+                taken = Some((entry.buffer, entry.data));
+                break;
+            }
+        }
+    }
+    pool.0 = pool.0.saturating_sub(freed);
+    taken
+}
+
+fn exact_pool_put(buffer: ID3D12Resource, data: *mut u8, cap: u64, retired_at: u64) {
+    if cap > EXACT_POOL_MAX_ITEM || crate::host::references(&buffer) != 1 {
+        return;
+    }
+    let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.0 + cap > EXACT_POOL_MAX_BYTES {
+        return;
+    }
+    pool.0 += cap;
+    let bucket = pool.1.entry(cap).or_default();
+    let item = ExactBuf { buffer, data, cap, retired_at };
+    if retired_at == 0 {
+        bucket.push_front(item);
+    } else {
+        bucket.push_back(item);
+    }
+}
+
+/// Since the last frame line: askings for such copies, newly allocated copies, and pooled reuses.
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5636,42 +5747,108 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
-/// change every frame).
+/// change every frame), recycling their resident mapped host buffers into
+/// [`EXACT_POOL`] so ring churn does not stall on `CreateCommittedResource`,
+/// `MakeResident`, and `mapped()`.
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
+    /// Copies kept before idle ones are swept, and askings an idle one stays for.
+    const MANY: usize = 2048;
+    const LATELY: u64 = 4096;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    // Fast shared-read path: 95%+ of calls hit without an exclusive lock.
+    {
+        let map = exact_map().read().unwrap_or_else(|e| e.into_inner());
+        if let Some((shadow, used)) = map.get(&(address, len)) {
+            used.store(now, Ordering::Relaxed);
+            let m = crate::host::moment();
+            if shadow.used.load(Ordering::Relaxed) != m {
+                shadow.used.store(m, Ordering::Relaxed);
+            }
+            return Some(shadow.clone());
+        }
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    // Amortized sweep of idle entries every 64 misses; retire buffers outside locks.
+    let miss = EXACT_MISSES.fetch_add(1, Ordering::Relaxed);
+    if miss.is_multiple_of(64) {
+        let mut evicted = Vec::new();
+        {
+            let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
+            if map.len() >= MANY {
+                let mut dead = Vec::new();
+                for (&key, (shadow, used)) in map.iter() {
+                    if Arc::strong_count(shadow) == 1
+                        && crate::host::references(&shadow.buffer) == 1
+                        && used.load(Ordering::Relaxed) + LATELY <= now
+                    {
+                        dead.push(key);
+                    }
+                }
+                for key in dead {
+                    if let Some((shadow, _)) = map.remove(&key) {
+                        evicted.push(shadow);
+                    }
+                }
+            }
+        }
+        if !evicted.is_empty() {
+            let stamp = crate::host::retire_stamp();
+            for shadow in evicted {
+                if let Ok(s) = Arc::try_unwrap(shadow)
+                    && s.card.is_none()
+                    && s.place.is_none()
+                {
+                    let buf = s.buffer.clone();
+                    let data = s.data;
+                    let cap = s.width();
+                    drop(s);
+                    exact_pool_put(buf, data, cap, stamp);
+                }
+            }
+        }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // Round small/medium allocations to power-of-two buckets (min 256 B) for high pool reuse.
+    let cap = if len <= EXACT_POOL_MAX_ITEM {
+        len.next_multiple_of(256).next_power_of_two()
+    } else {
+        len.next_multiple_of(256)
+    };
+    let (buffer, data, reused) = match exact_pool_take(cap) {
+        Some((b, d)) => (b, d, true),
+        None => {
+            let (b, d) = host()?.shared_buffer(cap)?;
+            (b, d, false)
+        }
+    };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
+    if let Some((shadow, used)) = map.get(&(address, len)) {
+        used.store(now, Ordering::Relaxed);
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        let existing = shadow.clone();
+        drop(map);
+        // Never exposed to GPU work yet: return directly to pool front as ready.
+        exact_pool_put(buffer, data, cap, 0);
+        return Some(existing);
+    }
+    if !reused {
+        crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    map.insert((address, len), (shadow.clone(), AtomicU64::new(now)));
+    drop(map);
+    if reused {
+        EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+        OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    }
     Some(shadow)
 }
 
@@ -5682,16 +5859,18 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = exact_map().read().unwrap_or_else(|e| e.into_inner()).len();
+    let pooled_mb = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner()).0 as f64 / (1024.0 * 1024.0);
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} newly allocated + {:.1} pooled per frame, {kept} kept ({pooled_mb:.1} MB pooled)",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        reused as f64 / frames
     );
 }
 

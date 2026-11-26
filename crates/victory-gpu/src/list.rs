@@ -231,6 +231,17 @@ unsafe impl Send for Idle {}
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+/// Lock-free mirror of `IDLE.0.len()` so `victory-submit` can check for low-water
+/// without contending on `IDLE`.
+#[cfg(windows)]
+static IDLE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True when the idle host-list pool is running low and `victory-submit` should
+/// drain landed lists synchronously instead of waiting for `victory-late-wait`.
+#[cfg(windows)]
+pub(crate) fn idle_low() -> bool {
+    IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) < 16
+}
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
@@ -249,28 +260,42 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
-/// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+/// Pops a recycled host list (parked closed with its state cleared).
+#[cfg(windows)]
+fn pop_idle() -> Option<crate::host::HostList> {
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = idle.0.pop()?;
+    idle.1 -= taken.1;
+    IDLE_LEN.store(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
+    Some(taken.0)
+}
+
+/// A host list open for recording: one that has run (reset once now), or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
-        }
-        taken
-    };
-    match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+    if let Some(list) = pop_idle() {
+        list.reset();
+        return Some(list);
     }
+    crate::host::host().and_then(|h| h.new_list().ok())
+}
+
+/// A closed host list ready for the title's next `Reset()`: reuses a parked
+/// closed list directly with zero redundant D3D12 `Reset` or dummy `Close`.
+#[cfg(windows)]
+fn fresh_list_closed() -> Option<crate::host::HostList> {
+    if let Some(list) = pop_idle() {
+        return Some(list);
+    }
+    let fresh = crate::host::host().and_then(|h| h.new_list().ok())?;
+    fresh.close();
+    Some(fresh)
 }
 
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
-/// what they held is let go, as before, and the host lists are reset and
-/// kept for [`fresh_list`].
+/// what they held is let go, and the host lists stay closed for
+/// [`fresh_list_closed`] (reset once when the title next resets the list).
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
@@ -280,17 +305,18 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) >= IDLE_MOST.0 {
             continue;
         }
-        // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
+        // Release held textures, deferred steps, pipelines and scratch chunks,
+        // leaving the command list closed so `detach` does not reset + close twice.
+        host.clear_state();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+            IDLE_LEN.store(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -404,12 +430,9 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list_closed() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -476,12 +499,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list_closed() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
