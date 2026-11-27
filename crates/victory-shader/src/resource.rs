@@ -576,6 +576,13 @@ impl<'a> Tracer<'a> {
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
         self.layout.iter().enumerate().find_map(|(i, p)| {
+            // Compute has at most 16 hardware user SGPRs (`s0..s15`); a
+            // parameter starting below 16 cannot spill into `s16+` (system
+            // inputs), while `user_data >= 16` entries are synthesized at
+            // `s16+` by `spill::user_data`.
+            if self.stage == HwStage::Cs && p.user_data < 16 && code >= 16 {
+                return None;
+            }
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
             (dword < p.sgprs).then_some((i, dword))
@@ -1034,6 +1041,13 @@ impl<'a> Tracer<'a> {
                     return false;
                 };
                 inst.name() == "v_add_co_ci_u32"
+                    && f.abs == 0
+                    && f.neg == 0
+                    && f.opsel == 0
+                    && !f.clamp
+                    && f.omod == 0
+                    && f.sdwa.is_none()
+                    && f.dpp.is_none()
                     && f.src[..2.min(f.src.len())]
                         .iter()
                         .any(|o| self.vterm(inst, o).is_some_and(high_of))
@@ -1052,6 +1066,13 @@ impl<'a> Tracer<'a> {
             return false;
         };
         inst.name() == "v_add_co_ci_u32"
+            && f.abs == 0
+            && f.neg == 0
+            && f.opsel == 0
+            && !f.clamp
+            && f.omod == 0
+            && f.sdwa.is_none()
+            && f.dpp.is_none()
             && f.src[..2.min(f.src.len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
@@ -4076,5 +4097,106 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn compute_stage_never_claims_system_sgprs_in_param_of() {
+        let words: &[u32] = &[
+            0xBE82_0310, // s_mov_b32 s2, s16
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let s16_in = p.inputs.iter().find(|i| i.0 == Reg::S(16)).unwrap().1;
+        // In compute (Cs), a layout parameter covering s14..s17 must NOT claim s16:
+        let r_cs = track(&p, &[param(Table, 14, 4)], HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        assert!(
+            !r_cs.params.iter().any(|&(v, _, _)| v == s16_in),
+            "compute system SGPR s16 must not be claimed by user parameter"
+        );
+        // In pixel (Ps), s16 is a valid user SGPR:
+        let r_ps = track(&p, &[param(Table, 14, 4)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
+        assert!(
+            r_ps.params.iter().any(|&(v, _, _)| v == s16_in),
+            "pixel stage can legitimately claim s16 as user SGPR"
+        );
+    }
+
+    #[test]
+    fn modified_v_add_co_ci_u32_is_not_treated_as_plain_address_carry() {
+        let layout = [param(Descriptor, 0, 2)];
+        let try_track = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &layout, HwStage::Cs, lanes(&p).as_ref())
+        };
+        let plain = try_track(&[
+            0xD70F_6A00,
+            0x0002_0400, // v_add_co_u32 v0, vcc_lo, s0, v2
+            0xD528_6A01,
+            0x01A9_0001, // v_add_co_ci_u32 v1, vcc_lo, s1, 0, vcc_lo
+            0xDC30_8000,
+            0x037D_0000, // global_load_dword v3, v[0:1], off
+            S_ENDPGM,
+        ])
+        .unwrap();
+        assert_eq!(plain.scalar.len(), 1);
+        assert_eq!(plain.scalar[0].1.param, 0);
+        assert!(plain.scalar[0].1.dynamic.is_some());
+
+        for (label, words) in [
+            (
+                "clamp",
+                &[
+                    0xD70F_6A00u32,
+                    0x0002_0400,
+                    0xD528_EA01,
+                    0x01A9_0001, // v_add_co_ci_u32 ... clamp
+                    0xDC30_8000,
+                    0x037D_0000,
+                    S_ENDPGM,
+                ][..],
+            ),
+            (
+                "sdwa",
+                &[
+                    0x7E06_0201u32,
+                    0x7E08_0280,
+                    0xD70F_6A00,
+                    0x0002_0400,
+                    0x5002_08F9,
+                    0x0606_0403, // v_add_co_ci_u32_sdwa ...
+                    0xDC30_8000,
+                    0x057D_0000,
+                    S_ENDPGM,
+                ][..],
+            ),
+            (
+                "dpp",
+                &[
+                    0x7E06_0201u32,
+                    0x7E08_0280,
+                    0xD70F_6A00,
+                    0x0002_0400,
+                    0x5002_08FA,
+                    0xFF01_1103, // v_add_co_ci_u32_dpp ...
+                    0xDC30_8000,
+                    0x057D_0000,
+                    S_ENDPGM,
+                ][..],
+            ),
+        ] {
+            let err = try_track(words).expect_err(label);
+            assert!(
+                matches!(
+                    err,
+                    ShaderError::Unsupported {
+                        what: "an address with an untracked high half",
+                        ..
+                    }
+                ),
+                "{label}: {err:?}"
+            );
+        }
     }
 }

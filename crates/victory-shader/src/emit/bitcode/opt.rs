@@ -60,13 +60,17 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// Not a pass over the module either: emit LLVM 3.7 fast-math flags on 32-bit
+/// float binary operations (`bitcode.rs`, controlled by `VICTORY_SHADER_FAST_BITS`,
+/// opt-in; default 24 = `nsz|arcp` when `FAST` is requested via `VICTORY_SHADER_OPT`).
+pub const FAST: u32 = 128;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
-/// Every pass.
+/// Every pass (excluding opt-in [`FAST`]).
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
+/// The passes that run when nothing says which: every one but [`WIDE`] and
+/// opt-in [`FAST`], which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127`
+/// asks for wide loads; `VICTORY_SHADER_FAST_BITS=24` enables `nsz|arcp`).
 pub const DEFAULT: u32 = ALL & !WIDE;
 
 /// What the instructions a module writes use, of the features a shader

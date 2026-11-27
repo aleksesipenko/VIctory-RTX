@@ -288,7 +288,30 @@ pub fn builder_bounds() -> bool {
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| {
+        let base = parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref());
+        let fast = parse_fast_math_bits(
+            std::env::var("VICTORY_SHADER_FAST_BITS").ok().as_deref(),
+            base & bitcode::opt::FAST != 0,
+        );
+        if fast != 0 {
+            (base | bitcode::opt::FAST) | (fast << 8)
+        } else {
+            base & !bitcode::opt::FAST
+        }
+    })
+}
+
+/// Active LLVM 3.7 fast-math flag bitmask (`VICTORY_SHADER_FAST_BITS`, 5 bits:
+/// 1 fast, 2 nnan, 4 ninf, 8 nsz, 16 arcp). Strictly opt-in (`0` when unset
+/// and `opt::FAST` is not requested in `VICTORY_SHADER_OPT`; defaults to `24`
+/// (`nsz|arcp`) when `opt::FAST` is requested with `VICTORY_SHADER_FAST_BITS`
+/// unset). Active bits are also folded into [`shader_opt`] so external shader
+/// caches keying on `shader_opt()` stay isolated per mask. Note: setting `fast`
+/// (bit 0) or `nnan` (bit 1) permits LLVM/driver to assume FP `BinOp` results
+/// are non-NaN, waiving strict NaN-to-zero guarantees downstream.
+pub fn fast_math_bits() -> u32 {
+    (shader_opt() >> 8) & 0x1F
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -371,7 +394,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
+/// `VICTORY_SHADER_OPT`'s value; every default pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
     let parsed = value
@@ -380,7 +403,26 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    parsed.map_or(
+        bitcode::opt::DEFAULT,
+        |n| n & (bitcode::opt::ALL | bitcode::opt::FAST),
+    )
+}
+
+/// `VICTORY_SHADER_FAST_BITS`'s value (5-bit LLVM 3.7 fast-math mask). Pure,
+/// for testing.
+fn parse_fast_math_bits(value: Option<&str>, opt_fast: bool) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    match parsed {
+        Some(n) => n & 0x1F,
+        None if opt_fast => 24,
+        None => 0,
+    }
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -1528,8 +1570,100 @@ mod tests {
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(
+            parse_shader_opt(Some("0xffffffff")),
+            all | super::bitcode::opt::FAST
+        );
         assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
+
+    #[test]
+    fn fast_math_bits_switch_parses_and_validates() {
+        assert_eq!(parse_fast_math_bits(None, false), 0);
+        assert_eq!(parse_fast_math_bits(None, true), 24);
+        assert_eq!(parse_fast_math_bits(Some("24"), false), 24);
+        assert_eq!(parse_fast_math_bits(Some("0x18"), false), 24);
+        assert_eq!(parse_fast_math_bits(Some("0"), true), 0);
+        assert_eq!(parse_fast_math_bits(Some("0xffff"), false), 0x1f);
+        // Validate a float add/mul shader emitted with fast_bits = 24 (`nsz | arcp`).
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        let a = s.m.f32(1.5f32.to_bits());
+        let b = s.m.f32(2.5f32.to_bits());
+        let _sum = s.m.bin(s.entry, super::bitcode::Bin::Add, a, b);
+        s.m.terminate(s.entry, super::bitcode::Term::Ret);
+        let bc = s.m.write_with_fast_bits(24);
+        let base_bc = s.m.write_with_fast_bits(0);
+        assert_ne!(bc, base_bc, "fast_bits must be encoded on float Bin ops");
+    }
+
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: db,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut early.clone()).unwrap();
+        }
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
+        assert_eq!(late, early, "early depth declared for a depth export");
+        let ps = |db| StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: db,
+            patches: vec![],
+        };
+        assert!(lower::early_depth(&ps(0x1450), &[]));
+        assert!(lower::early_depth(&ps(0x1010), &[]));
+        assert!(!lower::early_depth(&ps(0x0450), &[]));
+        assert!(!lower::early_depth(&ps(0x1012), &[]));
+        assert!(!lower::early_depth(&ps(0x1150), &[]));
+        assert!(!lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
+        assert!(!lower::early_depth(&StageIo::None, &[]));
     }
 
     #[test]
