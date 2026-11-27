@@ -3214,7 +3214,10 @@ impl State {
                     {
                         let queue = host.texture_queue();
                         let verified_due = frame + again_in;
-                        staging.on_uploaded(move |tiled| {
+                        // If an unsnapshotted in-place refresh already started
+                        // concurrently, `on_uploaded` returns `false` and the
+                        // slot simply remains `Pending(attempt)` for `frame + 1`.
+                        let _ = staging.on_uploaded(move |tiled| {
                             let print = crate::texture::fingerprint_slice(tiled, dense);
                             queue.lock().unwrap_or_else(|e| e.into_inner()).commit_baseline(
                                 index,

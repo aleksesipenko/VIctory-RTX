@@ -99,8 +99,44 @@ pub(crate) struct Staging {
     waiting: std::sync::atomic::AtomicU64,
     /// Submit-time baseline callbacks registered by `draw::State::heap_textures`
     /// so each slot's recheck fingerprint matches the exact `tiled` guest bytes
-    /// detiled into this staging buffer for GPU upload.
-    on_upload: Mutex<Vec<Box<dyn FnOnce(&[u8]) + Send>>>,
+    /// detiled into this staging buffer for GPU upload, synchronized with the
+    /// in-place snapshot decision.
+    on_upload: Mutex<OnUploadState>,
+}
+
+/// Synchronizes submit-time `on_uploaded` callback attachment against the
+/// in-place refresh snapshot decision so a late attachment (e.g. under
+/// `VICTORY_UPLOAD_AHEAD`) can never execute against unsnapshotted live memory.
+#[derive(Default)]
+struct OnUploadState {
+    started_without_snapshot: bool,
+    callbacks: Vec<Box<dyn FnOnce(&[u8]) + Send>>,
+}
+
+impl OnUploadState {
+    fn attach(&mut self, f: Box<dyn FnOnce(&[u8]) + Send>) -> bool {
+        if self.started_without_snapshot {
+            return false;
+        }
+        self.callbacks.push(f);
+        true
+    }
+
+    fn begin_in_place_refresh(&mut self) -> bool {
+        if self.callbacks.is_empty() {
+            self.started_without_snapshot = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn take_callbacks(&mut self) -> Vec<Box<dyn FnOnce(&[u8]) + Send>> {
+        if self.started_without_snapshot || self.callbacks.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.callbacks)
+    }
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -1251,25 +1287,35 @@ impl Staging {
 
     /// Registers a submit-time callback invoked with the exact `tiled` guest
     /// byte slice uploaded to the GPU when this staging buffer refreshes.
-    pub(crate) fn on_uploaded(&self, f: impl FnOnce(&[u8]) + Send + 'static) {
-        self.on_upload.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(f));
+    /// Returns `false` (without attaching) if an unsnapshotted in-place
+    /// refresh already began, so callers leave the slot `Pending` for next
+    /// frame instead of running against live guest memory.
+    pub(crate) fn on_uploaded(&self, f: impl FnOnce(&[u8]) + Send + 'static) -> bool {
+        self.on_upload
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach(Box::new(f))
     }
 
-    /// Whether any submit-time `on_upload` baseline callbacks are registered.
-    fn has_on_upload(&self) -> bool {
-        !self.on_upload.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    /// Atomically checks whether any `on_upload` callbacks are attached before
+    /// an in-place refresh: returns `true` to take an immutable snapshot, or
+    /// sets `started_without_snapshot = true` and returns `false` to borrow
+    /// live memory with zero copy overhead while rejecting late attachments.
+    fn begin_in_place_refresh(&self) -> bool {
+        self.on_upload
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_in_place_refresh()
     }
 
     /// Runs any pending `on_upload` baseline callbacks with the exact `tiled`
     /// byte slice just detiled (or confirmed unchanged) for GPU upload.
     fn notify_uploaded(&self, tiled: &[u8]) {
-        let callbacks = {
-            let mut list = self.on_upload.lock().unwrap_or_else(|e| e.into_inner());
-            if list.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *list)
-        };
+        let callbacks = self
+            .on_upload
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_callbacks();
         for cb in callbacks {
             cb(tiled);
         }
@@ -1468,7 +1514,7 @@ impl Staging {
         // immutable bytes even if the title mutates guest memory concurrently.
         let live = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let mut owned = None;
-        let tiled = snapshot_for_upload(live, self.has_on_upload(), &mut owned);
+        let tiled = snapshot_for_upload(live, self.begin_in_place_refresh(), &mut owned);
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1864,6 +1910,24 @@ fn snapshot_for_upload<'a>(
     }
 }
 
+/// Checks and charges the combined hashing cost of [`unchanged`]: `size` bytes
+/// for `digest(read)` PLUS `fingerprint_bytes(fp_len, dense)` for computing the
+/// recheck baseline from that same snapshot.
+fn try_charge_unchanged(
+    size: u64,
+    fp_len: u64,
+    dense: bool,
+    hashed_bytes: &mut u64,
+    budget: u64,
+) -> bool {
+    let total_cost = size.saturating_add(fingerprint_bytes(fp_len, dense));
+    if hashed_bytes.saturating_add(total_cost) > budget {
+        return false;
+    }
+    *hashed_bytes = hashed_bytes.saturating_add(total_cost);
+    true
+}
+
 /// Verifies `read` against `held` and, if equal, computes the recheck
 /// fingerprint for the `fp_len` prefix from the exact same immutable `read`
 /// snapshot (zero second read of live guest memory).
@@ -1885,10 +1949,12 @@ fn unchanged_snapshot_fingerprint(
 /// byte, and a texture uploaded again costs a staging buffer, a detiling and
 /// a copy more than this look.) `VICTORY_TEXTURE_SAME=0`: not asked.
 ///
-/// Enforces `budget` strictly before reading: if `*hashed_bytes + size > budget`
-/// the whole-buffer read is skipped and `None` is returned. When equal, returns
-/// `Some((address, span_len, fingerprint))` computed from the **exact same**
-/// snapshot slice that proved equality (zero second read of guest memory).
+/// Enforces `budget` strictly before reading across BOTH `digest(read)`
+/// (`size`) AND `fingerprint_slice` (`fingerprint_bytes(fp_len, dense)`): if
+/// `*hashed_bytes + size + fp_cost > budget`, the read is skipped and `None`
+/// is returned. When equal, returns `Some((address, span_len, fingerprint))`
+/// computed from the **exact same** snapshot slice that proved equality (zero
+/// second read of guest memory).
 pub(crate) fn unchanged(
     resource: This,
     first: u32,
@@ -1910,11 +1976,10 @@ pub(crate) fn unchanged(
         return None;
     }
     let size = layout.bytes_from(from);
-    if hashed_bytes.saturating_add(size) > budget {
+    let fp_len = layout.bytes_from(view_first).min(size);
+    if !try_charge_unchanged(size, fp_len, dense, hashed_bytes, budget) {
         return None;
     }
-    *hashed_bytes = hashed_bytes.saturating_add(size);
-    let fp_len = layout.bytes_from(view_first).min(size);
     with_read(size as usize, |read| {
         if crate::host::read_there(memory, read) == 0 {
             return None;
@@ -2486,6 +2551,63 @@ mod title_memory_tests {
         // Mismatched digest returns None.
         buf[100] ^= 1;
         assert_eq!(super::unchanged_snapshot_fingerprint(&buf, held, buf.len(), true), None);
+    }
+
+    /// A late `on_uploaded` attachment after an unsnapshotted in-place refresh
+    /// has started (`started_without_snapshot == true`) is rejected cleanly and
+    /// never runs against live guest memory.
+    #[test]
+    fn late_on_upload_rejected_after_unsnapshotted_refresh() {
+        let mut state = super::OnUploadState::default();
+        assert!(!state.begin_in_place_refresh(), "empty state takes zero-copy borrow");
+        assert!(state.started_without_snapshot);
+        assert!(
+            !state.attach(Box::new(|_| panic!("late callback must never run on live memory"))),
+            "late attachment after started_without_snapshot must return false"
+        );
+        assert!(state.take_callbacks().is_empty());
+
+        // Contrast: attachment before refresh triggers immutable snapshot and runs callback.
+        let mut snap_state = super::OnUploadState::default();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_cb = ran.clone();
+        assert!(snap_state.attach(Box::new(move |_| {
+            ran_cb.store(true, std::sync::atomic::Ordering::Release);
+        })));
+        assert!(snap_state.begin_in_place_refresh(), "attached callback forces immutable snapshot");
+        let cbs = snap_state.take_callbacks();
+        assert_eq!(cbs.len(), 1);
+        for cb in cbs {
+            cb(&[1, 2, 3, 4]);
+        }
+        assert!(ran.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// `unchanged()` charges BOTH `digest(read)` (`size`) AND
+    /// `fingerprint_slice` (`fingerprint_bytes(fp_len, dense)`) upfront so
+    /// 127 × 16 KiB hits stay strictly `<= 2 MiB` total hashed bytes.
+    #[test]
+    fn unchanged_budget_charges_both_digest_and_fingerprint() {
+        const CAP: u64 = 2 << 20;
+        let len = 16usize << 10;
+        let buf = vec![0x5au8; len];
+        let held = super::digest(&buf);
+        let mut charged = 0u64;
+        let mut actual_hashed = 0u64;
+        let mut hits = 0usize;
+        for _ in 0..127 {
+            if super::try_charge_unchanged(len as u64, len as u64, false, &mut charged, CAP) {
+                assert!(
+                    super::unchanged_snapshot_fingerprint(&buf, held, len, false).is_some()
+                );
+                actual_hashed += len as u64 + super::fingerprint_bytes(len as u64, false);
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 64, "64 × (16 KiB digest + 16 KiB fingerprint) = 2 MiB exact");
+        assert!(charged <= CAP, "charged {charged} exceeded cap {CAP}");
+        assert!(actual_hashed <= CAP, "actual hashed {actual_hashed} exceeded cap {CAP}");
+        assert_eq!(actual_hashed, CAP);
     }
 }
 
