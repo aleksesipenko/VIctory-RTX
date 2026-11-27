@@ -986,9 +986,16 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
+}
+
+/// Per-`Present` fast-path sweep of completed `upq` unconfirmed slots on the
+/// existing host device without lazily initializing D3D12.
+pub(crate) fn sweep_upq() {
+    if let Some(host) = made_host() {
+        host.sweep_upq();
+    }
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -9859,6 +9866,12 @@ impl Host {
         self.present_planes(texture, state, None, frame)
     }
 
+    /// Fast-path sweep of completed `upq` unconfirmed copy-queue slots
+    /// (1 relaxed atomic load when empty).
+    pub(crate) fn sweep_upq(&self) {
+        upq::sweep(&self.device);
+    }
+
     /// Shows `texture`, optionally alpha-compositing a second `overlay` plane
     /// over it (Series S two-plane presentation), and returns them to their states.
     pub(crate) fn present_planes(
@@ -9870,7 +9883,7 @@ impl Host {
     ) -> Option<bool> {
         // Per-frame fast-path sweep so even frames with zero card batches
         // reclaim completed signaled `upq` unconfirmed entries.
-        upq::sweep(&self.device);
+        self.sweep_upq();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {

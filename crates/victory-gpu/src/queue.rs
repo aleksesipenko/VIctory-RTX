@@ -1041,42 +1041,7 @@ extern "system" fn present(
         return S_OK;
     }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (planes > 1 && planes_seen(planes, plane_parameters))
-            .then(|| overlay_resource(plane_parameters))
-            .flatten()
-            .filter(|&over_res| over_res != resource)
-            .and_then(|over_res| {
-                crate::resource::host_resource(over_res).map(|over_tex| {
-                    let over_state = crate::resource::host_transition(over_res, COPY_SOURCE)
-                        .map_or(COPY_SOURCE, |(_, before)| before);
-                    (over_res, over_tex, over_state)
-                })
-            });
-        show_planes(
-            texture,
-            state,
-            overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
-        );
-        crate::resource::host_transition(resource, state);
-        if let Some((over_res, _, over_state)) = overlay {
-            crate::resource::host_transition(over_res, over_state);
-        }
-        let _ = host;
-    }
+    present_sync(planes, plane_parameters, frame, crate::host::sweep_upq);
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     called.end();
@@ -1115,6 +1080,67 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+}
+
+/// Runs per-`Present` presentation when a texture is recognized and
+/// unconditionally executes per-`Present` `upq` sweep housekeeping even on
+/// texture-less `Present` frames.
+#[cfg(windows)]
+fn finish_present<T>(texture: Option<T>, show: impl FnOnce(T), sweep: impl FnOnce()) {
+    if let Some(texture) = texture {
+        show(texture);
+    }
+    sweep();
+}
+
+/// Synchronous `Present` body: presents the recognized texture plane(s) when
+/// available and unconditionally invokes `sweep` even when no texture exists.
+#[cfg(windows)]
+fn present_sync(planes: u32, plane_parameters: *const Plane, frame: u64, sweep: impl FnOnce()) {
+    let presented = if planes > 0
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && plane.count > 0
+        && !plane.resources.is_null()
+        // SAFETY: the plane lists `count` resources.
+        && let resource = unsafe { *plane.resources }
+        && let Some(texture) = crate::resource::host_resource(resource)
+        && crate::host::host().is_some()
+    {
+        Some((resource, texture))
+    } else {
+        None
+    };
+    finish_present(
+        presented,
+        |(resource, texture)| {
+            const COPY_SOURCE: u32 = 0x800;
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let overlay = (planes > 1 && planes_seen(planes, plane_parameters))
+                .then(|| overlay_resource(plane_parameters))
+                .flatten()
+                .filter(|&over_res| over_res != resource)
+                .and_then(|over_res| {
+                    crate::resource::host_resource(over_res).map(|over_tex| {
+                        let over_state = crate::resource::host_transition(over_res, COPY_SOURCE)
+                            .map_or(COPY_SOURCE, |(_, before)| before);
+                        (over_res, over_tex, over_state)
+                    })
+                });
+            show_planes(
+                texture,
+                state,
+                overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
+                Shown { frame, resource: resource as usize },
+            );
+            crate::resource::host_transition(resource, state);
+            if let Some((over_res, _, over_state)) = overlay {
+                crate::resource::host_transition(over_res, over_state);
+            }
+        },
+        sweep,
+    );
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1399,5 +1425,49 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    /// Synchronous no-texture `Present` frames (zero planes, empty plane, or
+    /// unrecognized resource) must still invoke the `upq` sweep hook without
+    /// lazily initializing the host D3D12 device.
+    #[cfg(windows)]
+    #[test]
+    fn sync_present_sweeps_upq_without_texture() {
+        let had_host = crate::host::made_host().is_some();
+        let mut sweeps = 0usize;
+
+        // 0 planes / null plane pointer.
+        present_sync(0, std::ptr::null(), 1, || sweeps += 1);
+        assert_eq!(sweeps, 1);
+
+        // Plane with zero resources.
+        let empty = Plane {
+            token: 0,
+            count: 0,
+            resources: std::ptr::null(),
+        };
+        present_sync(1, &empty, 2, || sweeps += 1);
+        assert_eq!(sweeps, 2);
+
+        // Plane pointing to a null / unregistered resource (`host_resource` -> None).
+        let unregistered: This = std::ptr::null();
+        let missing = Plane {
+            token: 0,
+            count: 1,
+            resources: &unregistered,
+        };
+        present_sync(1, &missing, 3, || sweeps += 1);
+        assert_eq!(sweeps, 3);
+
+        // Shared `finish_present` contract: `show` runs iff `Some`, `sweep` always runs.
+        let mut showed = 0usize;
+        finish_present(None::<()>, |_| showed += 1, || sweeps += 1);
+        assert_eq!((showed, sweeps), (0, 4));
+        finish_present(Some(()), |_| showed += 1, || sweeps += 1);
+        assert_eq!((showed, sweeps), (1, 5));
+
+        // Production hook must remain a safe no-op without initializing D3D12.
+        present_sync(0, std::ptr::null(), 4, crate::host::sweep_upq);
+        assert_eq!(crate::host::made_host().is_some(), had_host);
     }
 }
