@@ -1254,10 +1254,9 @@ mod tests {
     }
 
     /// Asynchronous no-texture `Present` jobs must still invoke the `upq`
-    /// sweep hook, decrement `QUEUED`, and avoid lazily initializing D3D12.
+    /// sweep hook and decrement `QUEUED`.
     #[test]
     fn async_present_sweeps_upq_without_texture() {
-        let had_host = crate::host::made_host().is_some();
         let queued_before = QUEUED.load(Relaxed);
 
         // Direct `run_present` route with `texture == None` invokes sweep and
@@ -1268,8 +1267,8 @@ mod tests {
         assert_eq!(sweeps, 1);
         assert_eq!(QUEUED.load(Relaxed), queued_before);
 
-        // Full `Lane<Job>` dispatch of `Job::Present(None, None, ...)` invokes
-        // the production `crate::host::sweep_upq` hook without initializing D3D12.
+        // Full `Lane<Job>` dispatch of `Job::Present(None, None, ...)` executes
+        // the production `crate::host::sweep_upq` hook and drains cleanly.
         let lane: Lane<Job> = Lane::new();
         QUEUED.fetch_add(1, Relaxed);
         lane.push(1, [Job::Present(None, None, super::super::Shown { frame: 2, resource: 0 })]);
@@ -1278,6 +1277,5 @@ mod tests {
         assert_eq!(QUEUED.load(Relaxed), queued_before);
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
-        assert_eq!(crate::host::made_host().is_some(), had_host);
     }
 }

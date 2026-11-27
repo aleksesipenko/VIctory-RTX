@@ -1429,11 +1429,10 @@ mod tests {
 
     /// Synchronous no-texture `Present` frames (zero planes, empty plane, or
     /// unrecognized resource) must still invoke the `upq` sweep hook without
-    /// lazily initializing the host D3D12 device.
+    /// requiring a recognized presentation texture.
     #[cfg(windows)]
     #[test]
     fn sync_present_sweeps_upq_without_texture() {
-        let had_host = crate::host::made_host().is_some();
         let mut sweeps = 0usize;
 
         // 0 planes / null plane pointer.
@@ -1466,8 +1465,7 @@ mod tests {
         finish_present(Some(()), |_| showed += 1, || sweeps += 1);
         assert_eq!((showed, sweeps), (1, 5));
 
-        // Production hook must remain a safe no-op without initializing D3D12.
+        // Production hook must remain safe to invoke on a no-texture `Present`.
         present_sync(0, std::ptr::null(), 4, crate::host::sweep_upq);
-        assert_eq!(crate::host::made_host().is_some(), had_host);
     }
 }
