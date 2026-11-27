@@ -232,15 +232,81 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and whether its indirect/scratch buffers stayed warm.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct IdleEntry<T> {
+    list: T,
+    bytes: u64,
+    hot: bool,
+}
+
+/// Recycled host-list pool: up to [`HOT_SPARE`] warm lists sit at the **back**
+/// (popped first by [`Self::pop`]) while cold lists with released idle buffers
+/// sit at the **front**, so warm lists are always reused first whenever any
+/// exist. Hot vs cold classification is decided strictly under the pool lock.
+/// Provenance (GPL-3.0): Marvisak/VIctory#3228.
+#[cfg(windows)]
+struct IdlePool<T> {
+    entries: std::collections::VecDeque<IdleEntry<T>>,
+    bytes: u64,
+    hot_len: usize,
+}
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
 #[cfg(windows)]
-unsafe impl Send for Idle {}
+unsafe impl Send for IdlePool<crate::host::HostList> {}
+
+#[cfg(windows)]
+impl<T> IdlePool<T> {
+    const fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+            bytes: 0,
+            hot_len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        let taken = self.entries.pop_back()?;
+        self.bytes -= taken.bytes;
+        if taken.hot {
+            self.hot_len -= 1;
+        }
+        Some(taken.list)
+    }
+
+    fn park<D>(
+        &mut self,
+        mut list: T,
+        max_entries: usize,
+        max_bytes: u64,
+        prepare: impl FnOnce(&mut T, bool) -> (u64, D),
+    ) -> (Option<T>, Option<D>) {
+        if self.entries.len() >= max_entries {
+            return (Some(list), None);
+        }
+        let hot = self.hot_len < HOT_SPARE;
+        let (bytes, detached) = prepare(&mut list, hot);
+        if self.bytes + bytes > max_bytes {
+            return (Some(list), Some(detached));
+        }
+        let entry = IdleEntry { list, bytes, hot };
+        if hot {
+            self.entries.push_back(entry);
+            self.hot_len += 1;
+        } else {
+            self.entries.push_front(entry);
+        }
+        self.bytes += bytes;
+        (None, Some(detached))
+    }
+}
 
 /// Host lists that have run, reset and ready to record: the host side of
 /// a list a queue held, or of a part of a list cut at a wait, is taken
@@ -250,8 +316,9 @@ unsafe impl Send for Idle {}
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
-/// Lock-free mirror of `IDLE.0.len()` so `victory-submit` can check for low-water
+static IDLE: std::sync::Mutex<IdlePool<crate::host::HostList>> =
+    std::sync::Mutex::new(IdlePool::new());
+/// Lock-free mirror of `IDLE.len()` so `victory-submit` can check for low-water
 /// without contending on `IDLE`.
 #[cfg(windows)]
 static IDLE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -280,14 +347,14 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
-/// Pops a recycled host list (parked closed with its state cleared).
+/// Pops a recycled host list (parked closed with its state cleared),
+/// preferring warm `HOT_SPARE` lists before cold lists.
 #[cfg(windows)]
 fn pop_idle() -> Option<crate::host::HostList> {
     let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-    let taken = idle.0.pop()?;
-    idle.1 -= taken.1;
-    IDLE_LEN.store(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
-    Some(taken.0)
+    let taken = idle.pop()?;
+    IDLE_LEN.store(idle.len(), std::sync::atomic::Ordering::Relaxed);
+    Some(taken)
 }
 
 /// A host list open for recording: one that has run (reset once now), or a new one.
@@ -312,6 +379,12 @@ fn fresh_list_closed() -> Option<crate::host::HostList> {
     Some(fresh)
 }
 
+/// Hot spare lists kept with warm indirect argument and scratch buffers across
+/// frames; lists parked beyond this threshold release idle buffers to save VRAM.
+/// Provenance (GPL-3.0): Marvisak/VIctory#3228.
+#[cfg(windows)]
+const HOT_SPARE: usize = 24;
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, and the host lists stay closed for
@@ -321,6 +394,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let mut freed = Vec::new();
     for (i, list) in lists.into_iter().enumerate() {
         let DetachedData {
             host,
@@ -343,14 +417,25 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // never retain stale commands if submitted without Reset(), while the
         // next Reset() skips the redundant allocator.Reset() via `empty_closed`.
         host.reset_closed();
-        let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
-            IDLE_LEN.store(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
+        let (rejected, detached) = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            let res = idle.park(host, IDLE_MOST.0, IDLE_MOST.1, |h, hot| {
+                let detached = if hot {
+                    h.trim_oversized_buffers()
+                } else {
+                    h.release_idle_buffers()
+                };
+                (h.scratch_kept(), detached)
+            });
+            IDLE_LEN.store(idle.len(), std::sync::atomic::Ordering::Relaxed);
+            res
+        };
+        if let Some(detached) = detached {
+            freed.extend(detached);
         }
+        drop(rejected);
     }
+    crate::host::bury_resources(freed);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2767,5 +2852,67 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recycle_hot_spare_pops_warm_lists_before_cold() {
+        #[derive(Debug)]
+        struct FakeList {
+            id: usize,
+            buffers_retained: bool,
+        }
+
+        let mut pool: IdlePool<FakeList> = IdlePool::new();
+        for id in 0..30 {
+            let (rejected, _) = pool.park(
+                FakeList {
+                    id,
+                    buffers_retained: true,
+                },
+                IDLE_MOST.0,
+                IDLE_MOST.1,
+                |item, hot| {
+                    item.buffers_retained = hot;
+                    (if hot { 64 << 10 } else { 0 }, ())
+                },
+            );
+            assert!(rejected.is_none());
+        }
+        assert_eq!(pool.len(), 30);
+        assert_eq!(pool.hot_len, HOT_SPARE);
+
+        // Next pop MUST return a hot list (buffers retained), not a cold trimmed list.
+        let first = pool.pop().expect("pool has entries");
+        assert!(first.buffers_retained, "expected hot list first, got {first:?}");
+        assert_eq!(pool.hot_len, HOT_SPARE - 1);
+
+        // Parking a new list while cold lists remain refills hot_len back up to HOT_SPARE at the back.
+        let (rejected, _) = pool.park(
+            FakeList {
+                id: 100,
+                buffers_retained: true,
+            },
+            IDLE_MOST.0,
+            IDLE_MOST.1,
+            |item, hot| {
+                item.buffers_retained = hot;
+                (if hot { 64 << 10 } else { 0 }, ())
+            },
+        );
+        assert!(rejected.is_none());
+        assert_eq!(pool.hot_len, HOT_SPARE);
+
+        // Draining all 30 entries must yield all 24 hot lists first, then the 6 cold lists last.
+        let mut popped = Vec::new();
+        while let Some(item) = pool.pop() {
+            popped.push(item);
+        }
+        assert_eq!(popped.len(), 30);
+        assert_eq!(popped[0].id, 100);
+        assert!(popped[..HOT_SPARE].iter().all(|l| l.buffers_retained));
+        assert!(popped[HOT_SPARE..].iter().all(|l| !l.buffers_retained));
+        assert_eq!(pool.hot_len, 0);
+        assert_eq!(pool.bytes, 0);
     }
 }

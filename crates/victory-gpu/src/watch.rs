@@ -1385,6 +1385,27 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
 }
 
+/// [`nothing_new`] with a per-page effective stamp callback (used when a
+/// shadow carries partial-page spans alongside whole-page stamps).
+pub(crate) fn nothing_new_by(start: usize, end: usize, mut taken_at: impl FnMut(usize) -> u64) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    let j = journal();
+    if !known && !j.ahead.holds(first, last) {
+        return false;
+    }
+    for page in first..last {
+        if taken_at(page) == 0 {
+            return false;
+        }
+    }
+    j.notes.each(first, last, |page, write| write <= taken_at(page))
+}
+
 impl Tracked {
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
