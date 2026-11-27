@@ -275,7 +275,9 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
+    victory_loader::on_crash(victory_hle::modules::gameinput::on_crash_reset);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    victory_hle::modules::gameinput::configure(cfg.input.clone());
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -292,10 +294,10 @@ pub fn run(
     }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-    let code = main
-        .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    let joined = main.join();
     victory_hle::known_pipelines::flush();
+    victory_hle::modules::gameinput::shutdown();
+    let code = joined.map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
 }

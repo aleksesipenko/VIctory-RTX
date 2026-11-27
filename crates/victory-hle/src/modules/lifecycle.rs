@@ -298,15 +298,18 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
         end();
     };
     let late = finish.clone();
-    // Not on the calling thread: titles hand the suspend to their window
-    // thread and wait for it inside the routine.
-    std::thread::spawn(move || {
-        constrain_then_suspend(&constrain, &suspend);
-        finish("title suspended");
-    });
+    // Arm the 1 s deadline watchdog FIRST so even a hung HID driver during
+    // hardware reset or a stalled suspend routine can never block exit.
     std::thread::spawn(move || {
         std::thread::sleep(SUSPEND_DEADLINE);
         late("title did not finish suspending in time");
+    });
+    // Not on the calling thread: titles hand the suspend to their window
+    // thread and wait for it inside the routine.
+    std::thread::spawn(move || {
+        super::gameinput::shutdown();
+        constrain_then_suspend(&constrain, &suspend);
+        finish("title suspended");
     });
 }
 

@@ -42,6 +42,26 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
 }
 
+/// Best-effort hardware cleanup callback invoked after crash/panic logging
+/// (e.g. releasing DualSense adaptive trigger tension). The `bool` parameter is
+/// `true` on fatal termination paths (`report_unhandled`) and `false` on
+/// potentially recoverable paths (`panic::set_hook`, `log_crash`).
+static CRASH_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Registers a hardware cleanup function invoked on fatal crashes and panics.
+pub fn on_crash(hook: fn(bool)) {
+    CRASH_HOOK.store(hook as usize, std::sync::atomic::Ordering::Release);
+}
+
+fn run_crash_hook(fatal: bool) {
+    let raw = CRASH_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: `on_crash` stores only valid `fn(bool)` pointers.
+        let hook: fn(bool) = unsafe { std::mem::transmute(raw) };
+        hook(fatal);
+    }
+}
+
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -57,6 +77,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
                 std::thread::current().name().unwrap_or("?"),
                 title_output()
             ));
+            run_crash_hook(false);
         }));
     }
 }
@@ -68,6 +89,9 @@ pub fn log_crash(text: &str) {
 {}", title_output());
     eprint!("{text}");
     append_to_log(&text);
+    // `log_crash` is also called from recoverable failure paths (e.g. `xmem.rs`
+    // allocation failures), so trigger a non-fatal release after logging.
+    run_crash_hook(false);
 }
 
 fn append_to_log(text: &str) {
@@ -500,6 +524,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    run_crash_hook(true);
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),

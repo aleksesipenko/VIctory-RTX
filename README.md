@@ -146,8 +146,19 @@ This fork builds on a deep chain of GPL-3.0 community engineering; per-commit pr
 - **[voidopcode/vilocity](https://github.com/voidopcode/vilocity)** (`6804c16`): `VICTORY_TEXTURE_NO_WAIT=2` non-blocking streaming texture upload.
 - **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)** (`8cc31ab`, `f4b48ad`): NVIDIA Wave32 fixes, `SLOT_TABLE_STRIDES`, `Detached::release_tables()`, 32 GB RAM residency budgets, RT resolve skipping, and bake shader list.
 - **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)** (`a9632bc`, `24a479d`, `77e13a9`, `#1`, `#2`, `#7`): capped-heap `VICTORY_DYNAMIC_SLOTS`, `VICTORY_NAN_SCRUB`, `VICTORY_BVH_MISS`, `VICTORY_AMBIENT_MOST`, async texback writer, D3D12 errors 538/646 fixes, and intro video flicker fix.
-- **[Rubenpannen/VIctory-RTX5070](https://github.com/Rubenpannen/VIctory-RTX5070)** (`b696f73`, `9f2fd8c`): strict `VICTORY_WAVE_LOCAL` default and 2K/1080p `display_size()` fallback.
+- **[Rubenpannen/VIctory-RTX5070](https://github.com/Rubenpannen/VIctory-RTX5070)** (`b696f73`, `9f2fd8c`, `40f904b`): strict `VICTORY_WAVE_LOCAL` default, 2K/1080p `display_size()` fallback, and placed-copy `COMMON` state restoration.
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** (`#2337`): native Windows PlayStation 5 DualSense / DualSense Edge HID support (USB-C, Bluetooth `0x31`, `DS5Dongle`), 4-motor rumble to adaptive triggers, optional 4-channel WASAPI voice-coil haptics, 6-axis gyro aiming, battery telemetry, and crash/exit hardware reset.
+- **[readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)** (`9f6fb77`): opaque-only default reflection clamp (fixes dark water patches around boats).
 - **[miaohaixiang1-netizen/cool-fox-12gb](https://github.com/miaohaixiang1-netizen/cool-fox-12gb)** (`db556df`, `6d28e9b`), **Belobug/VIctory-Belobug-AMD**, **ZigZagBoi1/ScarlettPort**, **DexNom/VIctory**, **FQY55kai/ZJOU-VICTORY**, **myokex/victory-amd**, **Geckomacabre**, and **cxy0072019-sketch**: upstream renderer, ambient, HUD barrier, watchdog, guard, and readback contributions.
+
+### Controller & PlayStation 5 DualSense Support
+
+Native Windows HID support for **DualSense (`0x0CE6`)** and **DualSense Edge (`0x0DF2`)** is built directly into `gameinput.dll` (USB-C, Bluetooth `0x31`, and `DS5Dongle` — no DS4Windows or Steam Input required):
+
+- **4-Motor Rumble & Adaptive Triggers:** Translates Xbox impulse trigger feedback into DualSense adaptive trigger `vibration` / `hybrid` effects (`VICTORY_DUALSENSE_TRIGGERS=vibration|hybrid|off`, default `vibration`).
+- **Haptics:** Standard HID rumble by default, or optional single-USB 4-channel WASAPI voice-coil audio haptics over USB-C (`VICTORY_DUALSENSE_HAPTICS=hid|audio_4ch|hybrid|off`; `hybrid` is recommended for 4ch haptics—it drives 4ch USB audio haptics only when a single unambiguous DualSense USB device and audio endpoint are active, falling back to HID rumble otherwise or over Bluetooth).
+- **6-Axis Gyro Aiming:** Optional gyro-to-right-stick aiming (`VICTORY_DUALSENSE_GYRO=off|ads_or_touch|always`), recentered with the PS-first `PS + Touchpad` chord (60 ms simultaneous-press grace).
+- **Seamless `one_pad` Integration:** Preserves `VICTORY_ONE_PAD=1` (no controller-disconnected interruptions on plug/unplug), suppresses duplicate Steam Input / ViGEm mirrors (`auto`), reports battery telemetry, and resets trigger tension on focus loss, exit, or crash. See [victory.example.toml](victory.example.toml) for all `[input]` / `[input.dualsense]` keys.
 
 ## License
 
