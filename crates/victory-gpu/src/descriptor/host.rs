@@ -3552,6 +3552,23 @@ impl HostHeap {
                 // The backing can be evicted while a flip is waiting; requeue
                 // for the texture pass after releasing `made`.
                 requeue.push(f.index);
+            } else {
+                // Creation failed without allocation deferral (for example an
+                // out-of-bounds view or blocked owner): replace any prior or
+                // neutral descriptor with a matching null view so stale data
+                // cannot remain bound.
+                if !self.sampler {
+                    null_for(&view, self.at(f.index));
+                }
+                self.put(f.index);
+                self.quick_is(f.index, 0);
+                self.made.set(f.index, f.key);
+                self.set_placed_owner(
+                    f.index,
+                    dynamic_placed.then_some((f.key, 0, 0, resolved_gen)),
+                );
+                self.twin_made(f.index, false);
+                self.keep(f.index, None);
             }
         }
         if !requeue.is_empty() {
@@ -5517,6 +5534,56 @@ fn typed_store(format: u32) -> bool {
     supported
 }
 
+fn is_typeless_format(format: u32) -> bool {
+    format != 0
+        && crate::resource::family(format) == format
+        && format
+            .checked_add(1)
+            .is_some_and(|next| crate::resource::family(next) == format)
+}
+
+fn is_planar_yuv_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_NV12 | DXGI_FORMAT_P010 | DXGI_FORMAT_P016 | DXGI_FORMAT_NV11
+    )
+}
+
+fn planar_yuv_plane_matches(
+    res_format: DXGI_FORMAT,
+    view_format: DXGI_FORMAT,
+    plane_slice: u32,
+    unordered: bool,
+) -> bool {
+    match res_format {
+        DXGI_FORMAT_NV12 | DXGI_FORMAT_NV11 => match plane_slice {
+            0 => matches!(view_format, DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_UINT),
+            1 => matches!(view_format, DXGI_FORMAT_R8G8_UNORM | DXGI_FORMAT_R8G8_UINT),
+            _ => false,
+        },
+        DXGI_FORMAT_P010 | DXGI_FORMAT_P016 => match plane_slice {
+            0 => matches!(view_format, DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_R16_UINT),
+            1 => {
+                matches!(
+                    view_format,
+                    DXGI_FORMAT_R16G16_UNORM | DXGI_FORMAT_R16G16_UINT
+                ) || (unordered && view_format == DXGI_FORMAT_R32_UINT)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn planar_yuv_view_compatible(
+    res_format: DXGI_FORMAT,
+    view_format: DXGI_FORMAT,
+    unordered: bool,
+) -> bool {
+    planar_yuv_plane_matches(res_format, view_format, 0, unordered)
+        || planar_yuv_plane_matches(res_format, view_format, 1, unordered)
+}
+
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -5540,7 +5607,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         return false;
     }
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let typeless = is_typeless_format(own);
+    let planar_yuv = is_planar_yuv_format(d.Format);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -5550,17 +5618,32 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // D3D12 forbids typeless and depth-only formats as SRV/UAV view formats.
+    if is_typeless_format(view) || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) {
+        once!(view, own, unordered, "typeless or depth-only view format rejected");
+        return false;
+    }
     // A typed unordered view in a format the host cannot store to
     // (`B5G5R5A1_UNORM` on NVIDIA) removes the device when made: keep the slot
     // null instead (`slim-shady110 517ba14`).
-    let typed = if view == 0 || !typeless || (view != own && crate::resource::target_format(view) == own) {
+    let typed = if view == 0
+        || (!typeless && !planar_yuv)
+        || (view != own && crate::resource::target_format(view) == own)
+    {
         own
     } else {
         view
     };
-    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
+    if unordered && !(view == 0 && (typeless || planar_yuv)) && !typed_store(typed) {
         once!(view = typed, own, "an unordered view in a format the host cannot store");
         return false;
+    }
+    if planar_yuv {
+        let ok = view != 0 && planar_yuv_view_compatible(d.Format, DXGI_FORMAT(view as i32), unordered);
+        if !ok {
+            once!(view, own, unordered, "incompatible planar YUV view format");
+        }
+        return ok;
     }
     if view == 0 {
         return !typeless;
@@ -5583,6 +5666,462 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Queries the host device's D3D12 plane count for `format` (`0` if unsupported).
+fn device_format_plane_count(device: &ID3D12Device, format: DXGI_FORMAT) -> u8 {
+    let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+        Format: format,
+        PlaneCount: 0,
+    };
+    // SAFETY: plain format-info query on a live D3D12 device.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_INFO,
+            (&raw mut info).cast(),
+            size_of::<D3D12_FEATURE_DATA_FORMAT_INFO>() as u32,
+        )
+    }
+    .is_ok();
+    if ok { info.PlaneCount } else { 0 }
+}
+
+/// Fallback plane count when no live D3D12 device is available (unit tests).
+fn default_format_plane_count(format: DXGI_FORMAT) -> u8 {
+    match format {
+        DXGI_FORMAT_UNKNOWN => 0,
+        DXGI_FORMAT_R32G8X24_TYPELESS
+        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+        | DXGI_FORMAT_R24G8_TYPELESS
+        | DXGI_FORMAT_D24_UNORM_S8_UINT
+        | DXGI_FORMAT_NV12
+        | DXGI_FORMAT_P010
+        | DXGI_FORMAT_P016
+        | DXGI_FORMAT_NV11
+        | DXGI_FORMAT_420_OPAQUE => 2,
+        _ => 1,
+    }
+}
+
+/// Cached plane count for `format` on the active host device.
+fn host_format_plane_count(format: DXGI_FORMAT) -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static KNOWN: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    let idx = format.0 as usize;
+    if let Some(slot) = KNOWN.get(idx) {
+        let cached = slot.load(Relaxed);
+        if cached != 0 {
+            return cached - 1;
+        }
+    }
+    let Some(host) = host() else {
+        return default_format_plane_count(format);
+    };
+    let planes = device_format_plane_count(&host.device, format);
+    if let Some(slot) = KNOWN.get(idx) {
+        slot.store(planes.saturating_add(1), Relaxed);
+    }
+    planes
+}
+
+/// Queries whether `device` supports multisampled UAVs (`WriteableMSAATexturesSupported`).
+fn device_writeable_msaa(device: &ID3D12Device) -> bool {
+    let mut o14 = D3D12_FEATURE_DATA_D3D12_OPTIONS14::default();
+    // SAFETY: plain feature-support query on a live D3D12 device.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS14,
+            (&raw mut o14).cast(),
+            size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS14>() as u32,
+        )
+    }
+    .is_ok()
+        && o14.WriteableMSAATexturesSupported.as_bool()
+}
+
+/// Cached `WriteableMSAATexturesSupported` capability for the active host device.
+fn host_writeable_msaa() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static KNOWN: AtomicU8 = AtomicU8::new(0);
+    match KNOWN.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let Some(host) = host() else {
+        return false;
+    };
+    let supported = device_writeable_msaa(&host.device);
+    KNOWN.store(if supported { 2 } else { 1 }, Relaxed);
+    supported
+}
+
+/// Validates `plane_slice` against both the resource's D3D12 plane count and
+/// planar format/view-format pairing rules (depth/stencil and YUV planar formats).
+fn plane_slice_valid(
+    res_format: DXGI_FORMAT,
+    view_format: DXGI_FORMAT,
+    plane_count: u8,
+    plane_slice: u32,
+    unordered: bool,
+) -> bool {
+    if plane_count == 0 || plane_slice >= u32::from(plane_count) {
+        return false;
+    }
+    let vf = if view_format == DXGI_FORMAT_UNKNOWN {
+        res_format
+    } else {
+        view_format
+    };
+    if is_typeless_format(vf.0 as u32)
+        || crate::resource::DEPTH_FORMATS
+            .iter()
+            .any(|&(typed, _)| typed == vf.0 as u32)
+    {
+        return false;
+    }
+    match res_format {
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+            (plane_slice == 0 && vf == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)
+                || (plane_slice == 1 && vf == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)
+        }
+        DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_D24_UNORM_S8_UINT => {
+            (plane_slice == 0 && vf == DXGI_FORMAT_R24_UNORM_X8_TYPELESS)
+                || (plane_slice == 1 && vf == DXGI_FORMAT_X24_TYPELESS_G8_UINT)
+        }
+        DXGI_FORMAT_NV12 | DXGI_FORMAT_NV11 | DXGI_FORMAT_P010 | DXGI_FORMAT_P016 => {
+            planar_yuv_plane_matches(res_format, vf, plane_slice, unordered)
+        }
+        DXGI_FORMAT_420_OPAQUE => false,
+        _ => !matches!(
+            vf,
+            DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+                | DXGI_FORMAT_X32_TYPELESS_G8X24_UINT
+                | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+                | DXGI_FORMAT_X24_TYPELESS_G8_UINT
+        ),
+    }
+}
+
+/// Rejects view formats that D3D12 never permits on SRV/UAV descriptors
+/// (typeless resource formats, depth-only formats, or `DXGI_FORMAT_UNKNOWN`
+/// on a typeless/planar-YUV resource).
+fn view_format_typed_valid(own_format: DXGI_FORMAT, view_format: DXGI_FORMAT) -> bool {
+    let eff = if view_format == DXGI_FORMAT_UNKNOWN {
+        own_format
+    } else {
+        view_format
+    };
+    !is_typeless_format(eff.0 as u32)
+        && !is_planar_yuv_format(eff)
+        && eff != DXGI_FORMAT_420_OPAQUE
+        && !crate::resource::DEPTH_FORMATS
+            .iter()
+            .any(|&(typed, _)| typed == eff.0 as u32)
+}
+
+/// Validates and clamps a texture SRV description against the host resource's
+/// actual dimensions, sample count, mip count, array/depth extent, and planar
+/// format rules so console descriptors (e.g. Xbox 4-bit max-mip `MipLevels = 15`
+/// on a 7-mip texture) never trigger `RemoveDevice(DXGI_ERROR_INVALID_CALL)` on
+/// PC D3D12.
+fn clamp_srv_desc_for_resource(
+    own: &D3D12_RESOURCE_DESC,
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+    plane_count: u8,
+) -> bool {
+    if !view_format_typed_valid(own.Format, desc.Format) {
+        return false;
+    }
+    let own_mips = u32::from(own.MipLevels).max(1);
+    let own_array = u32::from(own.DepthOrArraySize).max(1);
+    let fix_mips = |most: &mut u32, mips: &mut u32| -> bool {
+        if *most >= own_mips || *mips == 0 {
+            return false;
+        }
+        let avail = own_mips - *most;
+        if *mips != u32::MAX && *mips > avail {
+            *mips = avail;
+        }
+        true
+    };
+    let fix_array = |first: &mut u32, size: &mut u32| -> bool {
+        if *first >= own_array || *size == 0 {
+            return false;
+        }
+        let avail = own_array - *first;
+        if *size != u32::MAX && *size > avail {
+            *size = avail;
+        }
+        true
+    };
+    // SAFETY: union arm matches `desc.ViewDimension`.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture1D;
+                if !fix_mips(&mut t.MostDetailedMip, &mut t.MipLevels) {
+                    return false;
+                }
+                desc.Anonymous.Texture1D = t;
+                true
+            }
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture1DArray;
+                if !fix_mips(&mut t.MostDetailedMip, &mut t.MipLevels)
+                    || !fix_array(&mut t.FirstArraySlice, &mut t.ArraySize)
+                {
+                    return false;
+                }
+                desc.Anonymous.Texture1DArray = t;
+                true
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || own.SampleDesc.Count > 1 {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture2D;
+                if !fix_mips(&mut t.MostDetailedMip, &mut t.MipLevels)
+                    || !plane_slice_valid(own.Format, desc.Format, plane_count, t.PlaneSlice, false)
+                {
+                    return false;
+                }
+                desc.Anonymous.Texture2D = t;
+                true
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || own.SampleDesc.Count > 1 {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture2DArray;
+                if !fix_mips(&mut t.MostDetailedMip, &mut t.MipLevels)
+                    || !fix_array(&mut t.FirstArraySlice, &mut t.ArraySize)
+                    || !plane_slice_valid(own.Format, desc.Format, plane_count, t.PlaneSlice, false)
+                {
+                    return false;
+                }
+                desc.Anonymous.Texture2DArray = t;
+                true
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMS => {
+                own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && own.SampleDesc.Count >= 1
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || own.SampleDesc.Count == 0
+                {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture2DMSArray;
+                if !fix_array(&mut t.FirstArraySlice, &mut t.ArraySize) {
+                    return false;
+                }
+                desc.Anonymous.Texture2DMSArray = t;
+                true
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture3D;
+                if !fix_mips(&mut t.MostDetailedMip, &mut t.MipLevels) {
+                    return false;
+                }
+                desc.Anonymous.Texture3D = t;
+                true
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    || own.SampleDesc.Count > 1
+                    || own_array < 6
+                {
+                    return false;
+                }
+                let mut t = desc.Anonymous.TextureCube;
+                if !fix_mips(&mut t.MostDetailedMip, &mut t.MipLevels) {
+                    return false;
+                }
+                desc.Anonymous.TextureCube = t;
+                true
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || own.SampleDesc.Count > 1 {
+                    return false;
+                }
+                let mut t = desc.Anonymous.TextureCubeArray;
+                if !fix_mips(&mut t.MostDetailedMip, &mut t.MipLevels)
+                    || t.First2DArrayFace >= own_array
+                    || t.NumCubes == 0
+                {
+                    return false;
+                }
+                let avail_cubes = (own_array - t.First2DArrayFace) / 6;
+                if avail_cubes == 0 {
+                    return false;
+                }
+                if t.NumCubes != u32::MAX && t.NumCubes > avail_cubes {
+                    t.NumCubes = avail_cubes;
+                }
+                desc.Anonymous.TextureCubeArray = t;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Validates and clamps a texture UAV description against the host resource's
+/// actual dimensions, mip count, array/W-slice extent, planar format rules,
+/// and MSAA UAV capability so out-of-range console views never trigger
+/// `RemoveDevice(DXGI_ERROR_INVALID_CALL)`.
+fn clamp_uav_desc_for_resource(
+    own: &D3D12_RESOURCE_DESC,
+    desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    plane_count: u8,
+    writeable_msaa: bool,
+) -> bool {
+    if !view_format_typed_valid(own.Format, desc.Format) {
+        return false;
+    }
+    let own_mips = u32::from(own.MipLevels).max(1);
+    let own_array = u32::from(own.DepthOrArraySize).max(1);
+    let fix_array = |first: &mut u32, size: &mut u32| -> bool {
+        if *first >= own_array || *size == 0 {
+            return false;
+        }
+        let avail = own_array - *first;
+        if *size != u32::MAX && *size > avail {
+            *size = avail;
+        }
+        true
+    };
+    // SAFETY: union arm matches `desc.ViewDimension`.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE1D => {
+                own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                    && desc.Anonymous.Texture1D.MipSlice < own_mips
+            }
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture1DArray;
+                if t.MipSlice >= own_mips || !fix_array(&mut t.FirstArraySlice, &mut t.ArraySize) {
+                    return false;
+                }
+                desc.Anonymous.Texture1DArray = t;
+                true
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2D => {
+                let t = desc.Anonymous.Texture2D;
+                own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    && own.SampleDesc.Count <= 1
+                    && t.MipSlice < own_mips
+                    && plane_slice_valid(own.Format, desc.Format, plane_count, t.PlaneSlice, true)
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || own.SampleDesc.Count > 1 {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture2DArray;
+                if t.MipSlice >= own_mips
+                    || !fix_array(&mut t.FirstArraySlice, &mut t.ArraySize)
+                    || !plane_slice_valid(own.Format, desc.Format, plane_count, t.PlaneSlice, true)
+                {
+                    return false;
+                }
+                desc.Anonymous.Texture2DArray = t;
+                true
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DMS => {
+                writeable_msaa
+                    && own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    && own.SampleDesc.Count >= 1
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY => {
+                if !writeable_msaa
+                    || own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    || own.SampleDesc.Count == 0
+                {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture2DMSArray;
+                if !fix_array(&mut t.FirstArraySlice, &mut t.ArraySize) {
+                    return false;
+                }
+                desc.Anonymous.Texture2DMSArray = t;
+                true
+            }
+            D3D12_UAV_DIMENSION_TEXTURE3D => {
+                if own.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                    return false;
+                }
+                let mut t = desc.Anonymous.Texture3D;
+                if t.MipSlice >= own_mips {
+                    return false;
+                }
+                let mip_depth = (own_array >> t.MipSlice.min(31)).max(1);
+                if t.FirstWSlice >= mip_depth || t.WSize == 0 {
+                    return false;
+                }
+                let avail = mip_depth - t.FirstWSlice;
+                if t.WSize != u32::MAX && t.WSize > avail {
+                    t.WSize = avail;
+                }
+                desc.Anonymous.Texture3D = t;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn clamp_srv_bounds(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) -> bool {
+    // SAFETY: a live texture resource.
+    let own = unsafe { texture.GetDesc() };
+    let plane_count = host_format_plane_count(own.Format);
+    let ok = clamp_srv_desc_for_resource(&own, desc, plane_count);
+    if !ok {
+        once!(
+            dim = desc.ViewDimension.0,
+            res_dim = own.Dimension.0,
+            res_fmt = own.Format.0,
+            view_fmt = desc.Format.0,
+            res_mips = own.MipLevels,
+            res_array = own.DepthOrArraySize,
+            "SRV texture view out of host resource bounds"
+        );
+    }
+    ok
+}
+
+fn clamp_uav_bounds(
+    texture: &ID3D12Resource,
+    desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC,
+) -> bool {
+    // SAFETY: a live texture resource.
+    let own = unsafe { texture.GetDesc() };
+    let plane_count = host_format_plane_count(own.Format);
+    let writeable_msaa = host_writeable_msaa();
+    let ok = clamp_uav_desc_for_resource(&own, desc, plane_count, writeable_msaa);
+    if !ok {
+        once!(
+            dim = desc.ViewDimension.0,
+            res_dim = own.Dimension.0,
+            res_fmt = own.Format.0,
+            view_fmt = desc.Format.0,
+            res_mips = own.MipLevels,
+            res_array = own.DepthOrArraySize,
+            "UAV texture view out of host resource bounds"
+        );
+    }
+    ok
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -5901,6 +6440,11 @@ fn make_twinned_with_placed(
                 {
                     show_prefilled(desc, prefilled);
                 }
+                if let Some(desc) = &mut desc
+                    && !clamp_srv_bounds(texture, desc)
+                {
+                    return None;
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -5960,6 +6504,11 @@ fn make_twinned_with_placed(
                 None => texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                return None;
+            }
+            if let Some(desc) = &mut desc
+                && !clamp_uav_bounds(texture, desc)
+            {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -6561,7 +7110,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             ..Default::default()
         }
     } else {
-        null_uav_desc(dimension)
+        null_uav_desc_with_caps(dimension, host_writeable_msaa())
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
@@ -6575,10 +7124,12 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
-/// 3D), 2D if it names none: a 2D null view where the shader writes a 3D
-/// texture is a mismatch GPU-based validation reports (the world's wind
-/// field, CS_CopyWindFieldBeforeUpdateWithSmooth, 2026-11-24).
-fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+/// 3D, or multisampled 2D / 2D array when `writeable_msaa` is supported),
+/// falling back to 2D if it names none or lacks capability.
+fn null_uav_desc_with_caps(
+    dimension: Option<u32>,
+    writeable_msaa: bool,
+) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
         ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
@@ -6602,6 +7153,16 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
                 ..Default::default()
             };
         }
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DMS) if writeable_msaa => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DMS;
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY) if writeable_msaa => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY;
+            desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
         Some(D3D12_UAV_DIMENSION_TEXTURE3D) => {
             desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
             desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
@@ -6612,6 +7173,11 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         _ => {}
     }
     desc
+}
+
+#[cfg(test)]
+fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    null_uav_desc_with_caps(dimension, false)
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
@@ -8763,6 +9329,554 @@ mod tests {
         assert_eq!(due_after.len(), (UAV_DUE_A_FRAME * 2) as usize);
         let (due_all, _) = heap.texture_slots_due(103, 256);
         assert_eq!(due_all.len(), total as usize);
+    }
+
+    #[test]
+    fn srv_and_uav_bounds_clamp_excess_mips_and_reject_invalid_views() {
+        let own_2d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 4,
+            MipLevels: 7,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // Exact Run 26 D3D12 Debug Layer failure: MostDetailedMip=0, MipLevels=15 on 7-mip texture.
+        // Negative/NaN ResourceMinLODClamp must be preserved unchanged.
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 15,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: f32::NAN,
+                },
+            },
+        };
+        assert!(clamp_srv_desc_for_resource(&own_2d, &mut srv, 1));
+        let t = unsafe { srv.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (0, 7));
+        assert!(t.ResourceMinLODClamp.is_nan());
+
+        // Single-plane resource rejects PlaneSlice >= 1 for both SRV and UAV (D3D12 error 344).
+        let mut bad_plane_srv = srv;
+        bad_plane_srv.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+            MostDetailedMip: 0,
+            MipLevels: 1,
+            PlaneSlice: 1,
+            ResourceMinLODClamp: 0.0,
+        };
+        assert!(!clamp_srv_desc_for_resource(&own_2d, &mut bad_plane_srv, 1));
+        let mut bad_plane_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 1 },
+            },
+        };
+        assert!(!clamp_uav_desc_for_resource(&own_2d, &mut bad_plane_uav, 1, false));
+
+        // Planar depth/stencil: R24G8_TYPELESS requires matching view format for plane 0 vs plane 1.
+        let own_ds = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R24G8_TYPELESS,
+            MipLevels: 1,
+            ..own_2d
+        };
+        let mut ds_depth_ok = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: u32::MAX, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+        };
+        assert!(clamp_srv_desc_for_resource(&own_ds, &mut ds_depth_ok, 2));
+        assert_eq!(unsafe { ds_depth_ok.Anonymous.Texture2D.MipLevels }, u32::MAX);
+        let mut ds_depth_wrong_plane = ds_depth_ok;
+        ds_depth_wrong_plane.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 };
+        assert!(!clamp_srv_desc_for_resource(&own_ds, &mut ds_depth_wrong_plane, 2));
+        let mut ds_stencil_ok = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+            ..ds_depth_wrong_plane
+        };
+        assert!(clamp_srv_desc_for_resource(&own_ds, &mut ds_stencil_ok, 2));
+        let mut ds_stencil_wrong_plane = ds_stencil_ok;
+        ds_stencil_wrong_plane.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 };
+        assert!(!clamp_srv_desc_for_resource(&own_ds, &mut ds_stencil_wrong_plane, 2));
+
+        // Planar YUV: NV12 plane 0 = R8_UNORM/R8_UINT, plane 1 = R8G8_UNORM/R8G8_UINT;
+        // SNORM/SINT rejected; P010/P016 chroma UAV additionally allows R32_UINT.
+        let own_nv12 = D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_NV12, MipLevels: 1, ..own_2d };
+        let mut nv12_p0 = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+        };
+        assert!(clamp_srv_desc_for_resource(&own_nv12, &mut nv12_p0, 2));
+        let mut nv12_snorm = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_R8_SNORM, ..nv12_p0 };
+        assert!(!clamp_srv_desc_for_resource(&own_nv12, &mut nv12_snorm, 2));
+        let mut nv12_bad = nv12_p0;
+        nv12_bad.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 };
+        assert!(!clamp_srv_desc_for_resource(&own_nv12, &mut nv12_bad, 2));
+        nv12_bad.Format = DXGI_FORMAT_R8G8_UNORM;
+        assert!(clamp_srv_desc_for_resource(&own_nv12, &mut nv12_bad, 2));
+
+        let own_p010 = D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_P010, MipLevels: 1, ..own_2d };
+        let mut p010_chroma_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 1 },
+            },
+        };
+        assert!(clamp_uav_desc_for_resource(&own_p010, &mut p010_chroma_uav, 2, false));
+        let mut p010_chroma_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 },
+            },
+        };
+        assert!(!clamp_srv_desc_for_resource(&own_p010, &mut p010_chroma_srv, 2));
+
+        // Typeless view format rejected even on matching typeless resource.
+        let own_typeless = D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R8G8B8A8_TYPELESS, ..own_2d };
+        let mut srv_typeless = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_R8G8B8A8_TYPELESS, ..srv };
+        assert!(!clamp_srv_desc_for_resource(&own_typeless, &mut srv_typeless, 1));
+
+        // Out-of-range MostDetailedMip and MipLevels=0 are rejected.
+        let mut bad_most = srv;
+        bad_most.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 7, MipLevels: 1, ..Default::default() };
+        assert!(!clamp_srv_desc_for_resource(&own_2d, &mut bad_most, 1));
+        let mut bad_zero = srv;
+        bad_zero.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 0, ..Default::default() };
+        assert!(!clamp_srv_desc_for_resource(&own_2d, &mut bad_zero, 1));
+
+        // Texture2DArray clamps both MipLevels and ArraySize while preserving negative ResourceMinLODClamp.
+        let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 2,
+                    MipLevels: 15,
+                    FirstArraySlice: 1,
+                    ArraySize: 10,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: -1.0,
+                },
+            },
+        };
+        assert!(clamp_srv_desc_for_resource(&own_2d, &mut srv_arr, 1));
+        let ta = unsafe { srv_arr.Anonymous.Texture2DArray };
+        assert_eq!((ta.MostDetailedMip, ta.MipLevels, ta.FirstArraySlice, ta.ArraySize, ta.ResourceMinLODClamp), (2, 5, 1, 3, -1.0));
+
+        // Single-sample multi-mip 2D texture is valid for TEXTURE2DMS and TEXTURE2DMSARRAY SRVs & UAVs.
+        let mut srv_ms = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        assert!(clamp_srv_desc_for_resource(&own_2d, &mut srv_ms, 1));
+        let mut srv_ms_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: 1, ArraySize: 8 },
+            },
+        };
+        assert!(clamp_srv_desc_for_resource(&own_2d, &mut srv_ms_arr, 1));
+        assert_eq!(unsafe { srv_ms_arr.Anonymous.Texture2DMSArray.ArraySize }, 3);
+
+        // MS UAV dimensions require `writeable_msaa = true` and match `null_uav_desc_with_caps`.
+        let mut uav_ms = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DMS,
+            ..Default::default()
+        };
+        assert!(!clamp_uav_desc_for_resource(&own_2d, &mut uav_ms, 1, false));
+        assert!(clamp_uav_desc_for_resource(&own_2d, &mut uav_ms, 1, true));
+        let mut uav_ms_arr = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_UAV { FirstArraySlice: 2, ArraySize: 8 },
+            },
+        };
+        assert!(clamp_uav_desc_for_resource(&own_2d, &mut uav_ms_arr, 1, true));
+        assert_eq!(unsafe { uav_ms_arr.Anonymous.Texture2DMSArray.ArraySize }, 2);
+        assert_eq!(null_uav_desc_with_caps(Some(6), true).ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DMS);
+        assert_eq!(null_uav_desc_with_caps(Some(7), true).ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY);
+
+        // Dimension mismatch rejected.
+        let mut wrong_dim = srv;
+        wrong_dim.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        assert!(!clamp_srv_desc_for_resource(&own_2d, &mut wrong_dim, 1));
+
+        // 3D UAV clamps WSize against mip depth (`8 >> 1 == 4`), preserves `u32::MAX`, and rejects out-of-range MipSlice.
+        let own_3d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 8,
+            MipLevels: 4,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut uav_3d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV { MipSlice: 1, FirstWSlice: 1, WSize: 16 },
+            },
+        };
+        assert!(clamp_uav_desc_for_resource(&own_3d, &mut uav_3d, 1, false));
+        let u3 = unsafe { uav_3d.Anonymous.Texture3D };
+        assert_eq!((u3.MipSlice, u3.FirstWSlice, u3.WSize), (1, 1, 3));
+
+        let mut uav_3d_max = uav_3d;
+        uav_3d_max.Anonymous.Texture3D = D3D12_TEX3D_UAV { MipSlice: 1, FirstWSlice: 1, WSize: u32::MAX };
+        assert!(clamp_uav_desc_for_resource(&own_3d, &mut uav_3d_max, 1, false));
+        assert_eq!(unsafe { uav_3d_max.Anonymous.Texture3D.WSize }, u32::MAX);
+
+        let mut bad_uav_mip = uav_3d;
+        bad_uav_mip.Anonymous.Texture3D = D3D12_TEX3D_UAV { MipSlice: 4, FirstWSlice: 0, WSize: 1 };
+        assert!(!clamp_uav_desc_for_resource(&own_3d, &mut bad_uav_mip, 1, false));
+    }
+
+    #[test]
+    fn srv_and_uav_bounds_match_d3d12_warp_debug_layer() {
+        const CHILD_ENV: &str = "VICTORY_WARP_BOUNDS_CHILD";
+        const NAME: &str = "descriptor::host::tests::srv_and_uav_bounds_match_d3d12_warp_debug_layer";
+        // Run D3D12 Debug Layer activation in an isolated child process so
+        // `EnableDebugLayer()` never removes a sibling test's live D3D12 device.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().expect("test exe"))
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("spawn isolated WARP debug-layer child");
+            assert!(
+                out.status.success(),
+                "WARP debug-layer child failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            return;
+        }
+
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
+        use windows::core::Interface;
+
+        let require_debug = std::env::var_os("VICTORY_REQUIRE_D3D12_DEBUG_TESTS")
+            .is_some_and(|v| v == "1")
+            || std::env::var_os("VICTORY_REQUIRE_DXR_TESTS").is_some_and(|v| v == "1");
+
+        // Isolated WARP D3D12 device with Debug Layer exercising the full
+        // `fits() -> clamp_*_desc_for_resource() -> Create*View()` path.
+        unsafe {
+            let mut debug: Option<ID3D12Debug> = None;
+            let debug_ok = D3D12GetDebugInterface(&mut debug).is_ok() && debug.is_some();
+            if let Some(d) = debug {
+                d.EnableDebugLayer();
+            } else if require_debug {
+                panic!("D3D12 Debug Layer required but unavailable");
+            } else {
+                eprintln!("NOTE: D3D12 Debug Layer unavailable on this host; running WARP device-removed checks only");
+            }
+            let factory = CreateDXGIFactory1::<IDXGIFactory4>().expect("DXGI factory");
+            let adapter = factory.EnumWarpAdapter::<IDXGIAdapter>().expect("WARP adapter");
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).expect("WARP D3D12 device");
+            let dev = dev.expect("non-null WARP D3D12 device");
+            let info: Option<ID3D12InfoQueue> = dev.cast().ok();
+            if require_debug {
+                assert!(
+                    debug_ok && info.is_some(),
+                    "ID3D12InfoQueue required when D3D12 Debug Layer verification is enforced"
+                );
+            }
+            if let Some(iq) = &info {
+                iq.ClearStoredMessages();
+            }
+            let heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 32,
+                    ..Default::default()
+                })
+                .expect("WARP descriptor heap");
+            let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let slot = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + i * step };
+            let props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let make_tex = |desc: &D3D12_RESOURCE_DESC| -> ID3D12Resource {
+                let mut res: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut res,
+                )
+                .expect("WARP committed texture");
+                res.unwrap()
+            };
+
+            // 1. 7-mip 4-slice 2D array with UAV: clamp MipLevels=15 -> 7, preserve negative/NaN LOD clamp,
+            //    reject PlaneSlice=1, accept PlaneSlice=0, AND accept 1-sample multi-mip MS SRV & UAV.
+            let tex_7mip_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 4,
+                MipLevels: 7,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let tex_7mip = make_tex(&tex_7mip_desc);
+            let planes_rgba = device_format_plane_count(&dev, DXGI_FORMAT_R8G8B8A8_UNORM);
+            assert_eq!(planes_rgba, 1);
+
+            let mut srv_clamped = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 15,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: -1.0,
+                    },
+                },
+            };
+            assert!(fits(&tex_7mip, Some(&mut srv_clamped.Format), false));
+            assert!(clamp_srv_desc_for_resource(&tex_7mip_desc, &mut srv_clamped, planes_rgba));
+            dev.CreateShaderResourceView(&tex_7mip, Some(&srv_clamped), slot(0));
+
+            let mut srv_nan = srv_clamped;
+            srv_nan.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: f32::NAN,
+            };
+            assert!(fits(&tex_7mip, Some(&mut srv_nan.Format), false));
+            assert!(clamp_srv_desc_for_resource(&tex_7mip_desc, &mut srv_nan, planes_rgba));
+            dev.CreateShaderResourceView(&tex_7mip, Some(&srv_nan), slot(1));
+
+            let mut uav_ok = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                        MipSlice: 2,
+                        FirstArraySlice: 1,
+                        ArraySize: u32::MAX,
+                        PlaneSlice: 0,
+                    },
+                },
+            };
+            assert!(fits(&tex_7mip, Some(&mut uav_ok.Format), true));
+            assert!(clamp_uav_desc_for_resource(&tex_7mip_desc, &mut uav_ok, planes_rgba, false));
+            dev.CreateUnorderedAccessView(&tex_7mip, None, Some(&uav_ok), slot(2));
+
+            // 2. Typeless resource: typeless view format MUST be rejected by both `fits` and `clamp`,
+            //    while compatible typed view format succeeds end-to-end.
+            let tex_typeless_desc = D3D12_RESOURCE_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                ..tex_7mip_desc
+            };
+            let tex_typeless = make_tex(&tex_typeless_desc);
+            let mut srv_typeless = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                ..srv_clamped
+            };
+            assert!(!fits(&tex_typeless, Some(&mut srv_typeless.Format), false));
+            assert!(!clamp_srv_desc_for_resource(&tex_typeless_desc, &mut srv_typeless, planes_rgba));
+            let mut srv_typed_on_typeless = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ..srv_clamped
+            };
+            assert!(fits(&tex_typeless, Some(&mut srv_typed_on_typeless.Format), false));
+            assert!(clamp_srv_desc_for_resource(&tex_typeless_desc, &mut srv_typed_on_typeless, planes_rgba));
+            dev.CreateShaderResourceView(&tex_typeless, Some(&srv_typed_on_typeless), slot(3));
+
+            // 3. Depth/stencil R24G8_TYPELESS: depth (plane 0) and stencil (plane 1) SRVs end-to-end.
+            let tex_ds_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 32,
+                Height: 32,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R24G8_TYPELESS,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let tex_ds = make_tex(&tex_ds_desc);
+            let planes_ds = device_format_plane_count(&dev, DXGI_FORMAT_R24G8_TYPELESS);
+            assert_eq!(planes_ds, 2);
+            let mut srv_depth = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+                },
+            };
+            assert!(fits(&tex_ds, Some(&mut srv_depth.Format), false));
+            assert!(clamp_srv_desc_for_resource(&tex_ds_desc, &mut srv_depth, planes_ds));
+            dev.CreateShaderResourceView(&tex_ds, Some(&srv_depth), slot(4));
+            let mut srv_stencil = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 },
+                },
+            };
+            assert!(fits(&tex_ds, Some(&mut srv_stencil.Format), false));
+            assert!(clamp_srv_desc_for_resource(&tex_ds_desc, &mut srv_stencil, planes_ds));
+            dev.CreateShaderResourceView(&tex_ds, Some(&srv_stencil), slot(5));
+
+            // 4. Planar YUV NV12 end-to-end (`fits -> clamp -> CreateShaderResourceView`):
+            //    R8_UNORM (plane 0) and R8G8_UNORM (plane 1) pass; R8_SNORM is rejected.
+            let tex_nv12_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 32,
+                Height: 32,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let tex_nv12 = make_tex(&tex_nv12_desc);
+            let planes_nv12 = device_format_plane_count(&dev, DXGI_FORMAT_NV12);
+            assert_eq!(planes_nv12, 2);
+            let mut srv_nv12_y = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+                },
+            };
+            assert!(fits(&tex_nv12, Some(&mut srv_nv12_y.Format), false));
+            assert_eq!(srv_nv12_y.Format, DXGI_FORMAT_R8_UNORM);
+            assert!(clamp_srv_desc_for_resource(&tex_nv12_desc, &mut srv_nv12_y, planes_nv12));
+            dev.CreateShaderResourceView(&tex_nv12, Some(&srv_nv12_y), slot(6));
+            let mut srv_nv12_uv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 },
+                },
+            };
+            assert!(fits(&tex_nv12, Some(&mut srv_nv12_uv.Format), false));
+            assert_eq!(srv_nv12_uv.Format, DXGI_FORMAT_R8G8_UNORM);
+            assert!(clamp_srv_desc_for_resource(&tex_nv12_desc, &mut srv_nv12_uv, planes_nv12));
+            dev.CreateShaderResourceView(&tex_nv12, Some(&srv_nv12_uv), slot(7));
+            let mut srv_nv12_snorm = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_R8_SNORM, ..srv_nv12_y };
+            assert!(!fits(&tex_nv12, Some(&mut srv_nv12_snorm.Format), false));
+            assert!(!clamp_srv_desc_for_resource(&tex_nv12_desc, &mut srv_nv12_snorm, planes_nv12));
+
+            // 5. Single-sample multi-mip 7-mip 4-slice texture viewed as TEXTURE2DMS & TEXTURE2DMSARRAY SRV/UAV.
+            let mut srv_ms = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            assert!(fits(&tex_7mip, Some(&mut srv_ms.Format), false));
+            assert!(clamp_srv_desc_for_resource(&tex_7mip_desc, &mut srv_ms, planes_rgba));
+            dev.CreateShaderResourceView(&tex_7mip, Some(&srv_ms), slot(8));
+            let mut srv_ms_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: 0, ArraySize: u32::MAX },
+                },
+            };
+            assert!(fits(&tex_7mip, Some(&mut srv_ms_arr.Format), false));
+            assert!(clamp_srv_desc_for_resource(&tex_7mip_desc, &mut srv_ms_arr, planes_rgba));
+            dev.CreateShaderResourceView(&tex_7mip, Some(&srv_ms_arr), slot(9));
+
+            let writeable_msaa = device_writeable_msaa(&dev);
+            let null_ms = null_uav_desc_with_caps(Some(6), writeable_msaa);
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&null_ms), slot(10));
+            let null_ms_arr = null_uav_desc_with_caps(Some(7), writeable_msaa);
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&null_ms_arr), slot(11));
+            if writeable_msaa {
+                let mut uav_ms = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DMS,
+                    ..Default::default()
+                };
+                assert!(fits(&tex_7mip, Some(&mut uav_ms.Format), true));
+                assert!(clamp_uav_desc_for_resource(&tex_7mip_desc, &mut uav_ms, planes_rgba, true));
+                dev.CreateUnorderedAccessView(&tex_7mip, None, Some(&uav_ms), slot(12));
+                let mut uav_ms_arr = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2DMSArray: D3D12_TEX2DMS_ARRAY_UAV { FirstArraySlice: 1, ArraySize: 8 },
+                    },
+                };
+                assert!(fits(&tex_7mip, Some(&mut uav_ms_arr.Format), true));
+                assert!(clamp_uav_desc_for_resource(&tex_7mip_desc, &mut uav_ms_arr, planes_rgba, true));
+                dev.CreateUnorderedAccessView(&tex_7mip, None, Some(&uav_ms_arr), slot(13));
+            }
+
+            assert!(dev.GetDeviceRemovedReason().is_ok(), "WARP device must not be removed");
+            if let Some(iq) = &info {
+                let mut errs = Vec::new();
+                for i in 0..iq.GetNumStoredMessages() {
+                    let mut len = 0usize;
+                    let _ = iq.GetMessage(i, None, &mut len);
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; len];
+                    if iq.GetMessage(i, Some(buf.as_mut_ptr().cast()), &mut len).is_ok() {
+                        let msg = &*buf.as_ptr().cast::<D3D12_MESSAGE>();
+                        if msg.Severity == D3D12_MESSAGE_SEVERITY_ERROR
+                            || msg.Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION
+                        {
+                            let desc = std::slice::from_raw_parts(msg.pDescription, msg.DescriptionByteLength);
+                            errs.push(String::from_utf8_lossy(desc).into_owned());
+                        }
+                    }
+                }
+                assert!(errs.is_empty(), "WARP D3D12 InfoQueue errors: {errs:?}");
+            }
+        }
     }
 }
 

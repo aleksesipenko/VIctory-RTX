@@ -484,8 +484,8 @@ fn dxr_ada_debug_layer() {
     }
 
     // Track A hardware verification on Ada under D3D12 Debug Layer:
-    // 1. Canonicalization of Xbox typeless index formats (`R16_TYPELESS` = 53,
-    //    `R32_TYPELESS` = 39) + `ScratchBatcher` multi-BLAS batching in one submit.
+    // 1. Canonical R16_UINT / R32_UINT indexed BLAS builds + `ScratchBatcher`
+    //    multi-BLAS batching in one submit.
     // 2. Self-`CopyAs` (`dst == src`, mode=1) allocates a fresh non-overlapping slice.
     // 3. Steady-state in-place TLAS reuse (in live mode) preserves the exact same
     //    `ID3D12Resource`, replaces old BLAS pins after fence completion, preserves
@@ -502,18 +502,18 @@ fn dxr_ada_debug_layer() {
     }
     let idx_buf = commands::upload(&mut side.lock().mem, &ib_vb).unwrap();
     let mut g_r16 = triangle();
-    g_r16.data.triangles.index_format = DXGI_FORMAT_R16_TYPELESS.0 as u32;
+    g_r16.data.triangles.index_format = DXGI_FORMAT_R16_UINT.0 as u32;
     g_r16.data.triangles.index_count = 3;
     g_r16.data.triangles.index_buffer = 0x20_0000;
     let mut g_r32 = triangle();
-    g_r32.data.triangles.index_format = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+    g_r32.data.triangles.index_format = DXGI_FORMAT_R32_UINT.0 as u32;
     g_r32.data.triangles.index_count = 3;
     g_r32.data.triangles.index_buffer = 0x20_0100;
-    let typeless_batch = [
+    let indexed_batch = [
         guest(0xc000, 1, 1, &raw const g_r16 as u64),
         guest(0xd000, 1, 1, &raw const g_r32 as u64),
     ];
-    let ops: Arc<[Work]> = capture_build(2, typeless_batch.as_ptr())
+    let ops: Arc<[Work]> = capture_build(2, indexed_batch.as_ptr())
         .0
         .into_iter()
         .map(|op| {
@@ -535,7 +535,7 @@ fn dxr_ada_debug_layer() {
         "ScratchBatcher must batch independent BLASes in one submit"
     );
 
-    // Build TLAS 0xe000 referencing R16_TYPELESS BLAS 0xc000.
+    // Build TLAS 0xe000 referencing R16_UINT BLAS 0xc000.
     let inst_c = commands::upload(&mut side.lock().mem, &instance(0xc000)).unwrap();
     send(
         &side,
@@ -543,7 +543,7 @@ fn dxr_ada_debug_layer() {
         &inst_c,
     );
     finish(&side);
-    let stable_tlas = side.srv(0xe000).expect("R16_TYPELESS TLAS");
+    let stable_tlas = side.srv(0xe000).expect("R16_UINT TLAS");
     assert_trace(&h, &side, &stable_tlas, 0);
 
     // Self-CopyAs (dst == src == 0xd000) must allocate a distinct non-overlapping slice.
@@ -774,7 +774,7 @@ fn dxr_ada_debug_layer() {
 }
 
 #[test]
-fn index_format_canonicalizes_typeless_and_validates_non_indexed() {
+fn index_format_rejects_compressed_typeless_and_validates_indexed() {
     let mut mock_addr = |va: u64, len: u64, align: u64| -> Checked<u64> {
         if va == 0 || !va.is_multiple_of(align) || len == 0 || va.checked_add(len).is_none() {
             return Err("invalid GPU input range");
@@ -820,19 +820,30 @@ fn index_format_canonicalizes_typeless_and_validates_non_indexed() {
         }
     };
 
-    // R16_TYPELESS (53) -> canonical R16_UINT (57), both dynamic and rehydrated static.
+    // Standard R16_UINT (57) and R32_UINT (42) indexed triangles succeed.
     for rehydrate in [false, true] {
-        let r16 = build_for(DXGI_FORMAT_R16_TYPELESS, 0x20_0002, 3, rehydrate).unwrap();
+        let r16 = build_for(DXGI_FORMAT_R16_UINT, 0x20_0002, 3, rehydrate).unwrap();
         assert_eq!(r16.IndexFormat, DXGI_FORMAT_R16_UINT);
         assert_eq!(r16.IndexCount, 3);
         assert_eq!(r16.IndexBuffer, 0x1_0020_0002);
     }
-
-    // R32_TYPELESS (39) -> canonical R32_UINT (42).
-    let r32 = build_for(DXGI_FORMAT_R32_TYPELESS, 0x20_0004, 3, false).unwrap();
+    let r32 = build_for(DXGI_FORMAT_R32_UINT, 0x20_0004, 3, false).unwrap();
     assert_eq!(r32.IndexFormat, DXGI_FORMAT_R32_UINT);
     assert_eq!(r32.IndexCount, 3);
     assert_eq!(r32.IndexBuffer, 0x1_0020_0004);
+
+    // Xbox XDXR compressed typeless streams (`R16_TYPELESS` = 53, `R32_TYPELESS` = 39)
+    // must fail closed rather than aliasing raw integer indices.
+    for rehydrate in [false, true] {
+        assert_eq!(
+            build_for(DXGI_FORMAT_R16_TYPELESS, 0x20_0002, 3, rehydrate).unwrap_err(),
+            "compressed XDXR index format"
+        );
+    }
+    assert_eq!(
+        build_for(DXGI_FORMAT_R32_TYPELESS, 0x20_0004, 3, false).unwrap_err(),
+        "compressed XDXR index format"
+    );
 
     // Non-indexed cases normalize to DXGI_FORMAT_UNKNOWN with IndexBuffer = 0.
     let stale_unknown = build_for(DXGI_FORMAT_UNKNOWN, 0xdead_beef, 0, false).unwrap();
@@ -840,19 +851,30 @@ fn index_format_canonicalizes_typeless_and_validates_non_indexed() {
     assert_eq!(stale_unknown.IndexBuffer, 0);
     assert_eq!(stale_unknown.IndexCount, 0);
 
-    let zero_typeless = build_for(DXGI_FORMAT_R16_TYPELESS, 0, 0, false).unwrap();
-    assert_eq!(zero_typeless.IndexFormat, DXGI_FORMAT_UNKNOWN);
-    assert_eq!(zero_typeless.IndexBuffer, 0);
-    assert_eq!(zero_typeless.IndexCount, 0);
+    let zero_r16 = build_for(DXGI_FORMAT_R16_UINT, 0, 0, false).unwrap();
+    assert_eq!(zero_r16.IndexFormat, DXGI_FORMAT_UNKNOWN);
+    assert_eq!(zero_r16.IndexBuffer, 0);
+    assert_eq!(zero_r16.IndexCount, 0);
+
+    for fmt in [DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R32_TYPELESS] {
+        let zero_typeless = build_for(fmt, 0, 0, false).unwrap();
+        assert_eq!(zero_typeless.IndexFormat, DXGI_FORMAT_UNKNOWN);
+        assert_eq!(zero_typeless.IndexBuffer, 0);
+        assert_eq!(zero_typeless.IndexCount, 0);
+    }
 
     // Malformed cases remain rejected.
     assert_eq!(
-        build_for(DXGI_FORMAT_R16_TYPELESS, 0x20_0000, 0, false).unwrap_err(),
+        build_for(DXGI_FORMAT_R16_UINT, 0x20_0000, 0, false).unwrap_err(),
         "invalid index format or buffer"
     );
     assert_eq!(
-        build_for(DXGI_FORMAT_R16_TYPELESS, 0, 3, false).unwrap_err(),
+        build_for(DXGI_FORMAT_R16_UINT, 0, 3, false).unwrap_err(),
         "invalid GPU input range"
+    );
+    assert_eq!(
+        build_for(DXGI_FORMAT_R16_TYPELESS, 0x20_0000, 0, false).unwrap_err(),
+        "invalid index format or buffer"
     );
     assert_eq!(
         build_for(DXGI_FORMAT_R8_UINT, 0x20_0000, 3, false).unwrap_err(),

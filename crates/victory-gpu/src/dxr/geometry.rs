@@ -161,10 +161,13 @@ fn geometry(
                 align,
             )?;
             let raw_idx_fmt = DXGI_FORMAT(crate::resource::pc_format(t.index_format) as i32);
-            // Xbox Series X `XboxBvhBuilder.dll` accepts typeless 16/32-bit index formats
-            // (`DXGI_FORMAT_R16_TYPELESS` = 53, `DXGI_FORMAT_R32_TYPELESS` = 39), whereas
-            // PC D3D12 DXR 1.1 requires canonical `R16_UINT` (57) / `R32_UINT` (42) and
-            // `DXGI_FORMAT_UNKNOWN` with a null `IndexBuffer` for non-indexed triangles.
+            // On Xbox Series X (`XboxBvhBuilder.dll`), `DXGI_FORMAT_R16_TYPELESS` (53)
+            // carries an XDXR compressed meshlet index stream (header `[clusters,
+            // 0x8000, num_tris, 0, num_verts, 0, ...]`), NOT raw 16-bit vertex indices.
+            // Passing that stream as `R16_UINT` to PC D3D12 DXR 1.1 produces out-of-bounds
+            // vertex fetches and `DXGI_ERROR_DEVICE_HUNG` on hardware. Fail closed on
+            // typeless indexed geometry until a dedicated decompressor exists, while
+            // normalizing non-indexed `(R16/R32_UINT, 0, 0)` to `DXGI_FORMAT_UNKNOWN`.
             let (fmt, ib, index_count, vertices) =
                 match (raw_idx_fmt, t.index_buffer, t.index_count) {
                     (DXGI_FORMAT_UNKNOWN, _, 0) => (DXGI_FORMAT_UNKNOWN, 0, 0, t.vertex_count),
@@ -176,11 +179,14 @@ fn geometry(
                         0,
                         0,
                     ) => (DXGI_FORMAT_UNKNOWN, 0, 0, t.vertex_count),
-                    (DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_TYPELESS, va, n) if n > 0 => {
+                    (DXGI_FORMAT_R16_UINT, va, n) if n > 0 => {
                         (DXGI_FORMAT_R16_UINT, addr(va, u64::from(n) * 2, 2)?, n, n)
                     }
-                    (DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_TYPELESS, va, n) if n > 0 => {
+                    (DXGI_FORMAT_R32_UINT, va, n) if n > 0 => {
                         (DXGI_FORMAT_R32_UINT, addr(va, u64::from(n) * 4, 4)?, n, n)
+                    }
+                    (DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_R32_TYPELESS, _, n) if n > 0 => {
+                        return Err("compressed XDXR index format");
                     }
                     _ => return Err("invalid index format or buffer"),
                 };
