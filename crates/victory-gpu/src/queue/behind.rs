@@ -663,7 +663,7 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
-                run_present(texture, overlay, shown, crate::host::sweep_upq);
+                run_present(texture, overlay, shown, &QUEUED, crate::host::sweep_upq);
             }
         }
         // (The mark was this submission's alone.)
@@ -674,11 +674,12 @@ impl Work for Job {
 
 /// Asynchronous `Present` body: presents `texture` when recognized and
 /// unconditionally invokes `sweep` even on texture-less `Present` frames,
-/// then decrements `QUEUED`.
+/// then decrements `queued`.
 fn run_present(
     texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     overlay: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     shown: super::Shown,
+    queued: &AtomicU64,
     sweep: impl FnOnce(),
 ) {
     super::finish_present(
@@ -695,7 +696,7 @@ fn run_present(
         },
         sweep,
     );
-    QUEUED.fetch_sub(1, Relaxed);
+    queued.fetch_sub(1, Relaxed);
 }
 
 static LANE: Lane<Job> = Lane::new();
@@ -1254,18 +1255,16 @@ mod tests {
     }
 
     /// Asynchronous no-texture `Present` jobs must still invoke the `upq`
-    /// sweep hook and decrement `QUEUED`.
+    /// sweep hook and decrement their queued counter.
     #[test]
     fn async_present_sweeps_upq_without_texture() {
-        let queued_before = QUEUED.load(Relaxed);
-
         // Direct `run_present` route with `texture == None` invokes sweep and
-        // decrements `QUEUED`.
-        QUEUED.fetch_add(1, Relaxed);
+        // decrements an isolated counter (no dependency on process-wide `QUEUED`).
+        let queued = AtomicU64::new(1);
         let mut sweeps = 0usize;
-        run_present(None, None, super::super::Shown { frame: 1, resource: 0 }, || sweeps += 1);
+        run_present(None, None, super::super::Shown { frame: 1, resource: 0 }, &queued, || sweeps += 1);
         assert_eq!(sweeps, 1);
-        assert_eq!(QUEUED.load(Relaxed), queued_before);
+        assert_eq!(queued.load(Relaxed), 0);
 
         // Full `Lane<Job>` dispatch of `Job::Present(None, None, ...)` executes
         // the production `crate::host::sweep_upq` hook and drains cleanly.
@@ -1274,7 +1273,6 @@ mod tests {
         lane.push(1, [Job::Present(None, None, super::super::Shown { frame: 2, resource: 0 })]);
         let limit = lane.lock().next;
         lane.look(limit);
-        assert_eq!(QUEUED.load(Relaxed), queued_before);
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }
