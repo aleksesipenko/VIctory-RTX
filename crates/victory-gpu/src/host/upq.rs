@@ -26,8 +26,9 @@
 //! (`CardPlan::up`) and come back with it when its submission has run
 //! (`Host::card_done`), so they are not written again while in use.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -101,6 +102,7 @@ impl Slot {
 }
 
 struct Queue {
+    device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     sent: u64,
@@ -113,63 +115,174 @@ unsafe impl Send for Queue {}
 /// `None` inside: none could be made (then nothing goes this way).
 static QUEUE: Mutex<Option<Option<Queue>>> = Mutex::new(None);
 
-/// Maximum unconfirmed copy-queue slots kept pinned before falling back to
-/// deferred retirement (bounds memory if a removed device keeps retrying).
+/// Maximum unconfirmed copy-queue slots kept pinned before intentionally
+/// leaking overflow entries on a stuck/broken device.
 const UNCONFIRMED_MAX: usize = 64;
 
-/// Copy-queue slots whose GPU completion could not be confirmed: their bounce
-/// buffers are retired via `super::retire_resource`, while their allocators
-/// and command lists remain pinned out of `Queue::free` so they are never
-/// `Reset()` or dropped while still in flight.
-static UNCONFIRMED: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+/// An unconfirmed copy-queue submission keeping `slot` (with `slot.bounce`,
+/// `allocator`, and `list` intact) and every source `ID3D12Resource` read by
+/// the copy alive until the copy-queue fence confirms completion or the device
+/// is removed. Never handed to graphics-queue `super::retire_resource`/`retire`.
+struct UnconfirmedSlot<S = Slot, R = ID3D12Resource, F = ID3D12Fence> {
+    #[allow(dead_code)]
+    slot: S,
+    #[allow(dead_code)]
+    pinned_sources: Vec<R>,
+    /// `Some((fence, target))` when `Queue::Signal` succeeded; `None` when
+    /// `Signal` failed (no copy-queue fence value exists).
+    signaled: Option<(F, u64)>,
+}
 
-/// Retires a slot whose copy-queue submission could not be confirmed complete.
-/// Never acquires `QUEUE`, and retires `bounce` outside all locks.
-fn retire_unconfirmed(mut slot: Slot) {
-    if let Some((old, _)) = slot.bounce.take() {
-        super::retire_resource(old);
+// SAFETY: free-threaded D3D12 COM interfaces.
+unsafe impl Send for UnconfirmedSlot {}
+
+struct UnconfirmedPool<S, R, F> {
+    entries: Vec<UnconfirmedSlot<S, R, F>>,
+}
+
+impl<S, R, F> UnconfirmedPool<S, R, F> {
+    const fn new() -> Self {
+        Self { entries: Vec::new() }
     }
-    let overflow = {
-        let mut pinned = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
-        if pinned.len() < UNCONFIRMED_MAX {
-            pinned.push(slot);
-            None
-        } else {
-            Some(slot)
+
+    /// Removes and returns entries whose copy-queue fence confirmed completion
+    /// (`completed != u64::MAX && completed >= target`), or all entries when
+    /// `device_removed` is true.
+    fn take_ready(
+        &mut self,
+        device_removed: bool,
+        mut completed_of: impl FnMut(&F) -> u64,
+    ) -> Vec<UnconfirmedSlot<S, R, F>> {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < self.entries.len() {
+            let is_ready = device_removed
+                || self.entries[i]
+                    .signaled
+                    .as_ref()
+                    .is_some_and(|(fence, target)| fence_confirmed(true, completed_of(fence), *target));
+            if is_ready {
+                ready.push(self.entries.swap_remove(i));
+            } else {
+                i += 1;
+            }
         }
+        ready
+    }
+
+    /// Pins `entry` if it has a copy-queue fence and capacity remains; returns
+    /// `Err(entry)` if it must be intentionally leaked (`Signal` failed or
+    /// pool is full at `UNCONFIRMED_MAX`).
+    fn try_push(&mut self, entry: UnconfirmedSlot<S, R, F>) -> Result<(), UnconfirmedSlot<S, R, F>> {
+        if entry.signaled.is_none() || self.entries.len() >= UNCONFIRMED_MAX {
+            return Err(entry);
+        }
+        self.entries.push(entry);
+        Ok(())
+    }
+}
+
+/// Copy-queue slots whose GPU completion could not be confirmed: pinned to
+/// their copy-queue fence (never graphics-queue bury lag).
+static UNCONFIRMED: Mutex<UnconfirmedPool<Slot, ID3D12Resource, ID3D12Fence>> =
+    Mutex::new(UnconfirmedPool::new());
+static UNCONFIRMED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn device_removed(device: Option<&ID3D12Device>) -> bool {
+    // SAFETY: plain device status query on a live device.
+    device.is_some_and(|d| unsafe { d.GetDeviceRemovedReason() }.is_err())
+}
+
+/// Sweeps any pinned copy-queue slots whose copy-queue fence has reached its
+/// target or whose device has been removed. Runs outside `QUEUE` and drops
+/// released entries outside `UNCONFIRMED`.
+fn sweep_unconfirmed(device: Option<&ID3D12Device>) {
+    if UNCONFIRMED_COUNT.load(Relaxed) == 0 {
+        return;
+    }
+    let removed = device_removed(device);
+    let ready = {
+        let mut pool = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
+        let ready = pool.take_ready(removed, |fence| {
+            // SAFETY: plain fence query on a live fence.
+            unsafe { fence.GetCompletedValue() }
+        });
+        UNCONFIRMED_COUNT.store(pool.entries.len(), Relaxed);
+        ready
     };
-    if let Some(slot) = overflow {
-        super::retire(slot);
+    drop(ready);
+}
+
+/// Clones one COM reference per distinct copy-source `ID3D12Resource` in `ranges`.
+fn pin_sources(ranges: &[Range<'_>]) -> Vec<ID3D12Resource> {
+    let mut seen = HashSet::new();
+    let mut pinned = Vec::new();
+    for &(_, _, cpu, _) in ranges {
+        if seen.insert(windows::core::Interface::as_raw(cpu) as usize) {
+            pinned.push(cpu.clone());
+        }
+    }
+    pinned
+}
+
+/// Pins an unconfirmed copy-queue slot (with `slot.bounce`, `allocator`, `list`,
+/// and `pinned_sources` intact) until the copy-queue fence confirms completion
+/// or the device is removed. If `Signal` failed (no copy-queue fence value) or
+/// `UNCONFIRMED` is full at `UNCONFIRMED_MAX`, intentionally leaks via
+/// `std::mem::forget` rather than freeing GPU-in-use COM objects.
+fn pin_unconfirmed(entry: UnconfirmedSlot, device: Option<&ID3D12Device>) {
+    if entry.signaled.is_none() {
+        std::mem::forget(entry);
+        return;
+    }
+    let removed = device_removed(device);
+    let (ready, overflow) = {
+        let mut pool = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
+        let ready = pool.take_ready(removed, |fence| {
+            // SAFETY: plain fence query on a live fence.
+            unsafe { fence.GetCompletedValue() }
+        });
+        let overflow = pool.try_push(entry).err();
+        UNCONFIRMED_COUNT.store(pool.entries.len(), Relaxed);
+        (ready, overflow)
+    };
+    drop(ready);
+    if let Some(entry) = overflow {
+        std::mem::forget(entry);
     }
 }
 
 /// Guards a slot after `ExecuteCommandLists` so that any error return or panic
-/// unwind never drops an in-flight allocator/bounce or recycles an unconfirmed
-/// slot back into `Queue::free`. Declared outside `QUEUE` lock scope so drop
-/// always runs with `QUEUE` unlocked.
-struct Submitted {
+/// unwind never drops an in-flight allocator/bounce/source or recycles an
+/// unconfirmed slot back into `Queue::free`. Declared outside `QUEUE` lock and
+/// local `bounce` clone scopes so drop always runs with `QUEUE` unlocked.
+struct Submitted<'a, 'b, 'c> {
     slot: Option<Slot>,
     fence: Option<(ID3D12Fence, u64)>,
     signal_ok: bool,
+    wait_failed: bool,
+    device: &'a ID3D12Device,
+    ranges: &'b [Range<'c>],
 }
 
-impl Submitted {
-    fn empty() -> Self {
-        Self { slot: None, fence: None, signal_ok: false }
+impl<'a, 'b, 'c> Submitted<'a, 'b, 'c> {
+    fn new(device: &'a ID3D12Device, ranges: &'b [Range<'c>]) -> Self {
+        Self { slot: None, fence: None, signal_ok: false, wait_failed: false, device, ranges }
     }
 
     fn arm(&mut self, slot: Slot, fence: ID3D12Fence, target: u64) {
         self.slot = Some(slot);
         self.fence = Some((fence, target));
         self.signal_ok = false;
+        self.wait_failed = false;
     }
 
     fn mark_signaled(&mut self) {
         self.signal_ok = true;
     }
 
-    fn mark_unconfirmed(&mut self) {
-        self.signal_ok = false;
+    fn mark_wait_failed(&mut self) {
+        self.wait_failed = true;
     }
 
     fn take(&mut self) -> Option<Slot> {
@@ -177,21 +290,25 @@ impl Submitted {
     }
 }
 
-impl Drop for Submitted {
+impl Drop for Submitted<'_, '_, '_> {
     fn drop(&mut self) {
         let Some(slot) = self.slot.take() else {
             return;
         };
-        let (completed, target) = match &self.fence {
-            Some((fence, target)) if self.signal_ok => {
+        let signaled = if self.signal_ok { self.fence.take() } else { None };
+        let (completed, target) = match &signaled {
+            Some((fence, target)) => {
                 // SAFETY: plain fence query on a live fence.
                 (unsafe { fence.GetCompletedValue() }, *target)
             }
-            _ => (0, 1),
+            None => (0, 1),
         };
-        match slot_outcome(true, self.signal_ok, true, completed, target) {
+        match slot_outcome(true, signaled.is_some(), !self.wait_failed, completed, target) {
             SlotOutcome::Recycle => give_back(slot),
-            SlotOutcome::RetireUnconfirmed => retire_unconfirmed(slot),
+            SlotOutcome::RetireUnconfirmed => {
+                let pinned_sources = pin_sources(self.ranges);
+                pin_unconfirmed(UnconfirmedSlot { slot, pinned_sources, signaled }, Some(self.device));
+            }
         }
     }
 }
@@ -211,7 +328,7 @@ fn make_queue(device: &ID3D12Device) -> Option<Queue> {
                 ..Default::default()
             })?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-            Ok(Queue { queue, fence, sent: 0, free: Vec::new() })
+            Ok(Queue { device: device.clone(), queue, fence, sent: 0, free: Vec::new() })
         })()
     };
     match made {
@@ -263,6 +380,7 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     }
+    sweep_unconfirmed(Some(&host.device));
     let popped = {
         let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = guard.get_or_insert_with(|| make_queue(&host.device)).as_mut() else {
@@ -294,8 +412,8 @@ pub(super) unsafe fn send(
     }
     // Declared before `bounce` and before the `QUEUE` lock scope so on error
     // or unwind, `QUEUE` and the local `bounce` clone always drop BEFORE
-    // `Submitted::drop` retires or recycles the slot.
-    let mut submitted_guard = Submitted::empty();
+    // `Submitted::drop` pins or recycles the slot.
+    let mut submitted_guard = Submitted::new(&host.device, ranges);
     let Some((bounce, _)) = slot.bounce.clone() else {
         give_back(slot);
         STATS[3].fetch_add(1, Relaxed);
@@ -374,7 +492,7 @@ pub(super) unsafe fn send(
                 target,
                 "up queue CPU wait did not confirm copy completion: as before"
             );
-            submitted_guard.mark_unconfirmed();
+            submitted_guard.mark_wait_failed();
             STATS[3].fetch_add(1, Relaxed);
             return None;
         }
@@ -392,11 +510,12 @@ pub(super) unsafe fn send(
 
 /// A plan's slot, back once its submission has run. Only returns the slot to
 /// the reusable pool if its copy-queue fence is confirmed complete (or it was
-/// never submitted); unconfirmed slots are retired safely outside `QUEUE`.
+/// never submitted); unconfirmed slots stay pinned to the copy-queue fence
+/// outside `QUEUE`.
 pub(super) fn give_back(mut slot: Slot) {
     enum Back {
-        Stored,
-        RetireUnconfirmed(Slot),
+        Stored(ID3D12Device),
+        PinUnconfirmed(Slot, Option<(ID3D12Fence, u64)>, Option<ID3D12Device>),
         Orphan(Slot),
     }
     let action = {
@@ -412,19 +531,22 @@ pub(super) fn give_back(mut slot: Slot) {
             if reusable {
                 slot.last_sent = 0;
                 q.free.push(slot);
-                Back::Stored
+                Back::Stored(q.device.clone())
             } else {
-                Back::RetireUnconfirmed(slot)
+                let signaled = Some((q.fence.clone(), slot.last_sent));
+                Back::PinUnconfirmed(slot, signaled, Some(q.device.clone()))
             }
         } else if slot.last_sent != 0 {
-            Back::RetireUnconfirmed(slot)
+            Back::PinUnconfirmed(slot, None, None)
         } else {
             Back::Orphan(slot)
         }
     };
     match action {
-        Back::Stored => {}
-        Back::RetireUnconfirmed(slot) => retire_unconfirmed(slot),
+        Back::Stored(device) => sweep_unconfirmed(Some(&device)),
+        Back::PinUnconfirmed(slot, signaled, device) => {
+            pin_unconfirmed(UnconfirmedSlot { slot, pinned_sources: Vec::new(), signaled }, device.as_ref());
+        }
         Back::Orphan(mut slot) => {
             if let Some((old, _)) = slot.bounce.take() {
                 super::retire_resource(old);
@@ -449,6 +571,7 @@ pub(super) fn line(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn a_buffer_is_made_only_when_the_one_we_have_is_too_small() {
@@ -477,5 +600,97 @@ mod tests {
         // D3D12 device-removed sentinel (`u64::MAX`): never recycle.
         assert_eq!(slot_outcome(true, true, true, u64::MAX, 7), SlotOutcome::RetireUnconfirmed);
         assert_eq!(slot_outcome(true, true, true, u64::MAX, u64::MAX), SlotOutcome::RetireUnconfirmed);
+    }
+
+    #[test]
+    fn unconfirmed_slot_retains_bounce_and_sources_until_copy_fence_confirms() {
+        struct FakeSlot {
+            _allocator: Arc<()>,
+            _bounce: Arc<()>,
+        }
+
+        let alloc = Arc::new(());
+        let bounce = Arc::new(());
+        let src1 = Arc::new(());
+        let src2 = Arc::new(());
+        let fence_value = Arc::new(AtomicU64::new(4));
+
+        let mut pool: UnconfirmedPool<FakeSlot, Arc<()>, Arc<AtomicU64>> = UnconfirmedPool::new();
+        assert!(
+            pool.try_push(UnconfirmedSlot {
+                slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                pinned_sources: vec![Arc::clone(&src1), Arc::clone(&src2)],
+                signaled: Some((Arc::clone(&fence_value), 7)),
+            })
+            .is_ok()
+        );
+
+        // Below target (4 < 7): slot, bounce, and sources all stay pinned.
+        assert!(pool.take_ready(false, |f| f.load(Relaxed)).is_empty());
+        assert_eq!(Arc::strong_count(&alloc), 2);
+        assert_eq!(Arc::strong_count(&bounce), 2);
+        assert_eq!(Arc::strong_count(&src1), 2);
+        assert_eq!(Arc::strong_count(&src2), 2);
+
+        // Device-removed sentinel (`u64::MAX`) without `device_removed` flag: still pinned.
+        fence_value.store(u64::MAX, Relaxed);
+        assert!(pool.take_ready(false, |f| f.load(Relaxed)).is_empty());
+        assert_eq!(Arc::strong_count(&bounce), 2);
+        assert_eq!(Arc::strong_count(&src1), 2);
+
+        // Once copy-queue fence confirms >= target (7): swept and released.
+        fence_value.store(7, Relaxed);
+        let ready = pool.take_ready(false, |f| f.load(Relaxed));
+        assert_eq!(ready.len(), 1);
+        drop(ready);
+        assert_eq!(Arc::strong_count(&alloc), 1);
+        assert_eq!(Arc::strong_count(&bounce), 1);
+        assert_eq!(Arc::strong_count(&src1), 1);
+        assert_eq!(Arc::strong_count(&src2), 1);
+
+        // Device removal sweeps stuck signaled entries too.
+        fence_value.store(0, Relaxed);
+        assert!(
+            pool.try_push(UnconfirmedSlot {
+                slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                pinned_sources: vec![Arc::clone(&src1)],
+                signaled: Some((Arc::clone(&fence_value), 9)),
+            })
+            .is_ok()
+        );
+        let ready = pool.take_ready(true, |f| f.load(Relaxed));
+        assert_eq!(ready.len(), 1);
+        drop(ready);
+        assert_eq!(Arc::strong_count(&bounce), 1);
+        assert_eq!(Arc::strong_count(&src1), 1);
+
+        // Unsignaled (`Signal` failed) or pool overflow (> UNCONFIRMED_MAX) is
+        // rejected so caller intentionally `std::mem::forget`s instead of dropping.
+        assert!(
+            pool.try_push(UnconfirmedSlot {
+                slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                pinned_sources: vec![Arc::clone(&src1)],
+                signaled: None,
+            })
+            .is_err()
+        );
+        for target in 1..=(UNCONFIRMED_MAX as u64) {
+            assert!(
+                pool.try_push(UnconfirmedSlot {
+                    slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                    pinned_sources: vec![Arc::clone(&src1)],
+                    signaled: Some((Arc::clone(&fence_value), target)),
+                })
+                .is_ok()
+            );
+        }
+        assert!(
+            pool.try_push(UnconfirmedSlot {
+                slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                pinned_sources: vec![Arc::clone(&src1)],
+                signaled: Some((Arc::clone(&fence_value), 999)),
+            })
+            .is_err()
+        );
     }
 }

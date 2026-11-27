@@ -317,9 +317,12 @@ fn reserve_again_budget(
             state.used_us = 0;
             (available, 0)
         }
+        // Monotonic frame guard: a stale frame (`frame < active_frame`) never
+        // resets `active_frame` or `used_us` and gets no extra wait budget.
+        Some(_) if frame < state.active_frame => (Duration::ZERO, 0),
         Some(first) if first == frame => (available, 0),
         Some(_) => {
-            if state.active_frame != frame {
+            if frame > state.active_frame {
                 state.active_frame = frame;
                 state.used_us = 0;
             }
@@ -852,54 +855,79 @@ mod tests {
         assert_eq!(reserve_again_budget(&p.wait_state, 7, Duration::ZERO, again), (Duration::ZERO, 0));
         assert_eq!(p.wait_state.lock().unwrap().first_frame, None);
 
-        // First frame at `u64::MAX` gets full budget with no sentinel collision.
-        assert_eq!(reserve_again_budget(&p.wait_state, u64::MAX, Duration::from_millis(200), again), (Duration::from_millis(200), 0));
-        assert_eq!(p.wait_state.lock().unwrap().first_frame, Some(u64::MAX));
-        // Another draw in the same first frame (`u64::MAX`) still gets full remaining budget.
-        assert_eq!(reserve_again_budget(&p.wait_state, u64::MAX, Duration::from_millis(120), again), (Duration::from_millis(120), 0));
+        // First frame at 7 gets full budget; another draw in frame 7 still gets full.
+        assert_eq!(reserve_again_budget(&p.wait_state, 7, Duration::from_millis(200), again), (Duration::from_millis(200), 0));
+        assert_eq!(p.wait_state.lock().unwrap().first_frame, Some(7));
+        assert_eq!(reserve_again_budget(&p.wait_state, 7, Duration::from_millis(120), again), (Duration::from_millis(120), 0));
 
-        // Frame 0 after `u64::MAX` is a subsequent frame: 10 consecutive draws
-        // on the same pending pipeline spend at most 8 ms total.
+        // Subsequent frame 8: 10 consecutive draws on the same pending pipeline
+        // spend at most 8 ms total.
         let mut total_ms = 0u128;
         for _ in 0..10 {
-            let (left, reserved) = reserve_again_budget(&p.wait_state, 0, full, again);
+            let (left, reserved) = reserve_again_budget(&p.wait_state, 8, full, again);
             total_ms += left.as_millis();
             // Simulate waiting the full granted slice (no refund).
-            refund_again_budget(&p.wait_state, 0, reserved, left);
+            refund_again_budget(&p.wait_state, 8, reserved, left);
         }
         assert_eq!(total_ms, 8);
 
-        // Next frame (frame 1) resets per-frame usage; an early wakeup refunds
+        // Next frame (frame 9) resets per-frame usage; an early wakeup refunds
         // unused microseconds so later draws in the same frame may use the rest,
         // and concurrent waiters cannot exceed the cap.
-        let (left1, res1) = reserve_again_budget(&p.wait_state, 1, Duration::from_millis(5), again);
+        let (left1, res1) = reserve_again_budget(&p.wait_state, 9, Duration::from_millis(5), again);
         assert_eq!((left1, res1), (Duration::from_millis(5), 5_000));
         // While draw 1 is still waiting, two concurrent waiters contend:
         // waiter 2 gets the remaining 3 ms, waiter 3 gets 0 ms.
-        let (left2, res2) = reserve_again_budget(&p.wait_state, 1, full, again);
+        let (left2, res2) = reserve_again_budget(&p.wait_state, 9, full, again);
         assert_eq!((left2, res2), (Duration::from_millis(3), 3_000));
-        let (left3, res3) = reserve_again_budget(&p.wait_state, 1, full, again);
+        let (left3, res3) = reserve_again_budget(&p.wait_state, 9, full, again);
         assert_eq!((left3, res3), (Duration::ZERO, 0));
         // Waiter 1 wakes early after 2 ms (refunds 3 ms); waiter 2 spends all 3 ms.
-        refund_again_budget(&p.wait_state, 1, res1, Duration::from_millis(2));
-        refund_again_budget(&p.wait_state, 1, res2, Duration::from_millis(3));
-        // A later draw in frame 1 can claim the 3 ms refunded by waiter 1, then exhausted.
-        let (left4, res4) = reserve_again_budget(&p.wait_state, 1, full, again);
+        refund_again_budget(&p.wait_state, 9, res1, Duration::from_millis(2));
+        refund_again_budget(&p.wait_state, 9, res2, Duration::from_millis(3));
+        // A later draw in frame 9 can claim the 3 ms refunded by waiter 1, then exhausted.
+        let (left4, res4) = reserve_again_budget(&p.wait_state, 9, full, again);
         assert_eq!((left4, res4), (Duration::from_millis(3), 3_000));
-        assert_eq!(reserve_again_budget(&p.wait_state, 1, full, again), (Duration::ZERO, 0));
+        assert_eq!(reserve_again_budget(&p.wait_state, 9, full, again), (Duration::ZERO, 0));
 
-        // Advancing to frame 2 resets the budget; a stale refund from frame 1
-        // must not affect frame 2's usage.
-        let (left_f2, res_f2) = reserve_again_budget(&p.wait_state, 2, full, again);
-        assert_eq!((left_f2, res_f2), (Duration::from_millis(8), 8_000));
-        refund_again_budget(&p.wait_state, 1, res4, Duration::ZERO);
+        // Advancing to frame 10 resets the budget; a stale refund from frame 9
+        // must not affect frame 10's usage.
+        let (left_f10, res_f10) = reserve_again_budget(&p.wait_state, 10, full, again);
+        assert_eq!((left_f10, res_f10), (Duration::from_millis(8), 8_000));
+        refund_again_budget(&p.wait_state, 9, res4, Duration::ZERO);
         assert_eq!(p.wait_state.lock().unwrap().used_us, 8_000);
-        assert_eq!(reserve_again_budget(&p.wait_state, 2, full, again), (Duration::ZERO, 0));
+        assert_eq!(reserve_again_budget(&p.wait_state, 10, full, again), (Duration::ZERO, 0));
+
+        // Monotonic frame guard (`12 -> 11 -> 12`): a late stale frame 11 must
+        // get 0 budget and must NOT reset frame 12's usage.
+        let (f12_a, res12_a) = reserve_again_budget(&p.wait_state, 12, Duration::from_millis(5), again);
+        assert_eq!((f12_a, res12_a), (Duration::from_millis(5), 5_000));
+        assert_eq!(reserve_again_budget(&p.wait_state, 11, full, again), (Duration::ZERO, 0));
+        assert_eq!(reserve_again_budget(&p.wait_state, 7, full, again), (Duration::ZERO, 0));
+        let (f12_b, res12_b) = reserve_again_budget(&p.wait_state, 12, full, again);
+        assert_eq!((f12_b, res12_b), (Duration::from_millis(3), 3_000));
+        assert_eq!(reserve_again_budget(&p.wait_state, 12, full, again), (Duration::ZERO, 0));
+        // Even after frame 12 is fully spent, another stale frame 11 still cannot reset it.
+        assert_eq!(reserve_again_budget(&p.wait_state, 11, full, again), (Duration::ZERO, 0));
+        assert_eq!(reserve_again_budget(&p.wait_state, 12, full, again), (Duration::ZERO, 0));
 
         // Zero again budget skips subsequent-frame waiting completely.
-        assert_eq!(reserve_again_budget(&p.wait_state, 3, full, Some(Duration::ZERO)), (Duration::ZERO, 0));
+        assert_eq!(reserve_again_budget(&p.wait_state, 13, full, Some(Duration::ZERO)), (Duration::ZERO, 0));
         // Unset / screen pass (`again == None`) leaves available budget untouched.
-        assert_eq!(reserve_again_budget(&p.wait_state, 4, Duration::from_millis(300), None), (Duration::from_millis(300), 0));
+        assert_eq!(reserve_again_budget(&p.wait_state, 14, Duration::from_millis(300), None), (Duration::from_millis(300), 0));
+
+        // `frame == u64::MAX` has no sentinel collision on a fresh pipeline.
+        let p_max = Pending::new(Vec::new(), None);
+        assert_eq!(
+            reserve_again_budget(&p_max.wait_state, u64::MAX, Duration::from_millis(200), again),
+            (Duration::from_millis(200), 0)
+        );
+        assert_eq!(p_max.wait_state.lock().unwrap().first_frame, Some(u64::MAX));
+        assert_eq!(
+            reserve_again_budget(&p_max.wait_state, u64::MAX, Duration::from_millis(120), again),
+            (Duration::from_millis(120), 0)
+        );
+        assert_eq!(reserve_again_budget(&p_max.wait_state, u64::MAX - 1, full, again), (Duration::ZERO, 0));
 
         // Concurrent threads in a subsequent frame collectively reserve at most `again`.
         let p = Arc::new(Pending::new(Vec::new(), None));
