@@ -30,6 +30,19 @@ use std::time::{Duration, Instant};
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
+/// Per-pipeline frame wait state for `VICTORY_PIPELINE_WAIT_AGAIN_MS`
+/// (GPL-3.0 provenance: Belobug/VIctory-Belobug-AMD#410).
+#[derive(Default)]
+struct WaitFrameState {
+    /// First frame in which a draw waited for this pipeline (`None`: never).
+    first_frame: Option<u64>,
+    /// Frame `used_us` belongs to.
+    active_frame: u64,
+    /// Microseconds reserved/spent by draws on this pipeline in `active_frame`
+    /// after `first_frame`.
+    used_us: u64,
+}
+
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
@@ -52,9 +65,9 @@ pub(crate) struct Pending {
     /// How long draws have waited for this pipeline so far, in microseconds
     /// ([`wait_once`]).
     waited_us: AtomicU64,
-    /// The frame a draw first waited for it, plus one; 0: never waited
-    /// ([`wait_again_budget`], GPL-3.0 provenance: Belobug/VIctory-Belobug-AMD#410).
-    first_wait: AtomicU64,
+    /// Per-`(pipeline, frame)` state for [`wait_again_budget`], stored inline
+    /// on `Pending` (no external map or sentinel collision).
+    wait_state: Mutex<WaitFrameState>,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -149,7 +162,7 @@ impl Pending {
             scene_input,
             left_out,
             waited_us: AtomicU64::new(0),
-            first_wait: AtomicU64::new(0),
+            wait_state: Mutex::new(WaitFrameState::default()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -275,37 +288,71 @@ fn wait_again_budget() -> Option<Duration> {
     })
 }
 
-/// The most a pipeline may wait in frame `frame`: `full` in the first frame
-/// that waited for it (`first_wait` is that frame plus one, 0 if none),
-/// `again` in later ones.
-fn budget_for(first_wait: u64, frame: u64, full: Duration, again: Option<Duration>) -> Duration {
-    if first_wait == 0 || first_wait == frame.wrapping_add(1) {
-        full
-    } else {
-        again.unwrap_or(full)
+/// Reserves what a draw may wait for this pipeline in `frame`, returning
+/// `(wait_budget, reserved_again_us)`.
+///
+/// - When `again` is `None` (switch unset or screen pass) or `available` is
+///   zero, `wait_state` is untouched so a pipeline dropped on an already-spent
+///   frame keeps its full first-frame wait on the next frame.
+/// - In the first frame (`first_frame` is `None` or `Some(frame)`), all draws
+///   get `available` (bounded by the frame/shared/`wait_once` budgets).
+/// - In any subsequent frame (`first_frame != Some(frame)`), all draws and
+///   concurrent waiters on this pipeline share one per-`(pipeline, frame)` cap
+///   of `again`: `reserved_again_us` is charged up front before waiting and any
+///   unused portion is refunded by [`refund_again_budget`].
+fn reserve_again_budget(
+    wait_state: &Mutex<WaitFrameState>,
+    frame: u64,
+    available: Duration,
+    again: Option<Duration>,
+) -> (Duration, u64) {
+    let Some(again) = again.filter(|_| !available.is_zero()) else {
+        return (available, 0);
+    };
+    let mut state = wait_state.lock().unwrap_or_else(|e| e.into_inner());
+    match state.first_frame {
+        None => {
+            state.first_frame = Some(frame);
+            state.active_frame = frame;
+            state.used_us = 0;
+            (available, 0)
+        }
+        Some(first) if first == frame => (available, 0),
+        Some(_) => {
+            if state.active_frame != frame {
+                state.active_frame = frame;
+                state.used_us = 0;
+            }
+            let again_us = again.as_micros().min(u128::from(u64::MAX)) as u64;
+            let rem_us = again_us.saturating_sub(state.used_us);
+            let avail_us = available.as_micros().min(u128::from(u64::MAX)) as u64;
+            let budget_us = avail_us.min(rem_us);
+            state.used_us = state.used_us.saturating_add(budget_us);
+            (Duration::from_micros(budget_us), budget_us)
+        }
     }
 }
 
-/// Caps `available` (what remains of the frame's and pipeline's budgets) to
-/// `again` after the first frame that waited for the pipeline. Marks
-/// `first_wait` only when `available` is non-zero, so a pipeline dropped on
-/// an already-spent frame keeps its full first-frame wait on the next frame.
-fn apply_again_budget(
-    first_wait: &AtomicU64,
+/// Refunds any unused portion of a subsequent-frame reservation back to
+/// `wait_state` if `frame` is still active.
+fn refund_again_budget(
+    wait_state: &Mutex<WaitFrameState>,
     frame: u64,
-    available: Duration,
-    full: Duration,
-    again: Option<Duration>,
-) -> Duration {
-    let Some(again) = again.filter(|_| !available.is_zero()) else {
-        return available;
-    };
-    let mine = frame.wrapping_add(1);
-    let first = match first_wait.compare_exchange(0, mine, Ordering::Relaxed, Ordering::Relaxed) {
-        Ok(_) => mine,
-        Err(first) => first,
-    };
-    available.min(budget_for(first, frame, full, Some(again)))
+    reserved_us: u64,
+    waited: Duration,
+) {
+    if reserved_us == 0 {
+        return;
+    }
+    let elapsed_us = waited.as_micros().min(u128::from(u64::MAX)) as u64;
+    let unused_us = reserved_us.saturating_sub(elapsed_us);
+    if unused_us == 0 {
+        return;
+    }
+    let mut state = wait_state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.active_frame == frame {
+        state.used_us = state.used_us.saturating_sub(unused_us);
+    }
 }
 
 /// Whether passes over the screen go before the others.
@@ -406,7 +453,7 @@ fn wait(p: &Pending, frame: u64) {
     let spent_of = &SPENT[usize::from(screen)];
     let again = if screen { None } else { wait_again_budget() };
     let shared = shared_budget();
-    let left = {
+    let (left, reserved_again_us) = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
@@ -415,11 +462,11 @@ fn wait(p: &Pending, frame: u64) {
         // Marked only when it may wait, so one dropped without waiting has
         // its full budget the next frame. Up to five recording threads may
         // wait for it at once. Only what is taken here is given back below.
-        let left = apply_again_budget(&p.first_wait, frame, available, budget, again);
+        let (left, reserved_again_us) = reserve_again_budget(&p.wait_state, frame, available, again);
         if shared {
             spent.1 += left;
         }
-        left
+        (left, reserved_again_us)
     };
     if left.is_zero() {
         return;
@@ -438,6 +485,9 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     waiting.end();
+    if reserved_again_us != 0 {
+        refund_again_budget(&p.wait_state, frame, reserved_again_us, waited);
+    }
     if wait_once() && p.made.get().is_none() {
         let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
         if Duration::from_micros(before) + waited >= budget {
@@ -777,21 +827,6 @@ mod tests {
         assert!(queue.pop(false, 1).is_none());
     }
 
-    /// A pipeline still being made waits the full budget in the first frame
-    /// that waits for it, and `VICTORY_PIPELINE_WAIT_AGAIN_MS` in later ones.
-    #[test]
-    fn later_frames_wait_the_again_budget() {
-        let full = Duration::from_millis(500);
-        let again = Some(Duration::from_millis(8));
-        assert_eq!(budget_for(0, 7, full, again), full);
-        assert_eq!(budget_for(8, 7, full, again), full);
-        assert_eq!(budget_for(8, 9, full, again), Duration::from_millis(8));
-        assert_eq!(budget_for(8, 9, full, None), full);
-        assert_eq!(budget_for(1, 0, full, again), full);
-        assert_eq!(budget_for(1, 1, full, again), Duration::from_millis(8));
-        assert_eq!(budget_for(1, 1, full, Some(Duration::ZERO)), Duration::ZERO);
-    }
-
     #[test]
     fn wait_again_switch_parses_optional_milliseconds() {
         assert_eq!(parse_wait_again_ms(None), None);
@@ -802,54 +837,88 @@ mod tests {
         assert_eq!(parse_wait_again_ms(Some(" 8 ")), Some(Duration::from_millis(8)));
     }
 
-    /// Dropped pipelines on an already-spent frame keep their full first-frame
-    /// budget on the next frame; concurrent waits in the first frame share the
-    /// full budget, while later frames cap to `again` (and still respect
-    /// remaining frame/`wait_once` budgets).
+    /// A pipeline still being made waits the full budget in the first frame
+    /// that waits for it (including `frame == u64::MAX`), keeps that first
+    /// wait if dropped on an exhausted frame, and caps all subsequent-frame
+    /// draws and concurrent waiters combined to `VICTORY_PIPELINE_WAIT_AGAIN_MS`
+    /// per `(pipeline, frame)`, refunding unused time on early wakeup.
     #[test]
-    fn apply_again_budget_tracks_first_wait_inline_on_pending() {
+    fn wait_again_budget_enforces_per_pipeline_frame_cap_and_u64_max() {
         let full = Duration::from_millis(500);
         let again = Some(Duration::from_millis(8));
         let p = Pending::new(Vec::new(), None);
-        assert_eq!(p.first_wait.load(Ordering::Relaxed), 0);
 
         // Dropped without waiting on an exhausted frame: not stamped.
-        assert_eq!(apply_again_budget(&p.first_wait, 7, Duration::ZERO, full, again), Duration::ZERO);
-        assert_eq!(p.first_wait.load(Ordering::Relaxed), 0);
+        assert_eq!(reserve_again_budget(&p.wait_state, 7, Duration::ZERO, again), (Duration::ZERO, 0));
+        assert_eq!(p.wait_state.lock().unwrap().first_frame, None);
 
-        // First frame with remaining budget gets up to full and stamps frame+1.
-        assert_eq!(
-            apply_again_budget(&p.first_wait, 8, Duration::from_millis(200), full, again),
-            Duration::from_millis(200)
-        );
-        assert_eq!(p.first_wait.load(Ordering::Relaxed), 9);
+        // First frame at `u64::MAX` gets full budget with no sentinel collision.
+        assert_eq!(reserve_again_budget(&p.wait_state, u64::MAX, Duration::from_millis(200), again), (Duration::from_millis(200), 0));
+        assert_eq!(p.wait_state.lock().unwrap().first_frame, Some(u64::MAX));
+        // Another draw in the same first frame (`u64::MAX`) still gets full remaining budget.
+        assert_eq!(reserve_again_budget(&p.wait_state, u64::MAX, Duration::from_millis(120), again), (Duration::from_millis(120), 0));
 
-        // Another recording thread in the same first frame still gets the full
-        // remaining frame budget.
-        assert_eq!(
-            apply_again_budget(&p.first_wait, 8, Duration::from_millis(120), full, again),
-            Duration::from_millis(120)
-        );
+        // Frame 0 after `u64::MAX` is a subsequent frame: 10 consecutive draws
+        // on the same pending pipeline spend at most 8 ms total.
+        let mut total_ms = 0u128;
+        for _ in 0..10 {
+            let (left, reserved) = reserve_again_budget(&p.wait_state, 0, full, again);
+            total_ms += left.as_millis();
+            // Simulate waiting the full granted slice (no refund).
+            refund_again_budget(&p.wait_state, 0, reserved, left);
+        }
+        assert_eq!(total_ms, 8);
 
-        // Subsequent frames cap to `again`, bounded by what remains of frame/own.
-        assert_eq!(
-            apply_again_budget(&p.first_wait, 9, Duration::from_millis(300), full, again),
-            Duration::from_millis(8)
-        );
-        assert_eq!(
-            apply_again_budget(&p.first_wait, 9, Duration::from_millis(3), full, again),
-            Duration::from_millis(3)
-        );
-        assert_eq!(
-            apply_again_budget(&p.first_wait, 10, Duration::from_millis(300), full, Some(Duration::ZERO)),
-            Duration::ZERO
-        );
+        // Next frame (frame 1) resets per-frame usage; an early wakeup refunds
+        // unused microseconds so later draws in the same frame may use the rest,
+        // and concurrent waiters cannot exceed the cap.
+        let (left1, res1) = reserve_again_budget(&p.wait_state, 1, Duration::from_millis(5), again);
+        assert_eq!((left1, res1), (Duration::from_millis(5), 5_000));
+        // While draw 1 is still waiting, two concurrent waiters contend:
+        // waiter 2 gets the remaining 3 ms, waiter 3 gets 0 ms.
+        let (left2, res2) = reserve_again_budget(&p.wait_state, 1, full, again);
+        assert_eq!((left2, res2), (Duration::from_millis(3), 3_000));
+        let (left3, res3) = reserve_again_budget(&p.wait_state, 1, full, again);
+        assert_eq!((left3, res3), (Duration::ZERO, 0));
+        // Waiter 1 wakes early after 2 ms (refunds 3 ms); waiter 2 spends all 3 ms.
+        refund_again_budget(&p.wait_state, 1, res1, Duration::from_millis(2));
+        refund_again_budget(&p.wait_state, 1, res2, Duration::from_millis(3));
+        // A later draw in frame 1 can claim the 3 ms refunded by waiter 1, then exhausted.
+        let (left4, res4) = reserve_again_budget(&p.wait_state, 1, full, again);
+        assert_eq!((left4, res4), (Duration::from_millis(3), 3_000));
+        assert_eq!(reserve_again_budget(&p.wait_state, 1, full, again), (Duration::ZERO, 0));
 
+        // Advancing to frame 2 resets the budget; a stale refund from frame 1
+        // must not affect frame 2's usage.
+        let (left_f2, res_f2) = reserve_again_budget(&p.wait_state, 2, full, again);
+        assert_eq!((left_f2, res_f2), (Duration::from_millis(8), 8_000));
+        refund_again_budget(&p.wait_state, 1, res4, Duration::ZERO);
+        assert_eq!(p.wait_state.lock().unwrap().used_us, 8_000);
+        assert_eq!(reserve_again_budget(&p.wait_state, 2, full, again), (Duration::ZERO, 0));
+
+        // Zero again budget skips subsequent-frame waiting completely.
+        assert_eq!(reserve_again_budget(&p.wait_state, 3, full, Some(Duration::ZERO)), (Duration::ZERO, 0));
         // Unset / screen pass (`again == None`) leaves available budget untouched.
-        assert_eq!(
-            apply_again_budget(&p.first_wait, 11, Duration::from_millis(300), full, None),
-            Duration::from_millis(300)
-        );
+        assert_eq!(reserve_again_budget(&p.wait_state, 4, Duration::from_millis(300), None), (Duration::from_millis(300), 0));
+
+        // Concurrent threads in a subsequent frame collectively reserve at most `again`.
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(reserve_again_budget(&p.wait_state, 10, full, again), (full, 0));
+        let reserved_total = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let p = Arc::clone(&p);
+                let reserved_total = &reserved_total;
+                s.spawn(move || {
+                    for _ in 0..4 {
+                        let (left, res) = reserve_again_budget(&p.wait_state, 11, Duration::from_millis(3), again);
+                        assert_eq!(left, Duration::from_micros(res));
+                        reserved_total.fetch_add(res, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(reserved_total.load(Ordering::Relaxed), 8_000);
     }
 
     /// Passes over the screen go before all others, and workers of their own

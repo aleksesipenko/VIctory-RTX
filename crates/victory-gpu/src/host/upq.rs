@@ -57,11 +57,37 @@ fn bounce_size(have: Option<u64>, total: u64) -> Option<u64> {
     Some(total.next_power_of_two().max(LEAST))
 }
 
+/// Whether a fence check confirms that `target` completed on the copy queue
+/// (`u64::MAX` is D3D12's device-removed sentinel).
+fn fence_confirmed(wait_ok: bool, completed: u64, target: u64) -> bool {
+    wait_ok && completed != u64::MAX && completed >= target
+}
+
+/// What to do with a slot after a submission attempt or completion check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotOutcome {
+    Recycle,
+    RetireUnconfirmed,
+}
+
+/// Decides whether a slot may be returned to the idle pool (`Recycle`) or must
+/// be kept out of the pool (`RetireUnconfirmed`) so an in-flight command
+/// allocator is never `Reset()` or prematurely dropped.
+fn slot_outcome(submitted: bool, signal_ok: bool, wait_ok: bool, completed: u64, target: u64) -> SlotOutcome {
+    if !submitted || (signal_ok && fence_confirmed(wait_ok, completed, target)) {
+        SlotOutcome::Recycle
+    } else {
+        SlotOutcome::RetireUnconfirmed
+    }
+}
+
 /// One submission's: a copy list and our buffer in the card's memory.
 pub(super) struct Slot {
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     bounce: Option<(ID3D12Resource, u64)>,
+    /// Copy-queue fence value of its last submission (`0`: idle/never sent).
+    last_sent: u64,
 }
 
 // SAFETY: free-threaded D3D12 objects, used by one submission at a time.
@@ -86,6 +112,89 @@ unsafe impl Send for Queue {}
 
 /// `None` inside: none could be made (then nothing goes this way).
 static QUEUE: Mutex<Option<Option<Queue>>> = Mutex::new(None);
+
+/// Maximum unconfirmed copy-queue slots kept pinned before falling back to
+/// deferred retirement (bounds memory if a removed device keeps retrying).
+const UNCONFIRMED_MAX: usize = 64;
+
+/// Copy-queue slots whose GPU completion could not be confirmed: their bounce
+/// buffers are retired via `super::retire_resource`, while their allocators
+/// and command lists remain pinned out of `Queue::free` so they are never
+/// `Reset()` or dropped while still in flight.
+static UNCONFIRMED: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+
+/// Retires a slot whose copy-queue submission could not be confirmed complete.
+/// Never acquires `QUEUE`, and retires `bounce` outside all locks.
+fn retire_unconfirmed(mut slot: Slot) {
+    if let Some((old, _)) = slot.bounce.take() {
+        super::retire_resource(old);
+    }
+    let overflow = {
+        let mut pinned = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
+        if pinned.len() < UNCONFIRMED_MAX {
+            pinned.push(slot);
+            None
+        } else {
+            Some(slot)
+        }
+    };
+    if let Some(slot) = overflow {
+        super::retire(slot);
+    }
+}
+
+/// Guards a slot after `ExecuteCommandLists` so that any error return or panic
+/// unwind never drops an in-flight allocator/bounce or recycles an unconfirmed
+/// slot back into `Queue::free`. Declared outside `QUEUE` lock scope so drop
+/// always runs with `QUEUE` unlocked.
+struct Submitted {
+    slot: Option<Slot>,
+    fence: Option<(ID3D12Fence, u64)>,
+    signal_ok: bool,
+}
+
+impl Submitted {
+    fn empty() -> Self {
+        Self { slot: None, fence: None, signal_ok: false }
+    }
+
+    fn arm(&mut self, slot: Slot, fence: ID3D12Fence, target: u64) {
+        self.slot = Some(slot);
+        self.fence = Some((fence, target));
+        self.signal_ok = false;
+    }
+
+    fn mark_signaled(&mut self) {
+        self.signal_ok = true;
+    }
+
+    fn mark_unconfirmed(&mut self) {
+        self.signal_ok = false;
+    }
+
+    fn take(&mut self) -> Option<Slot> {
+        self.slot.take()
+    }
+}
+
+impl Drop for Submitted {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        let (completed, target) = match &self.fence {
+            Some((fence, target)) if self.signal_ok => {
+                // SAFETY: plain fence query on a live fence.
+                (unsafe { fence.GetCompletedValue() }, *target)
+            }
+            _ => (0, 1),
+        };
+        match slot_outcome(true, self.signal_ok, true, completed, target) {
+            SlotOutcome::Recycle => give_back(slot),
+            SlotOutcome::RetireUnconfirmed => retire_unconfirmed(slot),
+        }
+    }
+}
 
 /// Since the last frame-rate line: submissions, bytes, copies sent this
 /// way; submissions that went as before because they were too big or
@@ -124,7 +233,7 @@ fn make_slot(device: &ID3D12Device) -> Option<Slot> {
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
             let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
-            Ok(Slot { allocator, list, bounce: None })
+            Ok(Slot { allocator, list, bounce: None, last_sent: 0 })
         })()
         .ok()
     }
@@ -183,6 +292,10 @@ pub(super) unsafe fn send(
         super::name(&made, || format!("copies in the card's memory: what goes up, {} MB", size >> 20));
         slot.bounce = Some((made, size));
     }
+    // Declared before `bounce` and before the `QUEUE` lock scope so on error
+    // or unwind, `QUEUE` and the local `bounce` clone always drop BEFORE
+    // `Submitted::drop` retires or recycles the slot.
+    let mut submitted_guard = Submitted::empty();
     let Some((bounce, _)) = slot.bounce.clone() else {
         give_back(slot);
         STATS[3].fetch_add(1, Relaxed);
@@ -213,7 +326,7 @@ pub(super) unsafe fn send(
             return None;
         }
     };
-    {
+    let cpu_wait_fence = {
         let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = guard.as_mut().and_then(Option::as_mut) else {
             drop(guard);
@@ -222,28 +335,48 @@ pub(super) unsafe fn send(
             return None;
         };
         // SAFETY: `list_to_run` was closed above and belongs to `slot`.
-        let submitted = unsafe {
-            (|| -> windows::core::Result<()> {
-                q.queue.ExecuteCommandLists(&[Some(list_to_run)]);
-                q.sent += 1;
-                q.queue.Signal(&q.fence, q.sent)?;
-                Ok(())
-            })()
-        };
-        if let Err(e) = submitted {
-            // (Nothing waits for a copy that was not sent.)
-            tracing::warn!(error = %e, "what goes up to copies in the card's memory could not go on the copy queue: as before");
-            q.free.push(slot);
+        unsafe { q.queue.ExecuteCommandLists(&[Some(list_to_run)]) };
+        q.sent += 1;
+        let target = q.sent;
+        slot.last_sent = target;
+        submitted_guard.arm(slot, q.fence.clone(), target);
+        // SAFETY: `q.fence` is a live fence owned by the copy queue.
+        if let Err(e) = unsafe { q.queue.Signal(&q.fence, target) } {
+            // `ExecuteCommandLists` already ran: `submitted_guard` retires the
+            // bounce buffer and keeps the unconfirmed allocator out of `q.free`.
+            tracing::warn!(error = %e, "what goes up to copies in the card's memory could not signal its fence: as before");
             STATS[3].fetch_add(1, Relaxed);
             return None;
         }
+        submitted_guard.mark_signaled();
         // SAFETY: a fence of ours that the copy queue signals.
-        if let Err(e) = unsafe { drawing.Wait(&q.fence, q.sent) } {
-            // The drawing queue cannot be made to wait: wait here, so that
-            // what follows still finds the bytes.
+        if let Err(e) = unsafe { drawing.Wait(&q.fence, target) } {
+            // The drawing queue cannot be made to wait: wait on the CPU after
+            // releasing `QUEUE`, and only proceed if completion is confirmed.
             tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
-            // SAFETY: as above; a null event waits until the value is reached.
-            let _ = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) };
+            Some((q.fence.clone(), target))
+        } else {
+            None
+        }
+    };
+    if let Some((fence, target)) = cpu_wait_fence {
+        // SAFETY: `fence` was signalled above; a null event waits until `target` is reached.
+        let wait_ok = unsafe {
+            fence.SetEventOnCompletion(target, windows::Win32::Foundation::HANDLE::default())
+        }
+        .is_ok();
+        // SAFETY: plain fence query on a live fence.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if !fence_confirmed(wait_ok, completed, target) {
+            tracing::warn!(
+                wait_ok,
+                completed,
+                target,
+                "up queue CPU wait did not confirm copy completion: as before"
+            );
+            submitted_guard.mark_unconfirmed();
+            STATS[3].fetch_add(1, Relaxed);
+            return None;
         }
     }
     let mut at = 0u64;
@@ -254,22 +387,50 @@ pub(super) unsafe fn send(
     STATS[0].fetch_add(1, Relaxed);
     STATS[1].fetch_add(ranges.iter().map(|r| r.3).sum::<u64>(), Relaxed);
     STATS[2].fetch_add(ranges.len() as u64, Relaxed);
-    Some(slot)
+    submitted_guard.take()
 }
 
-/// A plan's slot, back once its submission has run.
+/// A plan's slot, back once its submission has run. Only returns the slot to
+/// the reusable pool if its copy-queue fence is confirmed complete (or it was
+/// never submitted); unconfirmed slots are retired safely outside `QUEUE`.
 pub(super) fn give_back(mut slot: Slot) {
-    let orphan = {
+    enum Back {
+        Stored,
+        RetireUnconfirmed(Slot),
+        Orphan(Slot),
+    }
+    let action = {
         let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(Some(q)) = guard.as_mut() {
-            q.free.push(slot);
-            None
+            let reusable = if slot.last_sent == 0 {
+                true
+            } else {
+                // SAFETY: plain fence query on a live fence.
+                let completed = unsafe { q.fence.GetCompletedValue() };
+                slot_outcome(true, true, true, completed, slot.last_sent) == SlotOutcome::Recycle
+            };
+            if reusable {
+                slot.last_sent = 0;
+                q.free.push(slot);
+                Back::Stored
+            } else {
+                Back::RetireUnconfirmed(slot)
+            }
+        } else if slot.last_sent != 0 {
+            Back::RetireUnconfirmed(slot)
         } else {
-            slot.bounce.take().map(|(old, _)| old)
+            Back::Orphan(slot)
         }
     };
-    if let Some(old) = orphan {
-        super::retire_resource(old);
+    match action {
+        Back::Stored => {}
+        Back::RetireUnconfirmed(slot) => retire_unconfirmed(slot),
+        Back::Orphan(mut slot) => {
+            if let Some((old, _)) = slot.bounce.take() {
+                super::retire_resource(old);
+            }
+            drop(slot);
+        }
     }
 }
 
@@ -298,5 +459,23 @@ mod tests {
         assert_eq!(bounce_size(None, (5 << 20) + 1), Some(8 << 20));
         assert_eq!(bounce_size(None, MOST), Some(MOST));
         assert_eq!(bounce_size(Some(MOST), MOST), None);
+    }
+
+    #[test]
+    fn unconfirmed_submitted_slots_are_never_recycled() {
+        // Never submitted: always reusable.
+        assert_eq!(slot_outcome(false, false, false, 0, 1), SlotOutcome::Recycle);
+        // Submitted + signaled + confirmed completion: reusable.
+        assert_eq!(slot_outcome(true, true, true, 7, 7), SlotOutcome::Recycle);
+        assert_eq!(slot_outcome(true, true, true, 9, 7), SlotOutcome::Recycle);
+        // Signal failed after ExecuteCommandLists: never recycle.
+        assert_eq!(slot_outcome(true, false, true, 9, 7), SlotOutcome::RetireUnconfirmed);
+        // Wait failed (e.g. SetEventOnCompletion error): never recycle.
+        assert_eq!(slot_outcome(true, true, false, 7, 7), SlotOutcome::RetireUnconfirmed);
+        // Fence still behind target: never recycle.
+        assert_eq!(slot_outcome(true, true, true, 6, 7), SlotOutcome::RetireUnconfirmed);
+        // D3D12 device-removed sentinel (`u64::MAX`): never recycle.
+        assert_eq!(slot_outcome(true, true, true, u64::MAX, 7), SlotOutcome::RetireUnconfirmed);
+        assert_eq!(slot_outcome(true, true, true, u64::MAX, u64::MAX), SlotOutcome::RetireUnconfirmed);
     }
 }
