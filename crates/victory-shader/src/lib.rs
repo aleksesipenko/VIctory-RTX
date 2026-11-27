@@ -27,7 +27,7 @@ pub mod structure;
 /// translated before is kept across the rebuild. `victory shaders`
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
-pub const TRANSLATOR_VERSION: u32 = 5;
+pub const TRANSLATOR_VERSION: u32 = 6;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
@@ -41,6 +41,8 @@ pub enum ShaderError {
     NotDxbc,
     #[error("malformed shader: {0}")]
     Malformed(&'static str),
+    #[error("malformed shader: FSPX resource has unsupported root type {0}")]
+    FspxRootType(u8),
     #[error("GFX10 code at {offset:#x}: {reason}")]
     Isa { offset: usize, reason: &'static str },
     /// Valid code the translator cannot handle yet: an opcode name or a construct.

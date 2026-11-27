@@ -71,6 +71,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// LDS accesses lowered with their bound.
+    #[cfg(test)]
+    pub lds_bounds: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -401,11 +404,9 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
-    /// With `exchange` and `ds_bpermute_b32` in a group over 32 threads: the LDS
-    /// base dword of the 64-dword-per-console-wave scratch, and the cached
-    /// `(wave_off, base)` pair for this thread's console wave in the entry block.
-    bpermute_slot: Option<u32>,
-    bpermute_base: Option<(V, V)>,
+    /// Dwords of LDS allocated by the title program itself (excluding translator
+    /// scratch appended for wave-exchange / wave-base counters).
+    title_lds_dwords: u32,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1567,6 +1568,28 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the shader
+/// on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12: HLSL
+/// `[earlydepthstencil]`), so the host declares `ForceEarlyDepthStencil`. Not
+/// for a program that exports depth, stencil, or coverage (bits 0-2 and 8, or
+/// such an output), which cannot test before it runs.
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps {
+        db_shader_control, ..
+    } = io
+    else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage, SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs
+            .iter()
+            .any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1689,6 +1712,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
         // the like are found by the elements around them; what is left out goes at the end)
         let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
@@ -1712,8 +1738,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
-        // 64-dword-per-console-wave LDS scratch for cross-half `ds_bpermute_b32`
-        let mut bpermute_slot: Option<u32> = None;
+        // title-allocated LDS dwords, before translator scratch is appended
+        let mut title_lds_dwords = 0u32;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
@@ -1725,6 +1751,7 @@ impl<'a> Lower<'a> {
             let waves = cs.threads.iter().product::<u32>().div_ceil(64);
             s.threads = Some([32 * waves, 1, 1]);
             s.lds_dwords = if lift.dead_lds { 0 } else { cs.lds_bytes() / 4 };
+            title_lds_dwords = s.lds_dwords;
             if waves > 1 {
                 // `wave_base`'s counter: a dword past the program's LDS, or the program's
                 // first where it takes all a host group has (32 KiB)
@@ -1737,6 +1764,7 @@ impl<'a> Lower<'a> {
         } else if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = if lift.dead_lds { 0 } else { cs.lds_bytes() / 4 };
+            title_lds_dwords = s.lds_dwords;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1757,19 +1785,18 @@ impl<'a> Lower<'a> {
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
-            // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
-            // masks), nor when LDS may be shared within the console wave without barriers (a
-            // group over 32 threads with LDS): those still need 64-lane waves.
+            // `ds_swizzle`, `ds_bpermute`, `v_permlane16` / `v_permlanex16`, which the ISA
+            // confines there – runs exactly in waves of 32: the thread relabelling makes each
+            // host wave one half of a console wave (lanes 32k..32k+31). Not when it crosses
+            // halves (`v_mbcnt`, `v_readlane`, `v_writelane`, `ds_permute`, masks as numbers or
+            // lane-constant masks), nor when LDS may be shared within the console wave without
+            // barriers (a group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = live_insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1814,18 +1841,6 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
-                                if group > 32
-                                    && !LOCAL_WAVES.get()
-                                    && insts().any(|i| i.name() == "ds_bpermute_b32")
-                                {
-                                    let scratch = 64 * group.div_ceil(64);
-                                    // Reserve 1 dword for `halves`'s `wave_base` counter inside
-                                    // D3D12's 32 KiB (8,192 dword) groupshared limit.
-                                    if s.lds_dwords + scratch < 8192 {
-                                        bpermute_slot = Some(s.lds_dwords);
-                                        s.lds_dwords += scratch;
-                                    }
-                                }
                             }
                         }
                     }
@@ -1841,8 +1856,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -1917,6 +1932,7 @@ impl<'a> Lower<'a> {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            title_lds_dwords = s.lds_dwords;
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
@@ -2040,8 +2056,7 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
-            bpermute_slot,
-            bpermute_base: None,
+            title_lds_dwords,
             halves,
             partial_active: None,
             paired_active: None,
@@ -2977,6 +2992,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            lds_bounds: self.s.lds_bounds,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -4464,6 +4481,19 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, bad, zero, f)
     }
 
+    /// Clamps `f` to `[0.0, 1.0]` with `DX10_CLAMP` semantics (`NaN` -> `+0.0`).
+    /// Tests NaN in integer bits via `is_nan_f32` so driver float-compare
+    /// folding cannot turn `saturate(NaN)` into `1.0` under default lowering or
+    /// NaN-safe fast-math masks (e.g. `VICTORY_SHADER_FAST_BITS=24` `nsz|arcp`).
+    /// Opting into `nnan` (bit 1) or `fast` (bit 0) via `VICTORY_SHADER_FAST_BITS`
+    /// explicitly waives upstream NaN guarantees on FP `BinOp` producers.
+    fn saturate(&mut self, f: V) -> V {
+        let clamped = self.unary(7, f);
+        let nan = self.is_nan_f32(f);
+        let zero = self.s.m.f32(0.0f32.to_bits());
+        self.s.m.select(self.cur, nan, zero, clamped)
+    }
+
     fn binary(&mut self, op: u32, a: V, b: V) -> V {
         self.s.op(
             self.cur,
@@ -5008,23 +5038,6 @@ impl<'a> Lower<'a> {
         v
     }
 
-    /// `(wave_off, base)` for cross-half `ds_bpermute_b32` (made in the entry
-    /// block): `wave_off` is this console wave's first thread index (`thread & !63`)
-    /// and `base` is its 64-dword scratch start (`slot + wave_off`).
-    fn bpermute_base(&mut self, slot: u32) -> (V, V) {
-        if let Some(pair) = self.bpermute_base {
-            return pair;
-        }
-        let e = self.s.entry;
-        let thread = self.console_thread();
-        let mask = self.s.m.i32(!63);
-        let wave_off = self.s.m.bin(e, Bin::And, thread, mask);
-        let start = self.s.m.i32(slot);
-        let base = self.s.m.bin(e, Bin::Add, start, wave_off);
-        self.bpermute_base = Some((wave_off, base));
-        (wave_off, base)
-    }
-
     /// The console's decision of the branch closing IR block `b`, which the wave takes
     /// together ([`Structured::wide`]): `when` is the lane's own bit, and the branch is taken
     /// when some lane's `when` holds (`execnz`, `vccnz`, SCC of a mask operation set) or
@@ -5168,14 +5181,19 @@ impl<'a> Lower<'a> {
         self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
     }
 
-    /// This lane's bit of the mask `lo`, `hi` (wave64).
-    fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+    /// The low and high words of the current host wave's active ballot of `on`.
+    fn host_ballot(&mut self, at: usize, on: V) -> (V, V) {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
         self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() || self.twin.is_some() {
-            self.console_lane()
-        } else {
-            self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
-        };
+        (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+    }
+
+    /// Lane `lane`'s bit of the mask `lo`, `hi` (wave64 when `hi` is `Some`).
+    fn lane_bit_of(&mut self, at: usize, lane: V, lo: V, hi: Option<V>) -> V {
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -5193,6 +5211,17 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
+    }
+
+    /// This lane's bit of the mask `lo`, `hi` (wave64).
+    fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let lane = if self.exchange.is_some() || self.twin.is_some() {
+            self.console_lane()
+        } else {
+            self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
+        };
+        self.lane_bit_of(at, lane, lo, hi)
     }
 
     /// The value of the high dword of the wave64 register pair whose low
@@ -5341,7 +5370,7 @@ impl<'a> Lower<'a> {
             }
         }
         if v.clamp {
-            f = self.unary(7, f);
+            f = self.saturate(f);
         }
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
@@ -5863,106 +5892,43 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
-            // shortcut: a source lane that is not at this instruction on the
-            // host (it left through a branch, not a guard) is read as the
-            // host gives it; the console reads 0.
+            // Backward permute: no LDS is touched. On RDNA1/2 ISA §10.4.4 each
+            // lane reads `data` from `((address + offset) >> 2) & 31` inside its
+            // own 32-lane half; a source lane outside EXEC (or inactive in the
+            // host wave) returns 0.
             self.cross_lane(false)?;
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
-            let o = self.s.m.i32(offset);
+            let (o, two, k31, z) = (
+                self.s.m.i32(offset),
+                self.s.m.i32(2),
+                self.s.m.i32(31),
+                self.s.m.i32(0),
+            );
             let at = self.s.m.bin(c, Bin::Add, at, o);
-            let two = self.s.m.i32(2);
-            let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
-            let x = match guard {
-                Some(g) => {
-                    let z = self.s.m.i32(0);
-                    self.s.m.select(c, g, x, z)
-                }
-                None => x,
+            let dword = self.s.m.bin(c, Bin::LShr, at, two);
+            let local = self.s.m.bin(c, Bin::And, dword, k31);
+            let native64 = self.x.native.wave64 && self.s.wave_size == Some(64);
+            let src = if native64 {
+                let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+                let k32 = self.s.m.i32(32);
+                let half = self.s.m.bin(c, Bin::And, lane, k32);
+                self.s.m.bin(c, Bin::Or, half, local)
+            } else {
+                local
             };
-            let r = match self.exchange.as_ref().map(|e| e.1) {
-                Some(true) => {
-                    // Console wave64 in a single 32-lane host wave (`group <= 32`):
-                    // lanes 32..63 do not exist and must read 0 without passing an
-                    // out-of-bounds lane index to `WaveReadLaneAt`.
-                    let k32 = self.s.m.i32(32);
-                    let k31 = self.s.m.i32(31);
-                    let z = self.s.m.i32(0);
-                    let in_half = self.s.m.cmp(c, pred::IULT, src, k32);
-                    let lane = self.s.m.bin(c, Bin::And, src, k31);
-                    let r = self.read_lane(x, lane);
-                    self.s.m.select(c, in_half, r, z)
-                }
-                Some(false) if self.local && self.local_any => {
-                    let k31 = self.s.m.i32(31);
-                    let lane = self.s.m.bin(c, Bin::And, src, k31);
-                    self.read_lane(x, lane)
-                }
-                Some(false) if self.local => {
-                    return Err("a lane permute in a half-wave");
-                }
-                Some(false) => {
-                    // Console wave64 across two 32-lane host waves: exchange all 64
-                    // lanes through a 64-dword-per-console-wave LDS scratch buffer.
-                    if !self.all_lanes(self.cur_ir) {
-                        need(self.cur_ir);
-                        return Err("a lane permute where not every lane runs");
-                    }
-                    let Some(slot) = self.bpermute_slot else {
-                        return Err("a lane permute across two host waves (not enough LDS)");
-                    };
-                    let (wave_off, base) = self.bpermute_base(slot);
-                    let cl = self.console_lane();
-                    let dst_idx = self.s.m.bin(c, Bin::Add, base, cl);
-                    let lds = self.s.lds();
-                    let dst_ptr = self.s.m.element(c, lds, dst_idx);
-                    self.s.m.store(c, dst_ptr, x);
-                    self.group_sync(c);
-                    let src_idx = self.s.m.bin(c, Bin::Add, base, src);
-                    let src_ptr = self.s.m.element(c, lds, src_idx);
-                    let mut r = self.s.m.load(c, src_ptr);
-                    self.group_sync(c);
-                    // Partial final console wave (`group % 64 != 0`): lanes at or past
-                    // `group` never ran and left their scratch dwords uninitialised.
-                    let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
-                    if !group.is_multiple_of(64) {
-                        let abs_src = self.s.m.bin(c, Bin::Add, wave_off, src);
-                        let limit = self.s.m.i32(group);
-                        let in_group = self.s.m.cmp(c, pred::IULT, abs_src, limit);
-                        let z = self.s.m.i32(0);
-                        r = self.s.m.select(c, in_group, r, z);
-                    }
-                    r
-                }
-                None => self.read_lane(x, src),
-            };
+            let r = self.read_lane(x, src);
+            let mut on = guard.unwrap_or_else(|| self.s.m.bool(true));
+            if let Some(active) = self.partial_active {
+                on = self.s.m.bin(c, Bin::And, on, active);
+            }
+            let (lo, hi) = self.host_ballot(c, on);
+            let running = self.lane_bit_of(c, src, lo, native64.then_some(hi));
+            let r = self.s.m.select(c, running, r, z);
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
-            return Err("LDS the program does not allocate");
-        }
-        let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
-            let c = l.cur;
-            let o = l.s.m.i32(bytes);
-            let at = l.s.m.bin(c, Bin::Add, a, o);
-            let two = l.s.m.i32(2);
-            let index = l.s.m.bin(c, Bin::LShr, at, two);
-            let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
-        };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
             Some("b96") => 3,
@@ -5994,8 +5960,114 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16") && base.starts_with("ds_read")
                 || name.ends_with("_d16_hi")
         });
+        // Zero-sized title LDS: every console LDS address is out of bounds per
+        // RDNA2 address checking (reads and returning atomics yield 0, writes
+        // are dropped, and translator scratch is never touched).
+        if self.title_lds_dwords == 0 {
+            let _ = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?;
+            if sub.is_some() {
+                if name.starts_with("ds_read") {
+                    let reg = dst_reg.ok_or("an LDS read result")?;
+                    let x = if base == name {
+                        self.s.m.i32(0)
+                    } else {
+                        let old = match inst.read(Reg::V(reg)) {
+                            Some(v) => self.i32_of(v)?,
+                            None => self.s.m.i32(0),
+                        };
+                        let keep = if name.ends_with("_hi") {
+                            self.s.m.i32(0xFFFF)
+                        } else {
+                            self.s.m.i32(0xFFFF_0000)
+                        };
+                        self.s.m.bin(c, Bin::And, old, keep)
+                    };
+                    self.write(inst, Reg::V(reg), x, guard);
+                } else {
+                    let _ = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?;
+                }
+                return Ok(());
+            }
+            if let Some(rest) = name.strip_prefix("ds_read") {
+                let elements = if rest.starts_with('2') {
+                    pair(name)
+                } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                    vec![(offset, width(name))]
+                } else {
+                    return Err("an LDS read of bytes or halves");
+                };
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let z = self.s.m.i32(0);
+                let mut n = 0;
+                for (_, w) in elements {
+                    for _ in 0..w {
+                        self.write(inst, Reg::V(reg + n), z, guard);
+                        n += 1;
+                    }
+                }
+                return Ok(());
+            }
+            if let Some(rest) = name.strip_prefix("ds_write") {
+                let elements = if rest.starts_with('2') {
+                    pair(name)
+                } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                    vec![(offset, width(name))]
+                } else {
+                    return Err("an LDS write of bytes or halves");
+                };
+                for (e, (_, w)) in elements.into_iter().enumerate() {
+                    let _ = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+                }
+                return Ok(());
+            }
+            let op = name
+                .strip_prefix("ds_")
+                .map(|n| n.replace("_rtn", ""))
+                .ok_or("an LDS operation")?;
+            match op.as_str() {
+                "add_u32" | "sub_u32" | "and_b32" | "or_b32" | "xor_b32" | "min_i32"
+                | "max_i32" | "min_u32" | "max_u32" | "wrxchg_b32" | "max_f32" | "min_f32" => {
+                    let _ = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?;
+                }
+                "cmpst_b32" => {
+                    let _ = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?;
+                    let _ = self.vgprs(inst, data.get(1).ok_or("an LDS compare")?, 1)?;
+                }
+                _ => return Err("an LDS operation"),
+            }
+            if let Some(reg) = dst_reg {
+                let z = self.s.m.i32(0);
+                self.write(inst, Reg::V(reg), z, guard);
+            }
+            return Ok(());
+        }
+        let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+        // Bound every title LDS access to `title_lds_dwords` (never touching
+        // translator scratch appended past it, and preventing OOB groupshared
+        // accesses that can hang NVIDIA GPUs with Xid 109). Out-of-bounds
+        // console accesses read 0 and drop writes.
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
+            let c = l.cur;
+            let o = l.s.m.i32(bytes);
+            let at = l.s.m.bin(c, Bin::Add, a, o);
+            let two = l.s.m.i32(2);
+            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let n = l.s.m.i32(l.title_lds_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, n);
+            l.s.lds_bounds += 1;
+            let zero = l.s.m.i32(0);
+            let index = l.s.m.select(c, inside, index, zero);
+            let lds = l.s.lds();
+            (l.s.m.element(c, lds, index), inside)
+        };
+        let both = |l: &mut Self, g: Option<V>, inside: V| -> Option<V> {
+            Some(match g {
+                Some(g) => l.s.m.bin(l.cur, Bin::And, g, inside),
+                None => inside,
+            })
+        };
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inside) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -6005,6 +6077,8 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
+                let z = self.s.m.i32(0);
+                let w = self.s.m.select(c, inside, w, z);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -6047,7 +6121,8 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let run = both(self, guard, inside);
+                let at = self.begin_guarded(run);
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -6066,8 +6141,10 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inside) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let z = self.s.m.i32(0);
+                    let x = self.s.m.select(self.cur, inside, x, z);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -6089,12 +6166,22 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
+            if let [(off, x)] = stores.as_slice() {
+                let (p, inside) = dword(self, *off);
+                let run = both(self, guard, inside);
+                let at = self.begin_guarded(run);
+                self.s.m.store(self.cur, p, *x);
+                self.end_guarded(at, &[]);
+            } else {
+                let at = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let (p, inside) = dword(self, off);
+                    let inner = self.begin_guarded(Some(inside));
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(inner, &[]);
+                }
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -6123,17 +6210,23 @@ impl<'a> Lower<'a> {
             None => None,
         };
         let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
-        let outside = match old_reg {
+        let old = match old_reg {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let z = self.s.m.i32(0);
+        let outside = match guard {
+            Some(g) => self.s.m.select(self.cur, g, z, old),
+            None => z,
+        };
+        let (p, inside) = dword(self, offset);
+        let run = both(self, guard, inside);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
             _ => None,
         } {
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(run);
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
@@ -6141,7 +6234,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let at = self.begin_guarded(guard);
+        let at = self.begin_guarded(run);
         // A subtraction of a value that is no constant, as `ds_add` of its negation (HLSL's
         // `InterlockedAdd(shared, -x)`) or as `ds_sub`, is a compare-exchange loop: NVIDIA's
         // compiler refuses `atomicrmw add` of `0 - x` and `atomicrmw sub` on group-shared
@@ -6403,7 +6496,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let cross = match name {
-            "v_readlane_b32" | "ds_bpermute_b32" => true,
+            "v_readlane_b32" => true,
             // (not a waterfall loop's read, the lane's own dword: `Self::valu`)
             "v_readfirstlane_b32" => {
                 !inst.writes.first().is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1))
@@ -6451,8 +6544,7 @@ impl<'a> Lower<'a> {
 
     /// The paired form: an instruction that reads other lanes of the console wave, any of its
     /// 64: `v_readlane_b32` and `v_readfirstlane_b32` (scalar results, the same in both lanes of
-    /// the thread) and `ds_bpermute_b32`. Lane n and lane n + 32 are the lower and the upper
-    /// lane of host lane n.
+    /// the thread). Lane n and lane n + 32 are the lower and the upper lane of host lane n.
     fn paired_cross(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.cross_lane(false)?;
         let c = self.cur;
@@ -6473,7 +6565,8 @@ impl<'a> Lower<'a> {
                 let r = pick(self, lo, hi, lane);
                 self.write_i(inst, r, None)?;
             }
-            "v_readfirstlane_b32" => {
+            _ => {
+                // `v_readfirstlane_b32`
                 let [(lo, in_lo), (hi, in_hi)] = self.both(|l| {
                     let x = l.src(inst, 0)?;
                     let guard = if l.paired_active.is_some() {
@@ -6487,49 +6580,6 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.select(c, in_hi, hi, lo);
                 let r = self.s.m.select(c, in_lo, lo, hi);
                 self.write_i(inst, r, None)?;
-            }
-            _ => {
-                // `ds_bpermute_b32`: each lane reads the lane its address names, which gives
-                // its data, or 0 outside EXEC
-                let Fields::Ds {
-                    dst: Some(Operand::Vector { reg, .. }),
-                    addr: Some(addr),
-                    data,
-                    offset0,
-                    offset1,
-                    ..
-                } = &inst.fields
-                else {
-                    return Err("a permute's operands");
-                };
-                let data = data.first().ok_or("a permute source")?;
-                let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
-                let [(from_lo, x_lo, g_lo), (from_hi, x_hi, g_hi)] = self.both(|l| {
-                    let at = l.vgprs(inst, addr, 1)?[0];
-                    let x = l.vgprs(inst, data, 1)?[0];
-                    let guard = if l.paired_active.is_some() {
-                        l.memory_guard(b, i)
-                    } else {
-                        l.guard(b, i)
-                    }?;
-                    let (o, two) = (l.s.m.i32(offset), l.s.m.i32(2));
-                    let at = l.s.m.bin(c, Bin::Add, at, o);
-                    let from = l.s.m.bin(c, Bin::LShr, at, two);
-                    let x = match guard {
-                        Some(g) => l.s.m.select(c, g, x, z),
-                        None => x,
-                    };
-                    Ok((from, x, guard))
-                })?;
-                let read = [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)];
-                let guards = [g_lo, g_hi];
-                let reg = *reg;
-                self.both(|l| {
-                    let n = usize::from(l.upper);
-                    l.write(inst, Reg::V(reg), read[n], guards[n]);
-                    Ok(())
-                })?;
-                return Ok(());
             }
         }
         self.mirror(inst);
@@ -9735,7 +9785,7 @@ impl<'a> Lower<'a> {
                     return float(self, r);
                 }
                 if v.clamp {
-                    r = self.unary(7, r);
+                    r = self.saturate(r);
                 }
                 // The f16 result goes to one half; the other half stays.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -9765,13 +9815,30 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_cvt_pkrtz_f16_f32" => {
-                let (a, bb) = (f(self, 0)?, f(self, 1)?);
+                let (mut a, mut bb) = (f(self, 0)?, f(self, 1)?);
+                if v.omod != 0 {
+                    let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                    let k = self.s.m.f32(factor.to_bits());
+                    a = self.s.m.bin(c, Bin::Mul, a, k);
+                    bb = self.s.m.bin(c, Bin::Mul, bb, k);
+                }
+                if v.clamp {
+                    a = self.saturate(a);
+                    bb = self.saturate(bb);
+                }
                 let lo = self.f16_toward_zero(a);
                 let hi = self.f16_toward_zero(bb);
                 let sh = self.s.m.i32(16);
                 let hi = self.s.m.bin(c, Bin::Shl, hi, sh);
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
-                int(self, r)
+                // Output modifiers (`omod`/`clamp`) were already applied to each
+                // float lane above, so write directly without `write_i` rejecting them.
+                if let Some(Operand::Vector { reg, .. }) = v.dst {
+                    self.write(inst, Reg::V(reg), r, guard);
+                    Ok(())
+                } else {
+                    Err("a result without a register")
+                }
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
@@ -10070,7 +10137,6 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                let (mine, any) = self.first_lane(a, guard);
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value
                 let alike = match v.src.first() {
@@ -10080,6 +10146,16 @@ impl<'a> Lower<'a> {
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
+                // Alike in every lane the console runs: threads past a DispatchX count
+                // (`partial_active`) skipped the LDS and memory reads it is made of and hold
+                // another value, so the first lane is the first of the others.
+                let guard = match (guard, self.partial_active) {
+                    (g, Some(on)) if halves && alike => {
+                        Some(g.map_or(on, |g| self.s.m.bin(self.cur, Bin::And, g, on)))
+                    }
+                    (g, _) => g,
+                };
+                let (mine, any) = self.first_lane(a, guard);
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
@@ -10377,7 +10453,7 @@ impl<'a> Lower<'a> {
                 }
             }
             if v.clamp {
-                f = l.unary(7, f);
+                f = l.saturate(f);
             }
             // The console rounds to nearest; the host's conversion may round toward zero
             // (NVIDIA's does), one step of the last place lower where the two differ.
@@ -10422,8 +10498,17 @@ impl<'a> Lower<'a> {
                 };
                 let m = self.s.m.i32(0xFFFF);
                 let x = self.s.m.bin(c, Bin::And, x, m);
-                self.s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                let mut acc = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                if v.abs >> 2 & 1 != 0 {
+                    acc = self.unary(6, acc);
+                }
+                if v.neg >> 2 & 1 != 0 {
+                    let z = self.s.m.f32(0x8000_0000);
+                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
+                }
+                acc
             } else {
                 self.half_fsrc(inst, 2)?
             };
@@ -10705,8 +10790,14 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
-            return Err("modifiers on a packed integer operation");
+        if v.omod != 0
+            || v.sdwa.is_some()
+            || v.dpp.is_some()
+            || v.abs != 0
+            || (op == "fmac_f16" && (v.neg != 0 || v.opsel != 0))
+            || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0)
+        {
+            return Err("modifiers on a packed 16-bit operation");
         }
         let c = self.cur;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
@@ -10743,7 +10834,7 @@ impl<'a> Lower<'a> {
                     _ => self.fmad(xs[0], xs[1], xs[2]),
                 };
                 if v.clamp {
-                    f = self.unary(7, f);
+                    f = self.saturate(f);
                 }
                 self.s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
@@ -11601,7 +11692,7 @@ impl<'a> Lower<'a> {
                             f = self.s.m.bin(c, Bin::Mul, f, k);
                         }
                         if clamp {
-                            f = self.unary(7, f);
+                            f = self.saturate(f);
                         }
                         let lo = to_f16(self, f);
                         return self.write_half(inst, lo, None);
@@ -12584,15 +12675,18 @@ impl<'a> Lower<'a> {
             });
         }
         if *d16 {
-            // Two channels per VGPR, low half first (an odd last high half 0).
+            // Two channels per VGPR, low half first.
             let k16 = self.s.m.i32(16);
             xs = xs
                 .chunks(2)
-                .map(|p| match *p {
+                .enumerate()
+                .map(|(k, p)| match *p {
                     [lo, hi] => {
                         let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                         self.s.m.bin(c, Bin::Or, lo, hi)
                     }
+                    // An odd image load only writes the last register's low half.
+                    [lo] if op == 66 => self.low_half(inst, reg + k as u8, lo),
                     _ => p[0],
                 })
                 .collect();
@@ -12980,6 +13074,11 @@ impl<'a> Lower<'a> {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+            // With `VICTORY_NAN_SCRUB=1`, scrub float typed stores only when
+            // the view-kind bits are known and indicate a non-integer format;
+            // leave views whose kind cannot be read unscrubbed so integer
+            // payloads are never corrupted.
+            let scrub_floats = typed && nan_scrub();
             if d16 {
                 // d16 data is taken as f16, widened for the 32-bit float
                 // store; through a view of an integer format it is a 16-bit
@@ -13000,6 +13099,13 @@ impl<'a> Lower<'a> {
                     let f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    // The float alone: through a view of an integer format
+                    // the integer below is stored instead.
+                    let f = if scrub_floats && integer.is_some() {
+                        self.scrub_nan(f)
+                    } else {
+                        f
+                    };
                     let mut w = self.as_int(f);
                     if let Some((int, signed)) = integer {
                         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
@@ -13020,10 +13126,24 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
+                // Whether the view of 32-bit data is of an integer format,
+                // for the scrub (d16 data was scrubbed as it widened).
+                let integer = if scrub_floats && !d16 {
+                    self.integer_view(src)?
+                } else {
+                    None
+                };
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    let f = self.as_float(x);
+                    args.push(match integer {
+                        Some((int, _)) => {
+                            let scrubbed = self.scrub_nan(f);
+                            self.s.m.select(self.cur, int, f, scrubbed)
+                        }
+                        None => f,
+                    });
                 }
                 (69, "bufferStore.f32")
             } else {
@@ -14610,5 +14730,118 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn lds_accesses_are_bounded_by_the_allocation() {
+        // A write, a read, and a returning atomic at an address from v0: each
+        // compares its dword index with `title_lds_dwords` (unsigned) so OOB
+        // reads return 0 and OOB writes/atomics are dropped.
+        let words = [
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD8D8_0000,
+            0x0200_0000, // ds_read_b32 v2, v0
+            0xD880_0000,
+            0x0300_0100, // ds_add_rtn_u32 v3, v0, v1
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![], vec![]).unwrap();
+        assert_eq!(l.lds_bounds, 3, "one bound per LDS access");
+    }
+
+    #[test]
+    fn zero_sized_title_lds_emulates_oob_semantics() {
+        // Zero-sized title LDS (`rsrc2` LDS size bits = 0): every console LDS
+        // address is out of bounds per RDNA2 address checking, so writes drop,
+        // reads and returning atomics yield 0, and no LDS array is touched.
+        // Keep all results live via `v_or_b32` -> `buffer_store_dword` so DCE
+        // cannot elide the LDS instructions.
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+        ];
+        words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+        words.extend_from_slice(&[
+            0xD834_0000,
+            0x0000_0201, // ds_write_b32 v1, v2
+            0xD8D8_0000,
+            0x0200_0001, // ds_read_b32 v2, v1
+            0xD880_0000,
+            0x0300_0401, // ds_add_rtn_u32 v3, v1, v4
+            (0x1Cu32 << 25) | (3 << 9) | (256 + 2), // v_or_b32 v0, v2, v3
+            0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            S_ENDPGM,
+        ]);
+        let constants = RootParam {
+            sgprs: 4,
+            ..root(RootType::Constants, 0, 0)
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let layout = vec![constants, root(RootType::Table, 4, 1)];
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout,
+            used: vec![buffer],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: sgprs.max(2) << 1, // 0 bytes of LDS
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(l.lds_bounds, 0);
+        assert!(!l.dxil.is_empty());
+    }
+
+    #[test]
+    fn packed_fmac_f16_with_dpp_is_rejected() {
+        // Live VOP2 `v_pk_fmac_f16 v0, v1, v2` with DPP16 (`src0 = 0xFA`,
+        // followed by DPP word with vsrc0 = v1, quad_perm [0,1,2,3], masks = 0xF).
+        let vop2_dpp = (0x3Cu32 << 25) | (2 << 9) | 0xFA;
+        let dpp_word = 0xFF00_0001u32 | (0xE4 << 8);
+        let Err(err) = lowers_valu(&[vop2_dpp, dpp_word]) else {
+            panic!("expected DPP on v_pk_fmac_f16 to be rejected");
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "modifiers on a packed 16-bit operation",
+                    ..
+                }
+            ),
+            "expected DPP on v_pk_fmac_f16 to be rejected, got {err:?}"
+        );
     }
 }

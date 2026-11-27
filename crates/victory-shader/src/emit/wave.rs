@@ -793,7 +793,6 @@ fn shapes(
     uni: HashMap<Value, Sym>,
     wave: u32,
 ) -> HashMap<Value, Shape> {
-    let all = u64::MAX >> (64 - wave);
     let mut out = HashMap::new();
     for (v, s) in uni {
         if let Some(sh) = single(s, wave) {
@@ -801,14 +800,14 @@ fn shapes(
         }
     }
     for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
+        if let Some(sh) = per_lane(&lanes, wave) {
             out.insert(v, sh);
         }
     }
     out
 }
 
-fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
+fn per_lane(lanes: &[Sym], wave: u32) -> Option<Shape> {
     let first = lanes[0];
     let own = |l: usize, s: Sym| match s {
         Sym::Red {
@@ -826,25 +825,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         return Some(Shape::Masked(m.0, m.1, m.2));
     }
     if lanes.iter().all(|&s| s == first) {
-        return match first {
-            Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
-            Sym::Red {
-                op: Some(op),
-                src,
-                mask,
-                ident,
-                lanes,
-            } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
-            Sym::Half64 {
-                high,
-                lo,
-                hi,
-                mask,
-                lanes,
-            } if lanes == all => Some(Shape::Sum64 { high, lo, hi, mask }),
-            _ => None,
-        };
+        return single(first, wave);
     }
     // Prefixes: lane l holds lanes 0..l (exclusive) or 0..=l (inclusive).
     let mut meta: Option<(Value, Value, u32, bool)> = None;
@@ -1010,17 +991,17 @@ mod tests {
         };
         let inclusive: Vec<Sym> = (0..64).map(|l| red(u64::MAX >> (63 - l))).collect();
         assert_eq!(
-            per_lane(&inclusive, u64::MAX),
+            per_lane(&inclusive, 64),
             Some(Shape::Prefix(Op::AddU, x, m, 0, true))
         );
         let mut exclusive: Vec<Sym> = (0..64).map(|l| red((1u64 << l) - 1)).collect();
         exclusive[0] = Sym::K(0);
         assert_eq!(
-            per_lane(&exclusive, u64::MAX),
+            per_lane(&exclusive, 64),
             Some(Shape::Prefix(Op::AddU, x, m, 0, false))
         );
         assert_eq!(
-            per_lane(&vec![red(u64::MAX); 64], u64::MAX),
+            per_lane(&vec![red(u64::MAX); 64], 64),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
     }
@@ -1278,7 +1259,8 @@ mod tests {
             lanes,
         };
 
-        for (wave, all) in [(32usize, u64::from(u32::MAX)), (64usize, u64::MAX)] {
+        for wave in [32usize, 64usize] {
+            let w = wave as u32;
             let below_mask = |l: usize| if l == 0 { 0 } else { (1u64 << l) - 1 };
 
             let mut valid_inc: Vec<Sym> = (0..wave)
@@ -1286,7 +1268,7 @@ mod tests {
                 .collect();
             valid_inc[0] = red(None, v0, m0, 0, 1);
             assert_eq!(
-                per_lane(&valid_inc, all),
+                per_lane(&valid_inc, w),
                 Some(Shape::Prefix(Op::AddU, v0, m0, 0, true))
             );
 
@@ -1296,25 +1278,25 @@ mod tests {
             valid_exc[0] = Sym::K(0);
             valid_exc[1] = red(None, v0, m0, 0, 1);
             assert_eq!(
-                per_lane(&valid_exc, all),
+                per_lane(&valid_exc, w),
                 Some(Shape::Prefix(Op::AddU, v0, m0, 0, false))
             );
 
             let mut mixed_other_src = valid_exc.clone();
             mixed_other_src[0] = red(None, v_other, m0, 0, 1);
-            assert_eq!(per_lane(&mixed_other_src, all), None);
+            assert_eq!(per_lane(&mixed_other_src, w), None);
 
             let mut mixed_same_src = valid_exc.clone();
             mixed_same_src[0] = red(None, v0, m0, 0, 1);
-            assert_eq!(per_lane(&mixed_same_src, all), None);
+            assert_eq!(per_lane(&mixed_same_src, w), None);
 
             let mut exc_bad_lane1_src = valid_exc.clone();
             exc_bad_lane1_src[1] = red(None, v_other, m0, 0, 1);
-            assert_eq!(per_lane(&exc_bad_lane1_src, all), None);
+            assert_eq!(per_lane(&exc_bad_lane1_src, w), None);
 
             let mut exc_bad_lane1_set = valid_exc.clone();
             exc_bad_lane1_set[1] = red(None, v0, m0, 0, 0b11);
-            assert_eq!(per_lane(&exc_bad_lane1_set, all), None);
+            assert_eq!(per_lane(&exc_bad_lane1_set, w), None);
 
             for bad0 in [
                 red(None, v0, m0, 1, 1),
@@ -1325,14 +1307,14 @@ mod tests {
             ] {
                 let mut bad_inc = valid_inc.clone();
                 bad_inc[0] = bad0;
-                assert_eq!(per_lane(&bad_inc, all), None);
+                assert_eq!(per_lane(&bad_inc, w), None);
             }
 
             let mut bad_ident: Vec<Sym> = (0..wave)
                 .map(|l| red(Some(Op::AddU), v0, m0, 1, below_mask(l) | (1u64 << l)))
                 .collect();
             bad_ident[0] = red(None, v0, m0, 1, 1);
-            assert_eq!(per_lane(&bad_ident, all), None);
+            assert_eq!(per_lane(&bad_ident, w), None);
         }
     }
 }

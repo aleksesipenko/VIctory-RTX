@@ -573,6 +573,10 @@ impl Module {
     }
 
     pub fn write(&self) -> Vec<u8> {
+        self.write_with_fast_bits(u64::from(super::fast_math_bits()))
+    }
+
+    pub(crate) fn write_with_fast_bits(&self, fast_bits: u64) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -862,6 +866,13 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    // LLVM 3.7 fast-math flags on 32-bit float binary ops (opt-in via
+                    // `VICTORY_SHADER_FAST_BITS` / `opt::FAST`).
+                    Op::Bin(op, a, b)
+                        if fast_bits != 0 && self.types[inst.ty.0 as usize] == TypeDef::Float =>
+                    {
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, fast_bits])
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),

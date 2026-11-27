@@ -46,6 +46,18 @@ impl StaticSampler {
         }
     }
 
+    /// The mip LOD bias clamped to D3D12's `[-16.0, 15.99]` static-sampler
+    /// range (`D3D12_MIP_LOD_BIAS_MIN..=D3D12_MIP_LOD_BIAS_MAX`). The
+    /// hardware's signed 14-bit 6.8 field spans `[-32.0, +31.996]`, which
+    /// `D3D12SerializeVersionedRootSignature` rejects when left unclamped.
+    pub fn mip_lod_bias_for_host(&self) -> f32 {
+        if self.mip_lod_bias.is_nan() {
+            0.0
+        } else {
+            self.mip_lod_bias.clamp(-16.0, 15.99)
+        }
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -215,5 +227,17 @@ mod tests {
 
         let linear_mip = StaticSampler::from_words([0, w1, 2 << 26, 0]);
         assert_eq!(linear_mip.filter, 1);
+    }
+
+    #[test]
+    fn mip_lod_bias_for_host_clamps_to_d3d12_range() {
+        let with = |bias: f32| StaticSampler {
+            mip_lod_bias: bias,
+            ..StaticSampler::from_words([0; 4])
+        };
+        assert_eq!(with(-32.0).mip_lod_bias_for_host(), -16.0);
+        assert_eq!(with(31.996).mip_lod_bias_for_host(), 15.99);
+        assert_eq!(with(f32::NAN).mip_lod_bias_for_host(), 0.0);
+        assert_eq!(with(-2.5).mip_lod_bias_for_host(), -2.5);
     }
 }

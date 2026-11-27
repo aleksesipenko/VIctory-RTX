@@ -542,11 +542,15 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             slot: e[22],
         };
         let sgprs = match root {
-            RootType::Table => 1,
+            // All three are 32-bit heap/table base addresses in one user SGPR.
+            // The resource tracer already treats both dynamic heap roots as
+            // 32-bit addresses with a zero high half.
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => 1,
+            // A root descriptor is a 64-bit address in two user SGPRs.
             RootType::Descriptor => 2,
-            // The code holds its words; no user data.
+            // The code holds immediate sampler words; no user data is needed.
             RootType::ImmediateSampler => 0,
-            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+            _ => return Err(ShaderError::FspxRootType(e[5])),
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
             layout.push(RootParam {
