@@ -855,7 +855,7 @@ impl Lanes {
             let &(seq, ref read) = lane.reads.front()?;
             (seq, staging_bytes(&read.request))
         };
-        if self.staged > 0 && self.staged + staging > self.staging {
+        if self.staged > 0 && self.staged.saturating_add(staging) > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
@@ -973,16 +973,29 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Upper bound on the temporary buffers a request may hold while it runs.
+/// Provenance (GPL-3.0): mauroalvare / LooperSalty/AnyXboxX #319 (2d99e48).
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
+    let options = request.options;
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let source = u64::from(request.source_size);
+    let mut bytes = if compressed && options & MEMORY_SOURCE == 0 {
+        source
     } else {
         0
+    };
+    if options & ZLIB != 0 && options & BCPACK != 0 {
+        bytes = bytes.saturating_add(u64::from(request.intermediate_size));
     }
+    // A destination spread across physical allocations may require a scatter buffer.
+    if options & PAGE_DESTINATION != 0 {
+        bytes = bytes.saturating_add(if compressed {
+            u64::from(request.destination_size)
+        } else {
+            source
+        });
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -2307,6 +2320,45 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_limits_scatter_buffers_for_memory_sources() {
+        let mut lanes = lanes(100);
+        lanes.lanes.insert(0, Lane::new(0, 64));
+        let options = MEMORY_SOURCE | PAGE_DESTINATION;
+        read(&mut lanes, 0, options, 60);
+        read(&mut lanes, 0, options, 60);
+        lanes.submit(0, false);
+        let first = lanes.start().unwrap();
+        assert_eq!(first.staging, 60);
+        assert!(lanes.start().is_none(), "another scatter buffer would exceed 100 bytes");
+        lanes.finish(&first, Ok(()));
+        let second = lanes.start().unwrap();
+        assert_eq!(second.staging, 60);
+        lanes.finish(&second, Ok(()));
+        assert_eq!(lanes.staged, 0);
+    }
+
+    #[test]
+    fn staging_counts_compressed_input_intermediate_and_scatter_storage() {
+        let mut r = request(ZLIB | 2 | PAGE_DESTINATION, std::ptr::null_mut(), 80, std::ptr::null(), 0, 30);
+        r.intermediate_size = 50;
+        assert_eq!(staging_bytes(&r), 30 + 50 + 80);
+        r.options |= MEMORY_SOURCE;
+        assert_eq!(staging_bytes(&r), 50 + 80);
+        // Uncompressed file -> physical pages still needs up to source_size for scatter.
+        r.options = PAGE_DESTINATION;
+        assert_eq!(staging_bytes(&r), 30);
+        // Raw file -> contiguous address needs no temporary buffer.
+        r.options = 0;
+        assert_eq!(staging_bytes(&r), 0);
+        // Saturating addition handles extreme u32 sizes without overflow.
+        let mut huge = request(ZLIB | 2 | PAGE_DESTINATION, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
+        huge.source_size = u32::MAX;
+        huge.intermediate_size = u32::MAX;
+        huge.destination_size = u32::MAX;
+        assert_eq!(staging_bytes(&huge), u64::from(u32::MAX) * 3);
     }
 
     #[test]

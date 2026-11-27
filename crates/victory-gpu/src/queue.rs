@@ -159,10 +159,13 @@ fn submit_cut(this: This, lists: &[This]) {
             first < lists.len()
         )
     });
-    if first > 0 && crate::host::late() {
+    if cut_can_detach_prefix(lists, first, crate::host::late()) {
         // Sent to the card and not waited for: their host sides are taken
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
+        // Only safe when no list in `lists[..first]` is also named in
+        // `lists[first..]`; otherwise `detach` would consume its recording
+        // before `detach_parts(&lists[first..])` sees it.
         let (taken, order) = crate::list::detach(&lists[..first]);
         host.execute_late(taken, order);
     } else if first > 0 {
@@ -171,12 +174,11 @@ fn submit_cut(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
-        // They have run: their descriptor tables' slots are free again, as
-        // on the path without cuts ([`execute`]). This path replaced that
-        // one without the call, so the lists that run at once kept their
-        // slots until the title's reset and the ring ran out as before
-        // (run 45: 3,143 of 15,942 tables refused in one frame).
-        crate::list::tables_done(&lists[..first]);
+        // They have run: return dynamic descriptor table slots only for lists
+        // not also held in `lists[first..]`, so a repeated list recording
+        // (`[A, B, A]`) keeps its slots intact for the held suffix.
+        let done = split_tables_done(lists, first);
+        crate::list::tables_done(&done);
     }
     if first < lists.len() {
         let parts = crate::list::detach_parts(&lists[first..]);
@@ -206,6 +208,37 @@ fn submit_cut(this: This, lists: &[This]) {
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
     release_held(false);
+}
+
+/// Whether the immediate prefix `lists[..cut]` shares any list pointer with the
+/// held suffix `lists[cut..]`.
+#[cfg(any(windows, test))]
+fn split_overlaps_held(lists: &[This], cut: usize) -> bool {
+    let held = &lists[cut..];
+    lists[..cut].iter().any(|l| held.contains(l))
+}
+
+/// Whether `submit_cut` may detach and asynchronously execute `lists[..first]`.
+/// Detaching steals each list's host recording, so overlapping submissions like
+/// `[A, B, A]` must execute the prefix synchronously instead to preserve `A`'s
+/// recording and slots for `detach_parts(&lists[first..])`.
+#[cfg(any(windows, test))]
+fn cut_can_detach_prefix(lists: &[This], first: usize, late: bool) -> bool {
+    first > 0 && late && !split_overlaps_held(lists, first)
+}
+
+/// Immediate-prefix lists (`lists[..cut]`) that are not also named again in the
+/// held suffix (`lists[cut..]`), so their dynamic descriptor table slots can be
+/// returned without freeing slots still needed by a repeated list recording.
+/// Provenance (GPL-3.0): Bebrik229/VIctory-NVIDIA-Hybrid #2.
+#[cfg(any(windows, test))]
+fn split_tables_done(lists: &[This], cut: usize) -> Vec<This> {
+    let held = &lists[cut..];
+    lists[..cut]
+        .iter()
+        .copied()
+        .filter(|l| !held.contains(l))
+        .collect()
 }
 
 /// A submission to a queue that honours waits, list by list ([`split`]).
@@ -246,9 +279,11 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
-        // Provenance (GPL-3.0): fxceless #1320 — return dynamic table slots once
-        // the immediate prefix has executed.
-        crate::list::tables_done(&lists[..cut]);
+        // Provenance (GPL-3.0): fxceless #1320 (immediate slot return) +
+        // Bebrik229/VIctory-NVIDIA-Hybrid #2 (keep slots of any list also held
+        // behind the wait in `lists[cut..]`).
+        let done = split_tables_done(lists, cut);
+        crate::list::tables_done(&done);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -1417,5 +1452,53 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn submit_split_tables_done_excludes_held_lists() {
+        let a = 0x1000 as This;
+        let b = 0x2000 as This;
+        let c = 0x3000 as This;
+        let d = 0x4000 as This;
+        // Disjoint prefix and suffix: every prefix list returns its slots.
+        assert_eq!(split_tables_done(&[a, b, c, d], 2), vec![a, b]);
+        // A list repeated behind the wait stays out of `tables_done`, while
+        // non-overlapping prefix lists (including duplicates within the prefix)
+        // still return theirs.
+        assert_eq!(split_tables_done(&[a, b, a, c, b, d], 3), vec![a, a]);
+        // Every prefix list also held behind the wait: nothing returned now.
+        assert_eq!(split_tables_done(&[a, b, b, a], 2), Vec::<This>::new());
+        // Boundary cuts: none immediate, or all immediate.
+        assert_eq!(split_tables_done(&[a, b], 0), Vec::<This>::new());
+        assert_eq!(split_tables_done(&[a, b], 2), vec![a, b]);
+    }
+
+    #[test]
+    fn submit_cut_preserves_duplicate_list_recording_and_slots() {
+        let a = 0x1000 as This;
+        let b = 0x2000 as This;
+        let x = 0x3000 as This;
+        let y = 0x4000 as This;
+
+        // `[A, B, A]` split at `B` (`first = 1`): `A` also appears in the held
+        // suffix, so the prefix must not be detached (`execute_late`) and `A`
+        // must be excluded from `tables_done`.
+        assert!(split_overlaps_held(&[a, b, a], 1));
+        assert!(!cut_can_detach_prefix(&[a, b, a], 1, true));
+        assert_eq!(split_tables_done(&[a, b, a], 1), Vec::<This>::new());
+
+        // `[X, A, B, A]` split at `B` (`first = 2`): cannot detach prefix because
+        // `A` overlaps, while `X` still returns its slots after synchronous run.
+        assert!(split_overlaps_held(&[x, a, b, a], 2));
+        assert!(!cut_can_detach_prefix(&[x, a, b, a], 2, true));
+        assert_eq!(split_tables_done(&[x, a, b, a], 2), vec![x]);
+
+        // Disjoint `[X, Y, B]` split at `B` (`first = 2`): async detach allowed
+        // when `late` is on, and both `X` and `Y` return slots on sync path.
+        assert!(!split_overlaps_held(&[x, y, b], 2));
+        assert!(cut_can_detach_prefix(&[x, y, b], 2, true));
+        assert!(!cut_can_detach_prefix(&[x, y, b], 2, false));
+        assert!(!cut_can_detach_prefix(&[x, y, b], 0, true));
+        assert_eq!(split_tables_done(&[x, y, b], 2), vec![x, y]);
     }
 }

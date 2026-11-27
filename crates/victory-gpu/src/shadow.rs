@@ -136,6 +136,8 @@ struct Card {
     self_weak: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Quota split granted to this card side inside [`card_limits`]' total cap.
+    grant: CardBudgetGrant,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -257,6 +259,106 @@ fn card_limits() -> (u64, u64) {
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Subset of `CARD_BYTES[0]` drawn from the room kept for late >= 16 MiB copies.
+static CARD_RESERVED: AtomicU64 = AtomicU64::new(0);
+static CARD_ADMISSION: Mutex<()> = Mutex::new(());
+
+/// Quota split granted to a card-backed shadow inside [`card_limits`]' total cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CardBudgetGrant {
+    general: u64,
+    reserve: u64,
+}
+
+impl CardBudgetGrant {
+    fn total(self) -> u64 {
+        self.general.saturating_add(self.reserve)
+    }
+}
+
+/// Keep at most one eighth of the existing quota (capped at 64 MiB) for large
+/// buffers (`>= 16 MiB`) first used after other copies have filled ordinary room.
+/// Provenance (GPL-3.0): Xyzstk / DoubleGhosty/cool_fox #40 (9605006).
+fn card_reserve(most: u64) -> u64 {
+    let bytes = (most / 8).min(64 << 20) / 65536 * 65536;
+    if bytes >= 16 << 20 { bytes } else { 0 }
+}
+
+/// Choose general and/or reserved quota inside the same total cap `most`.
+/// A `>= 16 MiB` copy may span both remaining general quota and remaining
+/// reserved room when their sum covers `size`.
+fn card_budget_pick(size: u64, len: u64, used: u64, reserved: u64, most: u64) -> Option<CardBudgetGrant> {
+    if size > most.saturating_sub(used) {
+        return None;
+    }
+    let reserve = card_reserve(most);
+    let general_cap = most.saturating_sub(reserve);
+    let general_used = used.saturating_sub(reserved);
+    let remaining_general = general_cap.saturating_sub(general_used);
+    if size <= remaining_general {
+        return Some(CardBudgetGrant {
+            general: size,
+            reserve: 0,
+        });
+    }
+    let remaining_reserve = reserve.saturating_sub(reserved);
+    // Large buffers (`>= 16 MiB`) — or a single oversized first copy fitting `most` —
+    // may draw remaining general room plus reserved room up to `remaining_reserve`.
+    if len >= 16 << 20 || (general_used == 0 && size > general_cap) {
+        let general_take = remaining_general.min(size);
+        let reserve_take = size - general_take;
+        if reserve_take <= remaining_reserve {
+            return Some(CardBudgetGrant {
+                general: general_take,
+                reserve: reserve_take,
+            });
+        }
+    }
+    None
+}
+
+fn card_acquire_budget(size: u64, len: u64, most: u64) -> Option<CardBudgetGrant> {
+    let _admission = CARD_ADMISSION.lock().unwrap_or_else(|e| e.into_inner());
+    let live = CARD_BYTES[0].load(Ordering::Relaxed);
+    let kept = CARD_RESERVED.load(Ordering::Relaxed);
+    let grant = card_budget_pick(size, len, live, kept, most)?;
+    CARD_BYTES[0].fetch_add(grant.total(), Ordering::Relaxed);
+    if grant.reserve > 0 {
+        CARD_RESERVED.fetch_add(grant.reserve, Ordering::Relaxed);
+    }
+    Some(grant)
+}
+
+fn card_release(grant: CardBudgetGrant) {
+    let total = grant.total();
+    if total == 0 {
+        return;
+    }
+    let _admission = CARD_ADMISSION.lock().unwrap_or_else(|e| e.into_inner());
+    CARD_BYTES[0].fetch_sub(total, Ordering::Relaxed);
+    if grant.reserve > 0 {
+        CARD_RESERVED.fetch_sub(grant.reserve, Ordering::Relaxed);
+    }
+}
+
+/// Reserves card quota under [`CARD_ADMISSION`], drops the lock before invoking
+/// `alloc`, and rolls back both general and reserved bytes if `alloc` returns `None`.
+fn card_allocate_with<T>(
+    size: u64,
+    len: u64,
+    most: u64,
+    alloc: impl FnOnce(u64) -> Option<T>,
+) -> Option<(T, CardBudgetGrant)> {
+    let grant = card_acquire_budget(size, len, most)?;
+    // Admission bookkeeping is released before calling the driver.
+    match alloc(size) {
+        Some(buffer) => Some((buffer, grant)),
+        None => {
+            card_release(grant);
+            None
+        }
+    }
+}
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
@@ -358,8 +460,13 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
+///
+/// `count_toward_reserve_decay` is `true` for persistent title buffers
+/// ([`lookup`]) whose refusal permanently reduces [`card_room_kept`], and
+/// `false` for temporary view alignment copies ([`exact`]) whose transient
+/// churn must not drain the persistent late-buffer reserve.
+fn card_for(size: u64, len: u64, count_toward_reserve_decay: bool) -> Option<(ID3D12Resource, CardBudgetGrant)> {
+    let there = card_room_for(size, len, count_toward_reserve_decay);
     if there.is_some() || !card_all() || size >= 1 << 30 {
         return there;
     }
@@ -369,8 +476,15 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let (buffer, _) = host.shared_buffer(size)?;
+    let _admission = CARD_ADMISSION.lock().unwrap_or_else(|e| e.into_inner());
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some((
+        buffer,
+        CardBudgetGrant {
+            general: size,
+            reserve: 0,
+        },
+    ))
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -387,13 +501,56 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
+fn card_size_eligible(size: u64, len: u64, least: u64) -> bool {
+    // The minimum describes title data, not committed-resource padding.
+    // A 1 KiB constant buffer needs a 64 KiB allocation, but must not
+    // consume the quota intended for buffers of at least 64 KiB.
+    len >= least && size < 1 << 30
+}
+
+/// Records a VRAM-usage gate refusal against [`CARD_REFUSED`] only for
+/// persistent buffers (`count_toward_reserve_decay == true`) so temporary
+/// `exact()` rejections never shrink [`card_room_kept`].
+fn note_card_vram_refusal(
+    size: u64,
+    used: u64,
+    budget: u64,
+    hundredths: u64,
+    most: u64,
+    count_toward_reserve_decay: bool,
+) {
+    if !count_toward_reserve_decay {
+        return;
+    }
+    // Said, with the numbers it was decided by: run 193 made 31 copies
+    // of 95 and no line named the others. The first 64, then every
+    // 32nd.
+    let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+    if n <= 64 || n.is_multiple_of(32) {
+        tracing::info!(
+            "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
+             {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
+            size >> 10,
+            used >> 20,
+            budget >> 20,
+            (budget / 100 * hundredths) >> 20,
+            CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+            most >> 20,
+            n,
+            bytes >> 20,
+            crate::frame::current()
+        );
+    }
+}
+
 /// [`card_for`] in the card's own memory.
-fn card_room_for(size: u64) -> Option<ID3D12Resource> {
+fn card_room_for(size: u64, len: u64, count_toward_reserve_decay: bool) -> Option<(ID3D12Resource, CardBudgetGrant)> {
     if !cards() {
         return None;
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
+    if !card_size_eligible(size, len, least) {
         return None;
     }
     let host = host()?;
@@ -412,37 +569,22 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
     {
-        // Said, with the numbers it was decided by: run 193 made 31 copies
-        // of 95 and no line named the others. The first 64, then every
-        // 32nd.
-        let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
-        let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
-        if n <= 64 || n.is_multiple_of(32) {
-            tracing::info!(
-                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
-                 {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
-                size >> 10,
-                used >> 20,
-                budget >> 20,
-                (budget / 100 * hundredths) >> 20,
-                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
-                most >> 20,
-                n,
-                bytes >> 20,
-                crate::frame::current()
-            );
+        note_card_vram_refusal(size, used, budget, hundredths, most, count_toward_reserve_decay);
+        // VRAM usage gate refused this copy: kick off retirement of any stale
+        // idle carded `EXACT` entries even below the proactive pressure share.
+        maybe_reclaim_idle_carded_exact();
+        return None;
+    }
+    match card_allocate_with(size, len, most, |bytes| host.uav_buffer(bytes)) {
+        Some(allocated) => Some(allocated),
+        None => {
+            // Quota or VRAM allocation failed: kick off retirement of stale
+            // idle carded `EXACT` copies so card budget frees once their
+            // in-flight submissions drain.
+            maybe_reclaim_idle_carded_exact();
+            None
         }
-        return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
-    }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-    }
-    buffer
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -522,6 +664,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        maybe_reclaim_idle_carded_exact();
         return None;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -531,6 +674,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        maybe_reclaim_idle_carded_exact();
     }
     made
 }
@@ -558,6 +702,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        maybe_reclaim_idle_carded_exact();
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -567,6 +712,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        maybe_reclaim_idle_carded_exact();
     }
     buffer
 }
@@ -2768,7 +2914,7 @@ impl Drop for Shadow {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
-                CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
+                card_release(card.grant);
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
@@ -5360,6 +5506,7 @@ impl Shadow {
                 touched: Default::default(),
                 self_weak: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
+                grant: CardBudgetGrant::default(),
             });
         }
         let shadow = Arc::new(shadow);
@@ -5528,6 +5675,7 @@ mod land_tests {
             touched: Default::default(),
             self_weak: Default::default(),
             size: len as u64,
+            grant: super::CardBudgetGrant::default(),
         });
         Some(shadow)
     }
@@ -5768,13 +5916,21 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    let before = {
+        buffers().insert(
+            (start, resource),
+            Entry {
+                end: start + len,
+                shadow: None,
+            },
+        )
+    };
+    // A buffer made again at the same place and address: retire its old copy
+    // outside `BUFFERS`'s lock because lists and descriptors may still name it.
+    // Provenance (GPL-3.0): DoubleGhosty/cool_fox @ 6d813b4.
+    if let Some(shadow) = before.and_then(|e| e.shadow) {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -5931,7 +6087,7 @@ fn lookup(
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && (size >= card_limits().0 || card_all());
+        let big = cards() && (len >= card_limits().0 || card_all());
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
@@ -5948,33 +6104,44 @@ fn lookup(
         // memory, and the one just made is the CPU's side. Reserve LOCAL VRAM
         // only when allocating a card-resident buffer so system-RAM DXR inputs
         // are never falsely rejected by the LOCAL VRAM peak guard.
-        let card_budget = budget.map(|b| b.reserve(size)).transpose();
-        let (buffer, card) = match card_budget
-            .ok()
-            .and_then(|res| card_for(size).map(|on_card| (res, on_card)))
-        {
-            Some((reservation, on_card)) => {
-                if let Some(r) = reservation {
-                    r.finish_shadow(&on_card).ok()?;
+        let (buffer, card) = if big && size < 1 << 30 {
+            let card_budget = budget.map(|b| b.reserve(size)).transpose().map_err(|_| ());
+            match admit_card_with(
+                card_budget,
+                || card_for(size, len, true),
+                || {
+                    maybe_reclaim_idle_carded_exact();
+                },
+            ) {
+                Some((reservation, (on_card, grant))) => {
+                    if let Some(r) = reservation
+                        && r.finish_shadow(&on_card).is_err()
+                    {
+                        card_release(grant);
+                        return None;
+                    }
+                    crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                    let card = Card {
+                        staging: buffer,
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        touched: Default::default(),
+                        self_weak: Default::default(),
+                        size,
+                        grant,
+                    };
+                    (on_card, Some(card))
                 }
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    touched: Default::default(),
-                    self_weak: Default::default(),
-                    size,
-                };
-                (on_card, Some(card))
+                None => (buffer, None),
             }
-            None => (buffer, None),
+        } else {
+            (buffer, None)
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6200,6 +6367,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         touched: Default::default(),
         self_weak: Default::default(),
         size: len,
+        grant: CardBudgetGrant::default(),
     });
     let shadow = Arc::new(shadow);
     register_carded(&shadow);
@@ -6222,8 +6390,8 @@ fn loose(
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
         let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
+        if shadow.used.load(Ordering::Relaxed) < now {
+            shadow.used.fetch_max(now, Ordering::Relaxed);
         }
         if shadow.asked[0].load(Ordering::Relaxed) > address {
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
@@ -6282,12 +6450,19 @@ fn loose(
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     // Reserve LOCAL VRAM only for card-resident paths; if DXR VRAM is at cap,
-    // fall through to a system-RAM shared buffer instead of failing the lookup.
-    if let Ok(reservation) = budget.map(|b| b.reserve(charge)).transpose()
-        && let Some((buffer, data)) = window_mapped_for(len)
-    {
-        if let Some(r) = reservation {
-            r.finish_shadow(&buffer).ok()?;
+    // trigger idle carded `EXACT` reclaim and fall through to a shared buffer.
+    if let Some((reservation, (buffer, data))) = admit_card_with(
+        budget.map(|b| b.reserve(charge)).transpose().map_err(|_| ()),
+        || window_mapped_for(len),
+        || {
+            maybe_reclaim_idle_carded_exact();
+        },
+    ) {
+        if let Some(r) = reservation
+            && r.finish_shadow(&buffer).is_err()
+        {
+            WINDOW_MAPPED_BYTES.fetch_sub(len, Ordering::Relaxed);
+            return None;
         }
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
@@ -6304,14 +6479,20 @@ fn loose(
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let card_budget = budget.map(|b| b.reserve(charge)).transpose();
-    let (buffer, card) = match card_budget
-        .ok()
-        .and_then(|res| window_card_for(len).map(|on_card| (res, on_card)))
-    {
+    let card_budget = budget.map(|b| b.reserve(charge)).transpose().map_err(|_| ());
+    let (buffer, card) = match admit_card_with(
+        card_budget,
+        || window_card_for(len),
+        || {
+            maybe_reclaim_idle_carded_exact();
+        },
+    ) {
         Some((reservation, on_card)) => {
-            if let Some(r) = reservation {
-                r.finish_shadow(&on_card).ok()?;
+            if let Some(r) = reservation
+                && r.finish_shadow(&on_card).is_err()
+            {
+                WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                return None;
             }
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
@@ -6322,6 +6503,7 @@ fn loose(
                 touched: Default::default(),
                 self_weak: Default::default(),
                 size: len,
+                grant: CardBudgetGrant::default(),
             };
             (on_card, Some(card))
         }
@@ -6353,9 +6535,338 @@ type ExactMap = std::collections::HashMap<(u64, u64), (Arc<Shadow>, AtomicU64)>;
 static EXACT: std::sync::OnceLock<std::sync::RwLock<ExactMap>> = std::sync::OnceLock::new();
 static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
 static EXACT_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Approximate live bytes of card-backed shadows currently held in [`EXACT`].
+static EXACT_CARDED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Idle thresholds for proactive/pressure reclamation of carded [`EXACT`] copies.
+const EXACT_CARD_PRESSURE_TICKS: u64 = 256;
+const EXACT_CARD_IDLE_MS: u64 = 2_000;
+const EXACT_CARD_IDLE_FRAMES: u64 = 4;
+
+fn exact_card_pressure_limit(most: u64) -> u64 {
+    most / 4
+}
 
 fn exact_map() -> &'static std::sync::RwLock<ExactMap> {
     EXACT.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::with_capacity(2048)))
+}
+
+/// Disposes evicted [`EXACT`] shadows after `exact_map()`'s lock has been dropped.
+/// Shared-only buffers with an exclusive `Arc` are recycled into [`EXACT_POOL`];
+/// every carded or placed shadow (and any shadow whose `Arc` was concurrently
+/// upgraded, e.g. via [`CARDED`]'s `Weak`) is unconditionally retired via `retire`
+/// so GPU resources never drop before the fence.
+fn dispose_exact_evicted(
+    evicted: Vec<Arc<Shadow>>,
+    stamp: u64,
+    mut retire: impl FnMut(Arc<Shadow>),
+) {
+    for shadow in evicted {
+        if shadow.card.is_some() || shadow.place.is_some() {
+            retire(shadow);
+            continue;
+        }
+        match Arc::try_unwrap(shadow) {
+            Ok(s) => {
+                let buf = s.buffer.clone();
+                let data = s.data;
+                let cap = s.width();
+                drop(s);
+                exact_pool_put(buf, data, cap, stamp);
+            }
+            Err(shadow) => retire(shadow),
+        }
+    }
+}
+
+/// Removes idle card-backed entries from `map` (oldest first) so stale large
+/// alignment copies cannot monopolize card VRAM quota below `MANY` entries.
+fn sweep_idle_carded_exact_with(
+    map: &mut ExactMap,
+    now: u64,
+    idle_ticks: u64,
+    is_exclusive: impl Fn(&Arc<Shadow>, &Card) -> bool,
+    is_time_idle: impl Fn(u64) -> bool,
+) -> Vec<Arc<Shadow>> {
+    let mut candidates: Vec<(u64, (u64, u64))> = map
+        .iter()
+        .filter_map(|(&key, (shadow, used))| {
+            let card = shadow.card.as_ref()?;
+            if !is_exclusive(shadow, card) {
+                return None;
+            }
+            let last_tick = used.load(Ordering::Relaxed);
+            let tick_idle = last_tick.saturating_add(idle_ticks) <= now;
+            let time_idle = is_time_idle(shadow.used.load(Ordering::Relaxed));
+            (tick_idle || time_idle).then_some((last_tick, key))
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|&(tick, _)| tick);
+    let mut evicted = Vec::with_capacity(candidates.len());
+    let mut removed_bytes = 0u64;
+    for (_, key) in candidates {
+        if let Some((shadow, _)) = map.remove(&key) {
+            if let Some(card) = &shadow.card {
+                removed_bytes = removed_bytes.saturating_add(card.size);
+            }
+            evicted.push(shadow);
+        }
+    }
+    if removed_bytes > 0 {
+        let cur = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+        EXACT_CARDED_BYTES.store(cur.saturating_sub(removed_bytes), Ordering::Relaxed);
+    }
+    evicted
+}
+
+/// Cooldowns so repeated misses or consecutive refusals never spin scanning a
+/// full [`EXACT`] map on every call.
+const EXACT_PROACTIVE_SWEEP_COOLDOWN: u64 = 64;
+const EXACT_REFUSAL_SWEEP_MS: u64 = 16;
+const EXACT_REFUSAL_SWEEP_TICKS: u64 = 32;
+static EXACT_LAST_PROACTIVE_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// Tracks the `(frame, coarse_ms, exact_tick)` of the last **completed**
+/// refusal-triggered [`EXACT`] reclaim sweep. Updated only after `EXACT`'s
+/// write lock is acquired and the sweep actually runs, so a contended
+/// `try_write()` never suppresses subsequent refusals.
+struct RefusalSweepCooldown {
+    /// `0` means no refusal sweep has completed yet; otherwise `frame + 1`.
+    last_frame_plus_one: AtomicU64,
+    last_ms: AtomicU64,
+    last_tick: AtomicU64,
+}
+
+impl RefusalSweepCooldown {
+    const fn new() -> Self {
+        Self {
+            last_frame_plus_one: AtomicU64::new(0),
+            last_ms: AtomicU64::new(0),
+            last_tick: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns `true` if no refusal sweep has completed yet or if at least one
+    /// new frame, [`EXACT_REFUSAL_SWEEP_MS`] ms, or
+    /// [`EXACT_REFUSAL_SWEEP_TICKS`] ticks have elapsed since the last one.
+    fn ready(&self, frame: u64, now_ms: u64, now_tick: u64) -> bool {
+        let stored_frame = self.last_frame_plus_one.load(Ordering::Acquire);
+        if stored_frame == 0 {
+            return true;
+        }
+        let last_frame = stored_frame - 1;
+        let last_ms = self.last_ms.load(Ordering::Relaxed);
+        let last_tick = self.last_tick.load(Ordering::Relaxed);
+        frame > last_frame
+            || now_ms.saturating_sub(last_ms) >= EXACT_REFUSAL_SWEEP_MS
+            || now_tick.saturating_sub(last_tick) >= EXACT_REFUSAL_SWEEP_TICKS
+    }
+
+    /// Records a completed sweep while the caller holds `EXACT`'s write lock.
+    fn record(&self, frame: u64, now_ms: u64, now_tick: u64) {
+        self.last_ms.fetch_max(now_ms, Ordering::Relaxed);
+        self.last_tick.fetch_max(now_tick, Ordering::Relaxed);
+        self.last_frame_plus_one
+            .fetch_max(frame.saturating_add(1), Ordering::Release);
+    }
+}
+
+static EXACT_REFUSAL_COOLDOWN: RefusalSweepCooldown = RefusalSweepCooldown::new();
+
+/// Atomically claims a sweep slot if `last == 0` (first sweep) or at least
+/// `cooldown` units have elapsed since `last`.
+fn try_claim_sweep(last: &AtomicU64, current: u64, cooldown: u64) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    if prev != 0 && current.saturating_sub(prev) < cooldown {
+        return false;
+    }
+    last.compare_exchange(prev, current.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Sweeps `map` for normal `>= many` capacity eviction (`lately` tick age) and,
+/// independently, for carded pressure eviction (`EXACT_CARD_PRESSURE_TICKS` /
+/// frame age) even when `map.len() >= many`.
+#[allow(clippy::too_many_arguments)]
+fn sweep_exact_map_with(
+    map: &mut ExactMap,
+    now: u64,
+    many: usize,
+    lately: u64,
+    run_many_sweep: bool,
+    run_pressure_sweep: bool,
+    is_exclusive: impl Fn(&Arc<Shadow>) -> bool,
+    is_time_idle: impl Fn(u64) -> bool,
+) -> Vec<Arc<Shadow>> {
+    let mut evicted = Vec::new();
+    if run_many_sweep && map.len() >= many {
+        let mut dead = Vec::new();
+        for (&key, (shadow, used)) in map.iter() {
+            if is_exclusive(shadow) && used.load(Ordering::Relaxed).saturating_add(lately) <= now {
+                dead.push(key);
+            }
+        }
+        let mut removed_card_bytes = 0u64;
+        for key in dead {
+            if let Some((shadow, _)) = map.remove(&key) {
+                if let Some(card) = &shadow.card {
+                    removed_card_bytes = removed_card_bytes.saturating_add(card.size);
+                }
+                evicted.push(shadow);
+            }
+        }
+        if removed_card_bytes > 0 {
+            let cur = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+            EXACT_CARDED_BYTES.store(cur.saturating_sub(removed_card_bytes), Ordering::Relaxed);
+        }
+    }
+    if run_pressure_sweep {
+        evicted.extend(sweep_idle_carded_exact_with(
+            map,
+            now,
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| is_exclusive(s),
+            is_time_idle,
+        ));
+    }
+    evicted
+}
+
+/// Attempts a non-blocking refusal-triggered reclaim sweep on `lock`, gated by
+/// `cooldown`. Checks the cooldown lock-free before `try_write()`, re-checks
+/// under the write lock with a fresh clock sample, and records the post-sweep
+/// clock (`end.max(start)`) only after the sweep finishes so neither a
+/// contended `try_write()` nor clock progression during the scan triggers
+/// immediate back-to-back scans.
+fn reclaim_idle_carded_exact_with(
+    lock: &std::sync::RwLock<ExactMap>,
+    cooldown: &RefusalSweepCooldown,
+    mut sample_clock: impl FnMut() -> (u64, u64, u64),
+    idle_ticks: u64,
+    is_exclusive: impl Fn(&Arc<Shadow>, &Card) -> bool,
+    is_time_idle: impl Fn(u64) -> bool,
+) -> Vec<Arc<Shadow>> {
+    let (pre_frame, pre_ms, pre_tick) = sample_clock();
+    if !cooldown.ready(pre_frame, pre_ms, pre_tick) {
+        return Vec::new();
+    }
+    let Ok(mut map) = lock.try_write() else {
+        return Vec::new();
+    };
+    if EXACT_CARDED_BYTES.load(Ordering::Relaxed) == 0 {
+        return Vec::new();
+    }
+    let (start_frame, start_ms, start_tick) = sample_clock();
+    let start_frame = start_frame.max(pre_frame);
+    let start_ms = start_ms.max(pre_ms);
+    let start_tick = start_tick.max(pre_tick);
+    if !cooldown.ready(start_frame, start_ms, start_tick) {
+        return Vec::new();
+    }
+    let evicted = sweep_idle_carded_exact_with(
+        &mut map,
+        start_tick,
+        idle_ticks,
+        is_exclusive,
+        is_time_idle,
+    );
+    let (end_frame, end_ms, end_tick) = sample_clock();
+    cooldown.record(
+        end_frame.max(start_frame),
+        end_ms.max(start_ms),
+        end_tick.max(start_tick),
+    );
+    evicted
+}
+
+/// Monotonically advances an [`EXACT`] entry's tick (`pre_tick.max(current_tick)`)
+/// and host moment so a delayed thread carrying an older `pre_tick` can neither
+/// regress the entry backwards nor stamp it with a stale pre-lock tick.
+fn touch_exact_entry(
+    shadow: &Shadow,
+    used: &AtomicU64,
+    pre_tick: u64,
+    current_tick: u64,
+    moment: u64,
+) {
+    let tick = pre_tick.max(current_tick);
+    if used.load(Ordering::Relaxed) < tick {
+        used.fetch_max(tick, Ordering::Relaxed);
+    }
+    if shadow.used.load(Ordering::Relaxed) < moment {
+        shadow.used.fetch_max(moment, Ordering::Relaxed);
+    }
+}
+
+/// Inserts a newly constructed [`EXACT`] entry into `map`, sampling
+/// `(current_tick, current_moment)` via `sample_publish_clock` immediately
+/// before `map.insert(...)` (after resource naming, `Shadow::new`, and
+/// `register_carded`) so neither slow allocation nor registration stalls can
+/// insert stale timestamps.
+fn publish_exact_entry(
+    map: &mut ExactMap,
+    key: (u64, u64),
+    shadow: Arc<Shadow>,
+    pre_build_tick: u64,
+    sample_publish_clock: impl FnOnce() -> (u64, u64),
+) {
+    let (current_tick, current_moment) = sample_publish_clock();
+    let publish_tick = pre_build_tick.max(current_tick);
+    if shadow.used.load(Ordering::Relaxed) < current_moment {
+        shadow.used.fetch_max(current_moment, Ordering::Relaxed);
+    }
+    map.insert(key, (shadow, AtomicU64::new(publish_tick)));
+}
+
+/// Reclaims idle carded [`EXACT`] copies when any VRAM, quota, or DXR-budget
+/// gate refuses a card allocation, throttled by [`EXACT_REFUSAL_COOLDOWN`]
+/// (frame, time, or tick progression) and retiring evicted entries outside
+/// `EXACT`'s lock.
+fn maybe_reclaim_idle_carded_exact() -> usize {
+    if EXACT_CARDED_BYTES.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let Some(lock) = EXACT.get() else {
+        return 0;
+    };
+    let evicted = reclaim_idle_carded_exact_with(
+        lock,
+        &EXACT_REFUSAL_COOLDOWN,
+        || {
+            (
+                crate::frame::current(),
+                crate::host::coarse_ms(),
+                EXACT_TICK.load(Ordering::Relaxed),
+            )
+        },
+        EXACT_CARD_PRESSURE_TICKS,
+        |s, c| {
+            Arc::strong_count(s) == 1
+                && crate::host::references(&s.buffer) == 1
+                && crate::host::references(&c.staging) == 1
+        },
+        |m| m != 0 && crate::host::long_ago(m, EXACT_CARD_IDLE_MS, EXACT_CARD_IDLE_FRAMES),
+    );
+    let count = evicted.len();
+    if !evicted.is_empty() {
+        dispose_exact_evicted(evicted, crate::host::retire_stamp(), crate::host::retire);
+    }
+    count
+}
+
+/// Runs an outer reservation check (e.g. DXR LOCAL VRAM budget) followed by
+/// `alloc`. When the outer gate refuses early (`Err`), invokes `on_early_refused`
+/// so stale idle carded `EXACT` copies are reclaimed even below `most / 4`.
+fn admit_card_with<R, T>(
+    reserve: Result<R, ()>,
+    alloc: impl FnOnce() -> Option<T>,
+    on_early_refused: impl FnOnce(),
+) -> Option<(R, T)> {
+    let Ok(reservation) = reserve else {
+        on_early_refused();
+        return None;
+    };
+    alloc().map(|allocated| (reservation, allocated))
 }
 
 /// Already-resident, already-mapped shared buffer retired from [`EXACT`] for
@@ -6457,85 +6968,158 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     {
         let map = exact_map().read().unwrap_or_else(|e| e.into_inner());
         if let Some((shadow, used)) = map.get(&(address, len)) {
-            used.store(now, Ordering::Relaxed);
-            let m = crate::host::moment();
-            if shadow.used.load(Ordering::Relaxed) != m {
-                shadow.used.store(m, Ordering::Relaxed);
-            }
+            touch_exact_entry(
+                shadow,
+                used,
+                now,
+                EXACT_TICK.load(Ordering::Relaxed),
+                crate::host::moment(),
+            );
             return Some(shadow.clone());
         }
     }
-    // Amortized sweep of idle entries every 64 misses; retire buffers outside locks.
+    // Amortized sweep of idle entries every 64 misses, plus an independent
+    // throttled pressure sweep whenever carded `EXACT` copies exceed their
+    // bounded share (even when `map.len() >= MANY`); dispose and retire
+    // buffers outside `EXACT`'s lock.
     let miss = EXACT_MISSES.fetch_add(1, Ordering::Relaxed);
-    if miss.is_multiple_of(64) {
-        let mut evicted = Vec::new();
-        {
+    let run_many_sweep = miss.is_multiple_of(64);
+    let run_pressure_sweep = {
+        let bytes = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+        bytes > 0
+            && bytes > exact_card_pressure_limit(card_limits().1)
+            && try_claim_sweep(
+                &EXACT_LAST_PROACTIVE_SWEEP,
+                miss + 1,
+                EXACT_PROACTIVE_SWEEP_COOLDOWN,
+            )
+    };
+    if run_many_sweep || run_pressure_sweep {
+        let evicted = {
             let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
-            if map.len() >= MANY {
-                let mut dead = Vec::new();
-                for (&key, (shadow, used)) in map.iter() {
-                    if Arc::strong_count(shadow) == 1
-                        && crate::host::references(&shadow.buffer) == 1
-                        && used.load(Ordering::Relaxed) + LATELY <= now
-                    {
-                        dead.push(key);
-                    }
-                }
-                for key in dead {
-                    if let Some((shadow, _)) = map.remove(&key) {
-                        evicted.push(shadow);
-                    }
-                }
-            }
-        }
+            let sweep_now = now.max(EXACT_TICK.load(Ordering::Relaxed));
+            sweep_exact_map_with(
+                &mut map,
+                sweep_now,
+                MANY,
+                LATELY,
+                run_many_sweep,
+                run_pressure_sweep,
+                |s| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::references(&s.buffer) == 1
+                        && s.card
+                            .as_ref()
+                            .is_none_or(|c| crate::host::references(&c.staging) == 1)
+                },
+                |m| m != 0 && crate::host::long_ago(m, EXACT_CARD_IDLE_MS, EXACT_CARD_IDLE_FRAMES),
+            )
+        };
         if !evicted.is_empty() {
-            let stamp = crate::host::retire_stamp();
-            for shadow in evicted {
-                if let Ok(s) = Arc::try_unwrap(shadow)
-                    && s.card.is_none()
-                    && s.place.is_none()
-                {
-                    let buf = s.buffer.clone();
-                    let data = s.data;
-                    let cap = s.width();
-                    drop(s);
-                    exact_pool_put(buf, data, cap, stamp);
-                }
-            }
+            dispose_exact_evicted(evicted, crate::host::retire_stamp(), crate::host::retire);
         }
     }
-    // Round small/medium allocations to power-of-two buckets (min 256 B) for high pool reuse.
-    let cap = if len <= EXACT_POOL_MAX_ITEM {
+    // A view's alignment copy is read and written just as a title buffer is.
+    // Route eligible large alignment copies to DEFAULT VRAM via `card_for`
+    // (respecting DXR's LOCAL VRAM budget), keeping small/medium shared copies
+    // in power-of-two `EXACT_POOL` buckets.
+    // Provenance (GPL-3.0): Xyzstk / DoubleGhosty/cool_fox #40 (9605006).
+    let card_eligible = cards() && (len >= card_limits().0 || card_all());
+    let cap = if card_eligible {
+        len.next_multiple_of(1 << 16)
+    } else if len <= EXACT_POOL_MAX_ITEM {
         len.next_multiple_of(256).next_power_of_two()
     } else {
         len.next_multiple_of(256)
     };
-    let (buffer, data, reused) = match exact_pool_take(cap) {
+    let host = host()?;
+    let (staging, data, reused) = match exact_pool_take(cap) {
         Some((b, d)) => (b, d, true),
         None => {
-            let (b, d) = host()?.shared_buffer(cap)?;
+            let (b, d) = host.shared_buffer(cap)?;
             (b, d, false)
         }
+    };
+    let (buffer, card) = if card_eligible && cap < 1 << 30 {
+        let card_budget = host.dxr.as_ref().map(|d| d.budget.reserve(cap)).transpose().map_err(|_| ());
+        match admit_card_with(
+            card_budget,
+            || card_for(cap, len, false),
+            || {
+                maybe_reclaim_idle_carded_exact();
+            },
+        ) {
+            Some((reservation, (on_card, grant))) => {
+                if let Some(r) = reservation
+                    && r.finish_shadow(&on_card).is_err()
+                {
+                    card_release(grant);
+                    (staging, None)
+                } else {
+                    let card = Card {
+                        staging,
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        touched: Default::default(),
+                        self_weak: Default::default(),
+                        size: cap,
+                        grant,
+                    };
+                    (on_card, Some(card))
+                }
+            }
+            None => (staging, None),
+        }
+    } else {
+        (staging, None)
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
     if let Some((shadow, used)) = map.get(&(address, len)) {
-        used.store(now, Ordering::Relaxed);
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        touch_exact_entry(
+            shadow,
+            used,
+            now,
+            EXACT_TICK.load(Ordering::Relaxed),
+            crate::host::moment(),
+        );
         let existing = shadow.clone();
         drop(map);
-        // Never exposed to GPU work yet: return directly to pool front as ready.
-        exact_pool_put(buffer, data, cap, 0);
+        // Never exposed to GPU work yet: release any card-side quota and
+        // recycle only the shared staging buffer into `EXACT_POOL`.
+        match card {
+            Some(card) => {
+                card_release(card.grant);
+                drop(buffer);
+                exact_pool_put(card.staging, data, cap, 0);
+            }
+            None => exact_pool_put(buffer, data, cap, 0),
+        }
         return Some(existing);
     }
+    let carded_size = card.as_ref().map_or(0, |c| c.size);
+    let carded = card.is_some();
     if !reused {
-        crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+        let shared = card.as_ref().map_or(&buffer, |c| &c.staging);
+        crate::host::name(shared, || format!("title view {address:#x}+{len:#x}"));
     }
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), AtomicU64::new(now)));
+    if carded {
+        crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x} on the card"));
+    }
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.card = card;
+    let shadow = Arc::new(shadow);
+    if carded {
+        register_carded(&shadow);
+        EXACT_CARDED_BYTES.fetch_add(carded_size, Ordering::Relaxed);
+    }
+    publish_exact_entry(&mut map, (address, len), shadow.clone(), now, || {
+        (EXACT_TICK.load(Ordering::Relaxed), crate::host::moment())
+    });
     drop(map);
-    if reused {
+    if reused && !carded {
         EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
     } else {
         EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -6728,17 +7312,38 @@ mod window_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
-        .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
-        .collect();
-    all.extend(
-        LOOSE
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|s| (s.gpu, s.start, s.len)),
-    );
+    // Each table only if it is free: the device may be found removed by a
+    // call made while this thread holds a write lock on one of them
+    // (`lookup`, `loose`, and `exact` allocate buffers under `BUFFERS`,
+    // `LOOSE`, and `EXACT`), and `RwLock` is not reentrant. A table in use
+    // is left out and reported as skipped.
+    // Provenance (GPL-3.0): Belobug/VIctory-Belobug-AMD #214.
+    fn free_read<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+        match lock.try_read() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+    let mut busy = Vec::new();
+    let mut all: Vec<(u64, u64, u64)> = Vec::new();
+    match free_read(&BUFFERS) {
+        Some(b) => all.extend(
+            b.values()
+                .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len))),
+        ),
+        None => busy.push("buffers"),
+    }
+    match free_read(&LOOSE) {
+        Some(l) => all.extend(l.values().map(|s| (s.gpu, s.start, s.len))),
+        None => busy.push("loose copies"),
+    }
+    if let Some(exact) = EXACT.get() {
+        match free_read(exact) {
+            Some(e) => all.extend(e.values().map(|(s, _)| (s.gpu, s.start, s.len))),
+            None => busy.push("exact copies"),
+        }
+    }
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {
@@ -6754,5 +7359,714 @@ pub(crate) fn near(va: u64) -> String {
             all.len()
         ));
     }
+    if !busy.is_empty() {
+        text.push_str(&format!(
+            " (in use on this thread or another, not looked at: {})",
+            busy.join(", ")
+        ));
+    }
     text
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    /// Serializes tests in this module that touch process-global shadow tables
+    /// or card quota counters so default parallel `cargo test` runs stay clean.
+    static ADMISSION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn card_minimum_uses_title_bytes_and_keeps_the_allocation_ceiling() {
+        const PAGE: u64 = 65536;
+        for len in [4, 1040, 4096, PAGE - 1] {
+            assert!(!card_size_eligible(PAGE, len, PAGE));
+        }
+        assert!(card_size_eligible(PAGE, PAGE, PAGE));
+        assert!(card_size_eligible(3 * PAGE, 2 * PAGE + 1, PAGE));
+        assert!(!card_size_eligible(1 << 30, (1 << 30) - 1, PAGE));
+        // `VICTORY_CARD_ALL=1` sets the minimum to zero; budget admission
+        // still checks limits independently.
+        assert!(card_size_eligible(PAGE, 4, 0));
+    }
+
+    #[test]
+    fn late_large_copies_use_reserved_room_without_raising_the_total() {
+        const MB: u64 = 1 << 20;
+        let g = |general, reserve| Some(CardBudgetGrant { general, reserve });
+        assert_eq!(card_reserve(512 * MB), 64 * MB);
+        assert_eq!(card_reserve(2048 * MB), 64 * MB);
+        assert_eq!(card_reserve(128 * MB), 16 * MB);
+        assert_eq!(card_reserve(64 * MB), 0);
+        assert_eq!(card_budget_pick(448 * MB, 448 * MB, 0, 0, 512 * MB), g(448 * MB, 0));
+        assert_eq!(card_budget_pick(20 * MB, 20 * MB, 448 * MB, 0, 512 * MB), g(0, 20 * MB));
+        assert_eq!(card_budget_pick(MB, MB, 468 * MB, 20 * MB, 512 * MB), None);
+        assert_eq!(card_budget_pick(44 * MB, 44 * MB, 468 * MB, 20 * MB, 512 * MB), g(0, 44 * MB));
+        assert_eq!(card_budget_pick(16 * MB, 16 * MB, 512 * MB, 64 * MB, 512 * MB), None);
+        // Dropping a reserved copy restores its room; ordinary room is still full.
+        assert_eq!(card_budget_pick(24 * MB, 24 * MB, 468 * MB, 20 * MB, 512 * MB), g(0, 24 * MB));
+        // A single 500 MiB copy spans all 448 MiB of general room plus 52 MiB of reserve.
+        assert_eq!(card_budget_pick(500 * MB, 500 * MB, 0, 0, 512 * MB), g(448 * MB, 52 * MB));
+        assert_eq!(card_budget_pick(513 * MB, 513 * MB, 0, 0, 512 * MB), None);
+        assert_eq!(card_budget_pick(MB, MB, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn large_copy_spans_remaining_general_and_reserve_and_refunds_cleanly() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const MB: u64 = 1 << 20;
+        let base_total = CARD_BYTES[0].load(Ordering::Relaxed);
+        let base_reserved = CARD_RESERVED.load(Ordering::Relaxed);
+        let most = base_total + 512 * MB;
+
+        // 400 MiB used in general -> 48 MiB general + 64 MiB reserve left (112 MiB free).
+        assert_eq!(
+            card_budget_pick(80 * MB, 80 * MB, 400 * MB, 0, 512 * MB),
+            Some(CardBudgetGrant {
+                general: 48 * MB,
+                reserve: 32 * MB,
+            })
+        );
+        // A < 16 MiB copy cannot cross into the reserve even when 112 MiB total is free.
+        assert_eq!(card_budget_pick(12 * MB, 12 * MB, 440 * MB, 0, 512 * MB), None);
+
+        let (_, first_grant) =
+            card_allocate_with(400 * MB, 400 * MB, most, |_| Some(())).expect("400 MiB fits general");
+        assert_eq!(first_grant, CardBudgetGrant { general: 400 * MB, reserve: 0 });
+
+        // Failed driver allocation of a spanning 80 MiB request rolls back both general and reserve.
+        let failed: Option<((), CardBudgetGrant)> = card_allocate_with(80 * MB, 80 * MB, most, |_| {
+            assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 480 * MB);
+            assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved + 32 * MB);
+            None
+        });
+        assert!(failed.is_none());
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 400 * MB);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved);
+
+        // Successful spanning 80 MiB request draws 48 MiB general + 32 MiB reserve.
+        let (_, span_grant) =
+            card_allocate_with(80 * MB, 80 * MB, most, |_| Some(())).expect("80 MiB spans general+reserve");
+        assert_eq!(span_grant, CardBudgetGrant { general: 48 * MB, reserve: 32 * MB });
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 480 * MB);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved + 32 * MB);
+
+        // Remaining 32 MiB is reserve-only: small copy refused, 32 MiB large copy admitted.
+        assert!(card_allocate_with(MB, MB, most, |_| Some(())).is_none());
+        let (_, tail_grant) =
+            card_allocate_with(32 * MB, 32 * MB, most, |_| Some(())).expect("32 MiB fits remaining reserve");
+        assert_eq!(tail_grant, CardBudgetGrant { general: 0, reserve: 32 * MB });
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 512 * MB);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved + 64 * MB);
+
+        // Symmetric release restores both general and reserved counters cleanly.
+        card_release(span_grant);
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 432 * MB);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved + 32 * MB);
+        card_release(tail_grant);
+        card_release(first_grant);
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved);
+    }
+
+    #[test]
+    fn card_allocate_drops_lock_before_alloc_and_rolls_back_on_failure() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const MB: u64 = 1 << 20;
+        let base_total = CARD_BYTES[0].load(Ordering::Relaxed);
+        let base_reserved = CARD_RESERVED.load(Ordering::Relaxed);
+        let most = base_total + 512 * MB;
+
+        // Fill ordinary room (448 MiB) so the next >= 16 MiB copy uses reserved room.
+        let (ordinary_tag, ordinary_grant) = card_allocate_with(448 * MB, 448 * MB, most, |bytes| {
+            // `CARD_ADMISSION` must be unlocked before driver allocation runs.
+            assert!(CARD_ADMISSION.try_lock().is_ok());
+            assert_eq!(bytes, 448 * MB);
+            Some(1u32)
+        })
+        .expect("ordinary room should admit");
+        assert_eq!(ordinary_tag, 1);
+        assert_eq!(ordinary_grant, CardBudgetGrant { general: 448 * MB, reserve: 0 });
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 448 * MB);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved);
+
+        // Failed driver allocation from reserved room rolls back both counters.
+        let failed: Option<(u32, CardBudgetGrant)> = card_allocate_with(20 * MB, 20 * MB, most, |bytes| {
+            assert!(CARD_ADMISSION.try_lock().is_ok());
+            assert_eq!(bytes, 20 * MB);
+            assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 468 * MB);
+            assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved + 20 * MB);
+            None
+        });
+        assert!(failed.is_none());
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 448 * MB);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved);
+
+        // Successful allocation from reserved room tracks reserved bytes until released.
+        let (_, reserved_grant) =
+            card_allocate_with(20 * MB, 20 * MB, most, |_| Some(2u32)).expect("reserved room should admit");
+        assert_eq!(reserved_grant, CardBudgetGrant { general: 0, reserve: 20 * MB });
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total + 468 * MB);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved + 20 * MB);
+
+        card_release(reserved_grant);
+        card_release(ordinary_grant);
+        assert_eq!(CARD_BYTES[0].load(Ordering::Relaxed), base_total);
+        assert_eq!(CARD_RESERVED.load(Ordering::Relaxed), base_reserved);
+    }
+
+    #[test]
+    fn evicted_carded_exact_retires_even_under_concurrent_weak_upgrade() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut backing = vec![0u8; 65536];
+        let evicted = Shadow::unbacked(0x7_1000_0000, backing.as_mut_ptr(), 65536, true);
+        // Simulate a concurrent `CARDED` `Weak::upgrade()` racing with eviction
+        // so `Arc::try_unwrap` would return `Err`.
+        let weak = Arc::downgrade(&evicted);
+        let concurrent = weak.upgrade().expect("concurrent CARDED upgrade");
+        assert!(Arc::strong_count(&evicted) > 1);
+
+        let mut retired = Vec::new();
+        dispose_exact_evicted(vec![evicted], 0, |s| retired.push(s));
+        assert_eq!(retired.len(), 1, "carded shadow must still be retired under Weak::upgrade race");
+        drop(concurrent);
+        drop(retired);
+
+        // Also verify real `host::retire` keeps the shadow alive past the concurrent holder dropping.
+        let evicted2 = Shadow::unbacked(0x7_2000_0000, backing.as_mut_ptr(), 65536, true);
+        let baseline = Arc::strong_count(&evicted2);
+        let weak2 = Arc::downgrade(&evicted2);
+        let concurrent2 = weak2.upgrade().expect("concurrent CARDED upgrade");
+        dispose_exact_evicted(vec![evicted2], 0, crate::host::retire);
+        drop(concurrent2);
+        let probe = weak2.upgrade().expect("retired shadow still alive");
+        if std::env::var("VICTORY_BURY_LAG").as_deref() != Ok("0") {
+            assert_eq!(Arc::strong_count(&probe), baseline + 1);
+        }
+    }
+
+    #[test]
+    fn stale_carded_exact_entries_reclaimed_under_pressure_below_2048() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const SIZE: u64 = 1 << 20;
+        let mut backing = vec![0u8; 65536];
+        let k_oldest = (0x8_0001_0000u64, SIZE);
+        let k_second = (0x8_0002_0000u64, SIZE);
+        let k_held = (0x8_0003_0000u64, SIZE);
+        let k_fresh = (0x8_0004_0000u64, SIZE);
+
+        let s_oldest = Shadow::unbacked(k_oldest.0, backing.as_mut_ptr(), SIZE, true);
+        let s_second = Shadow::unbacked(k_second.0, backing.as_mut_ptr(), SIZE, true);
+        let s_held = Shadow::unbacked(k_held.0, backing.as_mut_ptr(), SIZE, true);
+        let s_fresh = Shadow::unbacked(k_fresh.0, backing.as_mut_ptr(), SIZE, true);
+        // Baseline refcount of `Shadow::unbacked` is 2 (1 forgotten + 1 owned by `exact_map`).
+        let exclusive_count = Arc::strong_count(&s_oldest);
+        // External holder keeps `k_held` ineligible for eviction.
+        let external_hold = s_held.clone();
+
+        let base_carded_bytes = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+        {
+            let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
+            map.insert(k_oldest, (s_oldest, AtomicU64::new(10)));
+            map.insert(k_second, (s_second, AtomicU64::new(20)));
+            map.insert(k_held, (s_held, AtomicU64::new(15)));
+            map.insert(k_fresh, (s_fresh, AtomicU64::new(450)));
+            EXACT_CARDED_BYTES.fetch_add(4 * SIZE, Ordering::Relaxed);
+            assert!(map.len() < 2048);
+        }
+
+        let evicted = {
+            let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
+            sweep_idle_carded_exact_with(
+                &mut map,
+                500,
+                EXACT_CARD_PRESSURE_TICKS,
+                |s, _| Arc::strong_count(s) == exclusive_count,
+                |_| false,
+            )
+        };
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(evicted[0].start, k_oldest.0);
+        assert_eq!(evicted[1].start, k_second.0);
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes + 2 * SIZE);
+
+        let mut retired = Vec::new();
+        dispose_exact_evicted(evicted, 0, |s| retired.push(s));
+        assert_eq!(retired.len(), 2);
+
+        // Verify held and fresh entries stayed resident, then clean up test entries.
+        {
+            let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
+            assert!(!map.contains_key(&k_oldest));
+            assert!(!map.contains_key(&k_second));
+            assert!(map.contains_key(&k_held));
+            assert!(map.contains_key(&k_fresh));
+            map.remove(&k_held);
+            map.remove(&k_fresh);
+            let cur = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+            EXACT_CARDED_BYTES.store(cur.saturating_sub(2 * SIZE), Ordering::Relaxed);
+        }
+        drop(external_hold);
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+    }
+
+    #[test]
+    fn early_card_refusal_reclaims_stale_carded_exact_below_pressure_cap() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const SIZE: u64 = 16 << 20;
+        let mut backing = vec![0u8; 65536];
+        let key = (0x8_1000_0000u64, SIZE);
+        let stale = Shadow::unbacked(key.0, backing.as_mut_ptr(), SIZE, true);
+        let exclusive_count = Arc::strong_count(&stale);
+
+        let base_carded_bytes = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+        // 16 MiB is well below `exact_card_pressure_limit(512 MiB) == 128 MiB`,
+        // yet an early DXR-cap or VRAM-usage refusal must still trigger reclaim.
+        assert!(SIZE <= exact_card_pressure_limit(512 << 20));
+        {
+            let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
+            map.insert(key, (stale, AtomicU64::new(10)));
+            EXACT_CARDED_BYTES.fetch_add(SIZE, Ordering::Relaxed);
+        }
+
+        let mut alloc_called = false;
+        let mut retired = Vec::new();
+        let res: Option<((), ())> = admit_card_with(
+            Err(()),
+            || {
+                alloc_called = true;
+                Some(())
+            },
+            || {
+                let evicted = {
+                    let mut map = exact_map().write().unwrap_or_else(|e| e.into_inner());
+                    sweep_idle_carded_exact_with(
+                        &mut map,
+                        500,
+                        EXACT_CARD_PRESSURE_TICKS,
+                        |s, _| Arc::strong_count(s) == exclusive_count,
+                        |_| false,
+                    )
+                };
+                dispose_exact_evicted(evicted, 0, |s| retired.push(s));
+            },
+        );
+        assert!(res.is_none());
+        assert!(!alloc_called, "early DXR refusal must not call card_for");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].start, key.0);
+        assert!(!exact_map().read().unwrap_or_else(|e| e.into_inner()).contains_key(&key));
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+    }
+
+    #[test]
+    fn temporary_exact_vram_refusal_does_not_decay_persistent_reserve() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const MB: u64 = 1 << 20;
+        const GB: u64 = 1 << 30;
+        let base_count = CARD_REFUSED[0].load(Ordering::Relaxed);
+        let base_bytes = CARD_REFUSED[1].load(Ordering::Relaxed);
+
+        // Temporary `exact()` VRAM refusal must not touch `CARD_REFUSED`, leaving
+        // `card_room_kept()` intact for persistent late buffers.
+        note_card_vram_refusal(20 * MB, 7 * GB, 8 * GB, 97, 512 * MB, false);
+        assert_eq!(CARD_REFUSED[0].load(Ordering::Relaxed), base_count);
+        assert_eq!(CARD_REFUSED[1].load(Ordering::Relaxed), base_bytes);
+
+        // Persistent `lookup()` VRAM refusal continues to decay `CARD_REFUSED` as before.
+        note_card_vram_refusal(20 * MB, 7 * GB, 8 * GB, 97, 512 * MB, true);
+        assert_eq!(CARD_REFUSED[0].load(Ordering::Relaxed), base_count + 1);
+        assert_eq!(CARD_REFUSED[1].load(Ordering::Relaxed), base_bytes + 20 * MB);
+
+        CARD_REFUSED[0].store(base_count, Ordering::Relaxed);
+        CARD_REFUSED[1].store(base_bytes, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn pressure_sweep_runs_when_exact_reaches_many_and_respects_cooldown() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const MANY: usize = 2048;
+        const LATELY: u64 = 4096;
+        const SIZE: u64 = 1 << 20;
+
+        // Cooldown allows first sweep, throttles intervening calls, then re-enables.
+        let last = AtomicU64::new(0);
+        assert!(try_claim_sweep(&last, 1, EXACT_PROACTIVE_SWEEP_COOLDOWN));
+        assert!(!try_claim_sweep(&last, 2, EXACT_PROACTIVE_SWEEP_COOLDOWN));
+        assert!(!try_claim_sweep(&last, 64, EXACT_PROACTIVE_SWEEP_COOLDOWN));
+        assert!(try_claim_sweep(&last, 65, EXACT_PROACTIVE_SWEEP_COOLDOWN));
+        assert!(!try_claim_sweep(&last, 66, EXACT_PROACTIVE_SWEEP_COOLDOWN));
+
+        // Build a local `ExactMap` with `>= MANY` (2048) entries: 2047 fresh shared
+        // entries plus 1 stale carded entry whose age is `>= EXACT_CARD_PRESSURE_TICKS`
+        // (256) but `< LATELY` (4096) so ONLY the pressure sweep can reclaim it.
+        let mut backing = vec![0u8; 65536];
+        let shared = Shadow::unbacked(0x8_2000_0000, backing.as_mut_ptr(), 4096, false);
+        let stale_key = (0x8_3000_0000u64, SIZE);
+        let stale_carded = Shadow::unbacked(stale_key.0, backing.as_mut_ptr(), SIZE, true);
+        let exclusive_count = Arc::strong_count(&stale_carded);
+
+        let base_carded_bytes = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+        let mut map = ExactMap::with_capacity(MANY);
+        for i in 0..(MANY - 1) {
+            map.insert((0x8_2000_0000 + (i as u64) * 16, 4096), (shared.clone(), AtomicU64::new(490)));
+        }
+        map.insert(stale_key, (stale_carded, AtomicU64::new(100)));
+        EXACT_CARDED_BYTES.fetch_add(SIZE, Ordering::Relaxed);
+        assert_eq!(map.len(), MANY);
+
+        let evicted = sweep_exact_map_with(
+            &mut map,
+            500,
+            MANY,
+            LATELY,
+            true,
+            true,
+            |s| Arc::strong_count(s) == exclusive_count,
+            |_| false,
+        );
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].start, stale_key.0);
+        assert!(!map.contains_key(&stale_key));
+        assert_eq!(map.len(), MANY - 1);
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+    }
+
+    #[test]
+    fn refusal_sweep_cooldown_handles_contention_and_frame_or_time_progress() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const SIZE: u64 = 1 << 20;
+        let mut backing = vec![0u8; 65536];
+        let base_carded_bytes = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+
+        let lock = std::sync::RwLock::new(ExactMap::new());
+        let cooldown = RefusalSweepCooldown::new();
+
+        // 1. Contended `try_write()` must NOT consume the refusal cooldown.
+        let k1 = (0x8_4000_0000u64, SIZE);
+        let s1 = Shadow::unbacked(k1.0, backing.as_mut_ptr(), SIZE, true);
+        let exclusive_count = Arc::strong_count(&s1);
+        lock.write().unwrap().insert(k1, (s1, AtomicU64::new(100)));
+        EXACT_CARDED_BYTES.fetch_add(SIZE, Ordering::Relaxed);
+
+        let reader = lock.read().unwrap();
+        let contended = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (10, 1_000, 500),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| false,
+        );
+        assert!(contended.is_empty());
+        assert!(reader.contains_key(&k1));
+        assert!(cooldown.ready(10, 1_000, 500));
+        drop(reader);
+
+        // Immediately uncontended at the exact same `(frame, ms, tick)`: sweeps and evicts `k1`.
+        let evicted = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (10, 1_000, 500),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| false,
+        );
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].start, k1.0);
+        assert!(!cooldown.ready(10, 1_000, 500));
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+
+        // 2. Empty sweep still throttles same-frame bursts, while advancing a single
+        // frame unlocks the very next refusal without needing N wasted refusals.
+        let k2 = (0x8_4100_0000u64, SIZE);
+        let s2 = Shadow::unbacked(k2.0, backing.as_mut_ptr(), SIZE, true);
+        lock.write().unwrap().insert(k2, (s2, AtomicU64::new(500)));
+        EXACT_CARDED_BYTES.fetch_add(SIZE, Ordering::Relaxed);
+
+        // Frame 11: sweep runs but `k2` is not yet eligible -> 0 evicted, cooldown recorded.
+        let empty = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (11, 1_005, 510),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| false,
+        );
+        assert!(empty.is_empty());
+        assert!(lock.read().unwrap().contains_key(&k2));
+
+        // Same frame & < 16 ms & < 32 ticks: throttled even if `is_time_idle` would match.
+        let throttled = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (11, 1_010, 520),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| true,
+        );
+        assert!(throttled.is_empty());
+        assert!(lock.read().unwrap().contains_key(&k2));
+
+        // Next frame (frame 12): immediately runs on the very first refusal and evicts `k2`.
+        let evicted = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (12, 1_010, 520),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| true,
+        );
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].start, k2.0);
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+
+        // 3. Elapsed time (`>= EXACT_REFUSAL_SWEEP_MS`) also unlocks a fresh sweep
+        // when the frame counter is stagnant (e.g. during loading stalls).
+        let k3 = (0x8_4200_0000u64, SIZE);
+        let s3 = Shadow::unbacked(k3.0, backing.as_mut_ptr(), SIZE, true);
+        lock.write().unwrap().insert(k3, (s3, AtomicU64::new(500)));
+        EXACT_CARDED_BYTES.fetch_add(SIZE, Ordering::Relaxed);
+
+        let still_throttled = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (12, 1_010 + EXACT_REFUSAL_SWEEP_MS - 1, 520),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| true,
+        );
+        assert!(still_throttled.is_empty());
+        assert!(lock.read().unwrap().contains_key(&k3));
+
+        let evicted = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (12, 1_010 + EXACT_REFUSAL_SWEEP_MS, 520),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| true,
+        );
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].start, k3.0);
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+
+        // 4. Clock advancing DURING the sweep records the post-sweep clock so an
+        // immediate subsequent refusal at the post-sweep clock does NOT re-scan.
+        let clock = std::cell::Cell::new((20u64, 2_000u64, 1_000u64));
+        let k4 = (0x8_4300_0000u64, SIZE);
+        let s4 = Shadow::unbacked(k4.0, backing.as_mut_ptr(), SIZE, true);
+        let k5 = (0x8_4400_0000u64, SIZE);
+        let s5 = Shadow::unbacked(k5.0, backing.as_mut_ptr(), SIZE, true);
+        {
+            let mut map = lock.write().unwrap();
+            map.insert(k4, (s4, AtomicU64::new(500)));
+            map.insert(k5, (s5, AtomicU64::new(990)));
+            EXACT_CARDED_BYTES.fetch_add(2 * SIZE, Ordering::Relaxed);
+        }
+
+        let evicted = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || clock.get(),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| {
+                // Simulate frame, coarse_ms, and EXACT_TICK advancing mid-scan.
+                clock.set((21, 2_020, 1_040));
+                Arc::strong_count(s) == exclusive_count
+            },
+            |_| false,
+        );
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].start, k4.0);
+        assert!(lock.read().unwrap().contains_key(&k5));
+        assert!(!cooldown.ready(21, 2_020, 1_040));
+
+        // Immediate refusal at the post-sweep clock is throttled (no back-to-back scan).
+        let back_to_back = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (21, 2_020, 1_040),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| true,
+        );
+        assert!(back_to_back.is_empty());
+        assert!(lock.read().unwrap().contains_key(&k5));
+
+        // 5. Explicit `EXACT_REFUSAL_SWEEP_TICKS` (32-tick) branch: `+31` stays
+        // throttled, `+32` unlocks an immediate sweep and evicts `k5`.
+        let tick_throttled = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (21, 2_020, 1_040 + EXACT_REFUSAL_SWEEP_TICKS - 1),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| true,
+        );
+        assert!(tick_throttled.is_empty());
+        assert!(lock.read().unwrap().contains_key(&k5));
+
+        let evicted = reclaim_idle_carded_exact_with(
+            &lock,
+            &cooldown,
+            || (21, 2_020, 1_040 + EXACT_REFUSAL_SWEEP_TICKS),
+            EXACT_CARD_PRESSURE_TICKS,
+            |s, _| Arc::strong_count(s) == exclusive_count,
+            |_| true,
+        );
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].start, k5.0);
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+    }
+
+    #[test]
+    fn exact_entry_ticks_are_monotonic_and_fresh_on_publish() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const SIZE: u64 = 1 << 20;
+        let mut backing = vec![0u8; 65536];
+        let base_carded_bytes = EXACT_CARDED_BYTES.load(Ordering::Relaxed);
+
+        let lock = std::sync::RwLock::new(ExactMap::new());
+
+        // (a) Delayed read-lock hit samples the fresh tick under the read lock
+        // instead of stamping stale pre-lock `now = 100`, and out-of-order
+        // touches never regress an existing entry backwards.
+        let k1 = (0x8_5000_0000u64, SIZE);
+        let s1 = Shadow::unbacked(k1.0, backing.as_mut_ptr(), SIZE, true);
+        let exclusive_count = Arc::strong_count(&s1);
+        let initial_moment = (8u64 << 32) | 10;
+        s1.used.store(initial_moment, Ordering::Relaxed);
+        lock.write().unwrap().insert(k1, (s1, AtomicU64::new(50)));
+        EXACT_CARDED_BYTES.fetch_add(SIZE, Ordering::Relaxed);
+
+        let hit_moment = (10u64 << 32) | 50;
+        let older_moment = (9u64 << 32) | 40;
+        {
+            let map = lock.read().unwrap();
+            let (shadow, used) = map.get(&k1).expect("existing entry");
+            // Thread stalled after sampling pre-lock `now = 100` while current tick reached `400`.
+            touch_exact_entry(shadow, used, 100, 400, hit_moment);
+            assert_eq!(used.load(Ordering::Relaxed), 400);
+            assert_eq!(shadow.used.load(Ordering::Relaxed), hit_moment);
+
+            // Delayed older touch must not regress `used` or `shadow.used` backwards.
+            touch_exact_entry(shadow, used, 100, 200, older_moment);
+            assert_eq!(used.load(Ordering::Relaxed), 400);
+            assert_eq!(shadow.used.load(Ordering::Relaxed), hit_moment);
+        }
+
+        // Immediate pressure sweep at `now = 400` must NOT evict `k1`
+        // (stamping pre-lock `100` would have evicted since `100 + 256 <= 400`).
+        {
+            let mut map = lock.write().unwrap();
+            let immediate = sweep_idle_carded_exact_with(
+                &mut map,
+                400,
+                EXACT_CARD_PRESSURE_TICKS,
+                |s, _| Arc::strong_count(s) == exclusive_count,
+                |_| false,
+            );
+            assert!(immediate.is_empty());
+            assert!(map.contains_key(&k1));
+        }
+
+        // (b) Build + `register_carded` advancing tick and moment before
+        // `publish_exact_entry` samples the post-registration clock right
+        // before `map.insert`, preventing stale insertion.
+        let clock = std::cell::Cell::new((100u64, hit_moment));
+        let pre_build_tick = clock.get().0;
+        let k2 = (0x8_5100_0000u64, SIZE);
+        let s2 = Shadow::unbacked(k2.0, backing.as_mut_ptr(), SIZE, true);
+        let publish_moment = (12u64 << 32) | 80;
+        // Simulate tick and moment advancing during allocation / `register_carded`.
+        let simulate_register_stall = || {
+            clock.set((500, publish_moment));
+        };
+        {
+            let mut map = lock.write().unwrap();
+            simulate_register_stall();
+            EXACT_CARDED_BYTES.fetch_add(SIZE, Ordering::Relaxed);
+            publish_exact_entry(&mut map, k2, s2, pre_build_tick, || clock.get());
+
+            let (published_shadow, published_used) = map.get(&k2).expect("published entry");
+            assert_eq!(published_used.load(Ordering::Relaxed), 500);
+            assert_eq!(published_shadow.used.load(Ordering::Relaxed), publish_moment);
+
+            // An immediate pressure sweep at `now = 500` must NOT evict `k1` or `k2`.
+            let immediate = sweep_idle_carded_exact_with(
+                &mut map,
+                500,
+                EXACT_CARD_PRESSURE_TICKS,
+                |s, _| Arc::strong_count(s) == exclusive_count,
+                |_| false,
+            );
+            assert!(immediate.is_empty());
+            assert!(map.contains_key(&k1));
+            assert!(map.contains_key(&k2));
+
+            // Once `EXACT_CARD_PRESSURE_TICKS` actually elapse, both become reclaimable.
+            let evicted = sweep_idle_carded_exact_with(
+                &mut map,
+                500 + EXACT_CARD_PRESSURE_TICKS,
+                EXACT_CARD_PRESSURE_TICKS,
+                |s, _| Arc::strong_count(s) == exclusive_count,
+                |_| false,
+            );
+            assert_eq!(evicted.len(), 2);
+            assert!(map.is_empty());
+        }
+        assert_eq!(EXACT_CARDED_BYTES.load(Ordering::Relaxed), base_carded_bytes);
+    }
+
+    #[test]
+    fn register_retires_overwritten_shadow() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut backing = vec![0u8; 4096];
+        let start = 0x7_0000_1000u64;
+        let resource = 0xdead_beefusize;
+        let old = Shadow::unbacked(start, backing.as_mut_ptr(), 4096, false);
+        let initial_refs = Arc::strong_count(&old);
+        {
+            buffers().insert(
+                (start, resource),
+                Entry {
+                    end: start + 4096,
+                    shadow: Some(old.clone()),
+                },
+            );
+        }
+        assert_eq!(Arc::strong_count(&old), initial_refs + 1);
+
+        register(resource, start, 8192);
+
+        {
+            let map = buffers_read();
+            let entry = map.get(&(start, resource)).expect("re-registered entry");
+            assert_eq!(entry.end, start + 8192);
+            assert!(entry.shadow.is_none());
+        }
+        // With default bury lag (> 0), `host::retire` keeps the overwritten
+        // `Arc<Shadow>` alive past `register` instead of dropping it inline.
+        if std::env::var("VICTORY_BURY_LAG").as_deref() != Ok("0") {
+            assert_eq!(Arc::strong_count(&old), initial_refs + 1);
+        }
+        unregister(resource, start);
+    }
+
+    #[test]
+    fn near_leaves_out_a_table_this_thread_holds() {
+        let _guard = ADMISSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let held = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+        let text = near(0x1234_0000);
+        drop(held);
+        assert!(text.contains("not looked at: buffers"), "{text}");
+
+        let held = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let text = near(0x1234_0000);
+        drop(held);
+        assert!(text.contains("not looked at: loose copies"), "{text}");
+
+        assert!(!near(0x1234_0000).contains("not looked at"));
+    }
 }
