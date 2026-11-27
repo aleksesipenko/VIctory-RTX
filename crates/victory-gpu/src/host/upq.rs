@@ -101,12 +101,62 @@ impl Slot {
     }
 }
 
+/// Source kind of a range in a submission batch. Only owned immutable
+/// `send::Memory` snapshots are eligible for the copy queue; shared
+/// `Card::staging` buffers must stay on the drawing queue so an unconfirmed
+/// copy-queue submission can never race later CPU writes into live staging
+/// memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SourceKind {
+    OwnedSendMemory,
+    #[cfg_attr(not(test), allow(dead_code))]
+    SharedCardStaging,
+}
+
+/// Whether a batch may be submitted to `upq`: `VICTORY_SEND_OWN` must be on,
+/// `upcheck` must not be active (`looks_none`), and every range in the batch
+/// must come from an owned immutable `send::Memory` snapshot (non-empty and
+/// containing zero `SharedCardStaging` sources).
+pub(super) fn batch_eligible(send_own: bool, looks_none: bool, sources: &[SourceKind]) -> bool {
+    send_own
+        && looks_none
+        && !sources.is_empty()
+        && sources.iter().all(|&s| s == SourceKind::OwnedSendMemory)
+}
+
+/// Serialized poison flag guarded by `QUEUE`, paired with the lock-free
+/// fast-path latch [`UpqState`]. Checked inside `QUEUE` immediately before
+/// `ExecuteCommandLists` so a concurrent poison from `give_back` can never race
+/// a submission.
+struct QueuePoison {
+    poisoned: bool,
+}
+
+impl QueuePoison {
+    const fn new() -> Self {
+        Self { poisoned: false }
+    }
+
+    /// Marks both the lock-protected flag and the atomic fast-path latch;
+    /// returns `true` on the first transition.
+    fn mark_poisoned(&mut self, state: &UpqState) -> bool {
+        self.poisoned = true;
+        state.trip()
+    }
+
+    /// Checked inside `QUEUE` immediately before `ExecuteCommandLists`.
+    fn allow_submit(&self, state: &UpqState) -> bool {
+        !self.poisoned && state.allow_send()
+    }
+}
+
 struct Queue {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     sent: u64,
     free: Vec<Slot>,
+    poison: QueuePoison,
 }
 
 // SAFETY: as `Slot`.
@@ -228,13 +278,40 @@ impl UpqState {
 
 static STATE: UpqState = UpqState::new();
 
-fn poison(why: &'static str) {
-    if STATE.trip() {
+/// Sets `q.poison` and `STATE` while the caller already holds `QUEUE`.
+/// Never acquires `UNCONFIRMED`.
+fn poison_under_queue(q: &mut Queue, why: &'static str) {
+    if q.poison.mark_poisoned(&STATE) {
         tracing::warn!(
             why,
             "disabling up-queue copy path after unconfirmed submission failure; falling back to drawing queue"
         );
     }
+}
+
+/// Acquires `QUEUE` briefly to set `q.poison` and `STATE`, then drops `QUEUE`.
+/// Must NEVER be called while holding `QUEUE` or `UNCONFIRMED`.
+fn poison_queue(why: &'static str) {
+    let first = {
+        let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(q)) = guard.as_mut() {
+            q.poison.mark_poisoned(&STATE)
+        } else {
+            STATE.trip()
+        }
+    };
+    if first {
+        tracing::warn!(
+            why,
+            "disabling up-queue copy path after unconfirmed submission failure; falling back to drawing queue"
+        );
+    }
+}
+
+/// Sweeps any completed/device-removed unconfirmed copy-queue slots (safe to
+/// call even when `upq` is bypassed or poisoned).
+pub(super) fn sweep(device: &ID3D12Device) {
+    sweep_unconfirmed(Some(device));
 }
 
 /// Sweeps any completed/device-removed unconfirmed copy-queue slots and
@@ -289,12 +366,13 @@ fn pin_sources(ranges: &[Range<'_>]) -> Vec<ID3D12Resource> {
 
 /// Pins an unconfirmed copy-queue slot (with `slot.bounce`, `allocator`, `list`,
 /// and `pinned_sources` intact) until the copy-queue fence confirms completion
-/// or the device is removed, and poisons the copy queue so no further
-/// copy-queue submissions are attempted. If `Signal` failed (no copy-queue
-/// fence value) or `UNCONFIRMED` is full at `UNCONFIRMED_MAX`, intentionally
-/// leaks via `std::mem::forget` rather than freeing GPU-in-use COM objects.
+/// or the device is removed, and poisons the copy queue under `QUEUE` BEFORE
+/// touching `UNCONFIRMED` (strict zero lock nesting between `QUEUE` and
+/// `UNCONFIRMED`). If `Signal` failed (no copy-queue fence value) or
+/// `UNCONFIRMED` is full at `UNCONFIRMED_MAX`, intentionally leaks via
+/// `std::mem::forget` rather than freeing GPU-in-use COM objects.
 fn pin_unconfirmed(entry: UnconfirmedSlot, device: Option<&ID3D12Device>, why: &'static str) {
-    poison(why);
+    poison_queue(why);
     if entry.signaled.is_none() {
         std::mem::forget(entry);
         return;
@@ -401,7 +479,7 @@ fn make_queue(device: &ID3D12Device) -> Option<Queue> {
                 ..Default::default()
             })?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-            Ok(Queue { device: device.clone(), queue, fence, sent: 0, free: Vec::new() })
+            Ok(Queue { device: device.clone(), queue, fence, sent: 0, free: Vec::new(), poison: QueuePoison::new() })
         })()
     };
     match made {
@@ -464,6 +542,10 @@ pub(super) unsafe fn send(
             STATS[3].fetch_add(1, Relaxed);
             return Outcome::NotSubmitted;
         };
+        if !q.poison.allow_submit(&STATE) {
+            STATS[3].fetch_add(1, Relaxed);
+            return Outcome::NotSubmitted;
+        }
         q.free.pop()
     };
     let Some(mut slot) = popped.or_else(|| make_slot(&host.device)) else {
@@ -529,6 +611,14 @@ pub(super) unsafe fn send(
             STATS[3].fetch_add(1, Relaxed);
             return Outcome::NotSubmitted;
         };
+        if !q.poison.allow_submit(&STATE) {
+            // Another thread (e.g. `give_back` on the relay thread) poisoned
+            // the copy queue after we passed the pre-lock fast check: return
+            // the unused slot cleanly without calling `ExecuteCommandLists`.
+            q.free.push(slot);
+            STATS[3].fetch_add(1, Relaxed);
+            return Outcome::NotSubmitted;
+        }
         // SAFETY: `list_to_run` was closed above and belongs to `slot`.
         unsafe { q.queue.ExecuteCommandLists(&[Some(list_to_run)]) };
         q.sent += 1;
@@ -537,9 +627,10 @@ pub(super) unsafe fn send(
         submitted_guard.arm(slot, q.fence.clone(), target);
         // SAFETY: `q.fence` is a live fence owned by the copy queue.
         if let Err(e) = unsafe { q.queue.Signal(&q.fence, target) } {
-            // `ExecuteCommandLists` already ran: `submitted_guard` poisons the
-            // copy queue, pins/leaks the bounce + allocator + sources, and the
-            // caller keeps its source upload memory out of reusable pools.
+            // Poison under `QUEUE` BEFORE unlocking so no concurrent `send()`
+            // can execute on this queue; `submitted_guard` then pins/leaks
+            // the bounce + allocator + sources after `QUEUE` unlocks.
+            poison_under_queue(q, "copy-queue Signal failed");
             tracing::warn!(error = %e, "what goes up to copies in the card's memory could not signal its fence: as before");
             STATS[3].fetch_add(1, Relaxed);
             return Outcome::SubmittedUnconfirmed;
@@ -615,6 +706,11 @@ pub(super) fn give_back(mut slot: Slot, pin_extra: impl FnOnce() -> Vec<ID3D12Re
                 q.free.push(slot);
                 Back::Stored(q.device.clone())
             } else {
+                // Poison under `QUEUE` BEFORE unlocking so any concurrent
+                // `send()` serialized on `QUEUE` bails out before
+                // `ExecuteCommandLists`, then pin in `UNCONFIRMED` after
+                // dropping `QUEUE`.
+                poison_under_queue(q, "copy-queue fence not confirmed at card_done");
                 let signaled = Some((q.fence.clone(), slot.last_sent));
                 Back::PinUnconfirmed(slot, signaled, Some(q.device.clone()))
             }
@@ -797,5 +893,47 @@ mod tests {
         // Subsequent trips are idempotent and keep submissions disabled.
         assert!(!state.trip());
         assert!(!state.allow_send());
+    }
+
+    #[test]
+    fn only_all_owned_send_memory_batches_are_eligible_for_upq() {
+        assert!(batch_eligible(true, true, &[SourceKind::OwnedSendMemory]));
+        assert!(batch_eligible(true, true, &[SourceKind::OwnedSendMemory, SourceKind::OwnedSendMemory]));
+        // Any shared `Card::staging` source in the batch disqualifies `upq`.
+        assert!(!batch_eligible(true, true, &[SourceKind::SharedCardStaging]));
+        assert!(!batch_eligible(true, true, &[SourceKind::OwnedSendMemory, SourceKind::SharedCardStaging]));
+        // Disabling `VICTORY_SEND_OWN`, enabling `upcheck`, or empty batches disqualify `upq`.
+        assert!(!batch_eligible(false, true, &[SourceKind::OwnedSendMemory]));
+        assert!(!batch_eligible(true, false, &[SourceKind::OwnedSendMemory]));
+        assert!(!batch_eligible(true, true, &[]));
+    }
+
+    #[test]
+    fn serialized_queue_poison_rejects_inflight_caller_before_submit() {
+        let state = UpqState::new();
+        let queue = Mutex::new(QueuePoison::new());
+
+        // Caller A passes the pre-lock fast check before any failure occurs.
+        assert!(state.allow_send());
+
+        // Concurrently, the relay thread detects an unconfirmed slot in
+        // `give_back` and poisons under the `QUEUE` lock before releasing it.
+        {
+            let mut q = queue.lock().unwrap();
+            assert!(q.allow_submit(&state));
+            assert!(q.mark_poisoned(&state));
+            assert!(!q.allow_submit(&state));
+            // Idempotent if called again under `QUEUE`.
+            assert!(!q.mark_poisoned(&state));
+        }
+
+        // Caller A now acquires `QUEUE` right before `ExecuteCommandLists`:
+        // the serialized check rejects submission cleanly (`Outcome::NotSubmitted`).
+        let submitted = {
+            let q = queue.lock().unwrap();
+            q.allow_submit(&state)
+        };
+        assert!(!submitted);
+        assert!(state.is_poisoned());
     }
 }

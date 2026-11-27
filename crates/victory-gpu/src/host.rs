@@ -4684,10 +4684,17 @@ impl Host {
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
                     if let Some(own) = &own {
-                        // With `upq`: the submission's own memory (the PC's)
-                        // comes whole into a buffer of ours in the card's on
-                        // the copy queue; the sends come from there.
-                        if looks.is_none() && upq::on() && upq::usable(&self.device) {
+                        // With `upq`: only owned immutable `send::Memory`
+                        // snapshots go up on the copy queue; shared
+                        // `Card::staging` fallbacks stay on the drawing queue.
+                        if upq::on()
+                            && upq::batch_eligible(
+                                send::own(),
+                                looks.is_none(),
+                                &[upq::SourceKind::OwnedSendMemory],
+                            )
+                            && upq::usable(&self.device)
+                        {
                             let (memory, used) = own.source();
                             match upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {}) {
                                 upq::Outcome::Sent(slot) => up = Some(slot),
@@ -4697,26 +4704,11 @@ impl Host {
                         }
                         let from = up.as_ref().and_then(upq::Slot::bounce);
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)), from);
-                    }
-                    // With `upq`: the PC's bytes come into a buffer of ours
-                    // on the copy queue, and this list copies them from
-                    // there (the card's memory), after a wait for that.
-                    if own.is_none() && looks.is_none() && upq::on() && upq::usable(&self.device) {
-                        let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
-                        let mut ranges: Vec<upq::Range<'_>> = Vec::new();
-                        for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
-                                ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
-                            }
-                        }
-                        match upq::send(self, &self.queue, &ranges, |i, bounce, at| {
-                            let (card, offset, _, bytes) = ranges[i];
-                            list.CopyBufferRegion(card, offset, bounce, at, bytes);
-                        }) {
-                            upq::Outcome::Sent(slot) => up = Some(slot),
-                            upq::Outcome::NotSubmitted => {}
-                            upq::Outcome::SubmittedUnconfirmed => up_unconfirmed = true,
-                        }
+                    } else if upq::on() {
+                        // Shared `Card::staging` batches bypass `upq` directly
+                        // onto the drawing queue below; still sweep any earlier
+                        // signaled unconfirmed copy-queue slots.
+                        upq::sweep(&self.device);
                     }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, _)) = shadow.card_sides() else {
@@ -4929,24 +4921,15 @@ impl Host {
             looks.read();
         }
         let sends = plan.sends;
-        let synced = plan._synced;
         let up_confirmed = match plan.up {
             Some(slot) => upq::give_back(slot, || {
-                if let Some(memory) = sends.as_ref() {
-                    vec![memory.resource().clone()]
-                } else {
-                    synced
-                        .iter()
-                        .filter_map(|s| s.card_sides().map(|(staging, _, _)| staging.clone()))
-                        .collect()
-                }
+                sends.as_ref().map(|memory| memory.resource().clone()).into_iter().collect()
             }),
             None => !plan.up_unconfirmed,
         };
         if let Some(memory) = sends {
             send::finish_memory(memory, up_confirmed);
         }
-        drop(synced);
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
