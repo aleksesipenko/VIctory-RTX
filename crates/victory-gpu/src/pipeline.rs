@@ -681,15 +681,15 @@ pub(crate) extern "system" fn create_compute_x(
 /// Provenance (GPL-3.0): that-one-guy7 #34.
 #[repr(C)]
 pub(crate) struct DeserializeComputeHead {
-    root: This,
-    kind0: *const u8,
-    kind0_size: usize,
-    kind1: *const u8,
-    kind1_size: usize,
-    kind6: *const u8,
-    kind6_size: usize,
-    kind7: *const u8,
-    kind7_size: usize,
+    pub(crate) root: This,
+    pub(crate) kind0: *const u8,
+    pub(crate) kind0_size: usize,
+    pub(crate) kind1: *const u8,
+    pub(crate) kind1_size: usize,
+    pub(crate) kind6: *const u8,
+    pub(crate) kind6_size: usize,
+    pub(crate) kind7: *const u8,
+    pub(crate) kind7_size: usize,
 }
 
 /// Wraps an assembled FSPX blob in a single-part `ACCC` DXBC container.
@@ -757,7 +757,7 @@ fn safe_read_bytes(src: *const u8, dst: &mut [u8]) -> bool {
 /// protection (unlike `WriteProcessMemory`, `ReadProcessMemory` probes `dst`
 /// via `ProbeForWrite` and rejects `PAGE_READONLY` and `PAGE_EXECUTE_READ`).
 #[cfg(windows)]
-fn safe_write_this(dst: *mut This, value: This) -> bool {
+pub(crate) fn safe_write_this(dst: *mut This, value: This) -> bool {
     if dst.is_null()
         || !(dst as usize).is_multiple_of(align_of::<This>())
         || (dst as usize).checked_add(size_of::<This>()).is_none()
@@ -781,7 +781,7 @@ fn safe_write_this(dst: *mut This, value: This) -> bool {
 }
 
 #[cfg(not(windows))]
-fn safe_write_this(dst: *mut This, value: This) -> bool {
+pub(crate) fn safe_write_this(dst: *mut This, value: This) -> bool {
     if dst.is_null() || !(dst as usize).is_multiple_of(align_of::<This>()) {
         return false;
     }

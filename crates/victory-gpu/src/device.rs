@@ -399,6 +399,36 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+/// Opt-in gate for `DeserializeComputePipelineStateX` (device slot 0x218).
+/// Default OFF (`E_NOTIMPL`): the title's FSPX compute blobs omit shader
+/// reflection names (breaking `ambient.rs` / `make.rs` role matching) and
+/// contain 490+ root-type-0 FSPX compute shaders that fail translation when
+/// `S_OK` suppresses the fallback to `CreateComputePipelineState` (causing
+/// blank frames). Set `VICTORY_DESERIALIZE_COMPUTE_X=1` to opt in for FSPX
+/// experiments.
+extern "system" fn deserialize_compute_x_opt_in(
+    this: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_DESERIALIZE_COMPUTE_X").is_some_and(|v| v == "1")
+    }) {
+        return pipeline::deserialize_compute_x(
+            this,
+            desc.cast::<pipeline::DeserializeComputeHead>(),
+            iid,
+            out,
+        );
+    }
+    if !pipeline::safe_write_this(out, std::ptr::null()) {
+        return E_INVALIDARG;
+    }
+    unknown_pipeline::<0x218>(this, desc, iid, std::ptr::null_mut())
+}
+
 /// The host device's state: the console's device is removed when the host's is
 /// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
 extern "system" fn removed_reason(_: This) -> HRESULT {
@@ -452,7 +482,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = pipeline::deserialize_compute_x as *const (); // 0x218
+    f[67] = deserialize_compute_x_opt_in as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -597,5 +627,104 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    fn run_slot_0x218_child(expect_enabled: bool) {
+        type Fn0x218 = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        let dev = device();
+        let call = slot::<Fn0x218>(dev, 0x218);
+
+        let mut k0 = [0u8; 0x1c];
+        k0[0x0c..0x0e].copy_from_slice(&8u16.to_le_bytes());
+        k0[0x0e..0x10].copy_from_slice(&16u16.to_le_bytes());
+        k0[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        k0[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        k0[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        k0[0x18..0x1c].copy_from_slice(&0x9cu32.to_le_bytes());
+        let k1 = [0x11u8; 0x14];
+        let code = [0x00u8, 0x00, 0x81, 0xBF];
+        let mut k7 = [0u8; 0x18 + 32];
+        let meta_len = (k7.len() - 0x14) as u32;
+        k7[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        k7[4..8].copy_from_slice(&meta_len.to_le_bytes());
+        k7[8..12].copy_from_slice(&(code.len() as u32 / 4).to_le_bytes());
+        k7[0x14] = 0x40;
+        k7[0x18] = 0x43;
+
+        let desc = crate::pipeline::DeserializeComputeHead {
+            root: std::ptr::null(),
+            kind0: k0.as_ptr(),
+            kind0_size: k0.len(),
+            kind1: k1.as_ptr(),
+            kind1_size: k1.len(),
+            kind6: code.as_ptr(),
+            kind6_size: code.len(),
+            kind7: k7.as_ptr(),
+            kind7_size: k7.len(),
+        };
+        let pipeline_iid = crate::object::guid(
+            0x765a30f3,
+            0xf624,
+            0x4c6f,
+            [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+        );
+
+        let mut out: This = dev;
+        let hr = call(dev, (&raw const desc).cast(), &pipeline_iid, &mut out);
+        if expect_enabled {
+            assert_eq!(hr, S_OK);
+            assert!(!out.is_null());
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
+        } else {
+            assert_eq!(hr, E_NOTIMPL);
+            assert!(out.is_null());
+        }
+
+        assert_eq!(
+            call(dev, (&raw const desc).cast(), &pipeline_iid, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        let unaligned = (&raw mut out).cast::<u8>().wrapping_add(1).cast::<This>();
+        assert_eq!(call(dev, (&raw const desc).cast(), &pipeline_iid, unaligned), E_INVALIDARG);
+        #[cfg(windows)]
+        assert_eq!(
+            call(dev, (&raw const desc).cast(), &pipeline_iid, 0x1040usize as *mut This),
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn deserialize_compute_x_slot_respects_opt_in_gate_and_safe_out_write() {
+        if let Ok(mode) = std::env::var("VICTORY_TEST_SLOT_0X218_CHILD") {
+            match mode.as_str() {
+                "off" => run_slot_0x218_child(false),
+                "on" => run_slot_0x218_child(true),
+                other => panic!("unexpected VICTORY_TEST_SLOT_0X218_CHILD={other}"),
+            }
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let run_child = |mode: &str, opt_in: Option<&str>| {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("--exact")
+                .arg("device::tests::deserialize_compute_x_slot_respects_opt_in_gate_and_safe_out_write")
+                .arg("--nocapture")
+                .env("VICTORY_TEST_SLOT_0X218_CHILD", mode)
+                .env_remove("VICTORY_DESERIALIZE_COMPUTE_X");
+            if let Some(val) = opt_in {
+                cmd.env("VICTORY_DESERIALIZE_COMPUTE_X", val);
+            }
+            let output = cmd.output().expect("spawn isolated 0x218 test child");
+            assert!(
+                output.status.success(),
+                "isolated 0x218 child mode={mode} opt_in={opt_in:?} failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        };
+        run_child("off", None);
+        run_child("off", Some("0"));
+        run_child("on", Some("1"));
     }
 }
