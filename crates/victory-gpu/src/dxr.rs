@@ -37,6 +37,92 @@ fn strict_tlas() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DXR_STRICT_TLAS").is_some_and(|v| v == "1"))
 }
 
+const AS_ALIGN: u64 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT as u64;
+const MIN_SCRATCH_BYTES: u64 = 16 << 20;
+const MIN_TLAS_RESERVE_BYTES: u64 = 4 << 20;
+const MIN_INST_POOL_BYTES: u64 = 64 * 1024;
+const MAX_POOLED_INST_BYTES: u64 = 4 << 20;
+const MAX_FREE_INST: usize = 8;
+const MAX_FREE_TABLES: usize = 4;
+const DEFAULT_REFIT_PERIOD: u32 = 64;
+
+fn refit_dynamic_blas() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT_REFIT").is_some_and(|v| v == "1"))
+}
+
+fn parse_refit_period(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_REFIT_PERIOD)
+}
+
+fn refit_period() -> u32 {
+    static PERIOD: OnceLock<u32> = OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        parse_refit_period(std::env::var("VICTORY_NATIVE_RT_REFIT_PERIOD").ok().as_deref())
+    })
+}
+
+/// Bump-allocates 256B-aligned scratch slices across consecutive independent BLAS
+/// builds within one submission so they run without per-BLAS `UAV` barriers,
+/// flushing only on destination/source VA hazards, scratch exhaustion, or before
+/// a dependent op (`CopyAs`, `BuildTlas`, or end of command list).
+#[derive(Default)]
+struct ScratchBatcher {
+    buf_id: usize,
+    cursor: u64,
+    written_dests: Vec<u64>,
+}
+
+impl ScratchBatcher {
+    fn has_pending(&self) -> bool {
+        !self.written_dests.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.cursor = 0;
+        self.written_dests.clear();
+    }
+
+    /// Reserves a 256B-aligned scratch slice of `need` bytes within scratch buffer
+    /// `buf_id` (`capacity >= aligned(need)`). Returns `(emit_uav_barrier_first, byte_offset)`.
+    fn alloc(
+        &mut self,
+        buf_id: usize,
+        capacity: u64,
+        need: u64,
+        dest_va: u64,
+        src_va: u64,
+    ) -> (bool, u64) {
+        let aligned = need.max(AS_ALIGN).next_multiple_of(AS_ALIGN);
+        if buf_id != self.buf_id {
+            self.buf_id = buf_id;
+            self.cursor = 0;
+        }
+        let dest_conflict = self.written_dests.contains(&dest_va);
+        let src_conflict = src_va != 0 && self.written_dests.contains(&src_va);
+        let fits = self
+            .cursor
+            .checked_add(aligned)
+            .is_some_and(|end| end <= capacity);
+        let need_barrier = self.has_pending() && (dest_conflict || src_conflict || !fits);
+        if need_barrier {
+            self.reset();
+        }
+        let offset = self.cursor;
+        self.cursor = offset.saturating_add(aligned);
+        self.written_dests.push(dest_va);
+        (need_barrier, offset)
+    }
+
+    fn flush(&mut self, list: &ID3D12GraphicsCommandList4) {
+        if self.has_pending() {
+            barrier(list);
+            self.reset();
+        }
+    }
+}
+
 static UNRECORDED: AtomicU64 = AtomicU64::new(0);
 static EMPTY_TLAS_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
@@ -65,17 +151,53 @@ pub(crate) fn prepare(batch: Captured, list: &crate::host::HostList) -> Arc<[Wor
         .collect()
 }
 
+type PinSlot = Arc<Mutex<Vec<(u64, Arc<Entry>)>>>;
+
+/// Merges all candidate BLAS entries from `table` into `slot` (deduplicated by `Arc::ptr_eq`)
+/// without dropping existing pins. Used on in-place TLAS failure paths so any GPU draw queued
+/// after the failed build still keeps every potential BLAS slab slice alive until the TLAS
+/// resource's `ID3DDestructionNotifier` fires (strictly after `finish_slot_readers()`).
+fn retain_table_pins(slot: &PinSlot, table: &Table) {
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, key, ref entry) in &table.slots {
+        if !guard.iter().any(|(_, existing)| Arc::ptr_eq(existing, entry)) {
+            guard.push((key, entry.clone()));
+        }
+    }
+}
+
+/// Preserves candidate BLAS pins for every unprocessed in-place TLAS observation in a
+/// popped flight before returning an early error from `collect()`.
+fn retain_in_place_pins<'a>(observations: impl IntoIterator<Item = &'a Observation>) {
+    for obs in observations {
+        if obs.in_place
+            && let (Some(slot), Some(table)) = (&obs.entry.pins, &obs.table)
+        {
+            retain_table_pins(slot, table);
+        }
+    }
+}
+
 struct Entry {
     storage: Storage,
     top: bool,
     serial: u64,
+    /// Monotonic generation stamped on creation and incremented on every in-place
+    /// TLAS write so an earlier failed observation never evicts a later queued rebuild.
+    write_serial: AtomicU64,
     flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS,
     shape: Option<Vec<geometry::UpdateGeometry>>,
     update_scratch: u64,
     full_size: u64,
+    consecutive_refits: u32,
     compact_size: AtomicU64,
     ready: AtomicBool,
-    deps: OnceLock<Vec<(u64, u64)>>,
+    deps: Mutex<Option<Vec<(u64, u64)>>>,
+    /// Single-registration pin slot attached once to a TLAS `storage.buffer` via
+    /// `keep_on_resource`, storing `(guest_blas_va, Arc<Entry>)` pairs. Swapped
+    /// in-place in `collect()` after the rebuilding flight's fence completes so old
+    /// BLASes remain alive for all prior GPU readers and release once unreachable.
+    pins: Option<PinSlot>,
 }
 struct Observation {
     key: u64,
@@ -84,6 +206,8 @@ struct Observation {
     table: Option<Arc<Table>>,
     kind: Kind,
     compacted_from: Option<u64>,
+    in_place: bool,
+    write_serial: u64,
 }
 #[derive(Clone, Copy)]
 enum Kind {
@@ -111,6 +235,8 @@ struct Stats {
     static_blas: u64,
     refits: u64,
     tlas: u64,
+    tlas_reused: u64,
+    blas_batched: u64,
     compacted: u64,
     missing_blas: u64,
     auto_compacted: u64,
@@ -157,6 +283,7 @@ struct Flight {
     _work: Arc<[Work]>,
     resources: Vec<ID3D12Resource>,
     patched: Vec<ID3D12Resource>,
+    table_uploads: Vec<ID3D12Resource>,
     sources: Vec<Arc<Entry>>,
 }
 
@@ -170,6 +297,10 @@ struct Engine {
     compactions: VecDeque<(u64, u64)>,
     entries: HashMap<u64, Arc<Entry>>,
     table: Option<Arc<Table>>,
+    table_words: Vec<[u32; 4]>,
+    free_table_bufs: Vec<ID3D12Resource>,
+    free_table_uploads: Vec<ID3D12Resource>,
+    free_inst: Vec<ID3D12Resource>,
     patch: Patcher,
     scratch: Option<(u64, ID3D12Resource)>,
     pending: VecDeque<Flight>,
@@ -224,6 +355,10 @@ impl Sidecar {
             compactions: VecDeque::new(),
             entries: HashMap::new(),
             table: None,
+            table_words: Vec::new(),
+            free_table_bufs: Vec::new(),
+            free_table_uploads: Vec::new(),
+            free_inst: Vec::new(),
             patch: Patcher::new(&dev)?,
             scratch: None,
             pending: VecDeque::new(),
@@ -385,7 +520,7 @@ impl Engine {
         }
         tracing::info!(target:"victory_gpu::host", input_items, submitted_items=s.input+lost, pending_items,
             built=s.built, skipped=s.skipped, failed=s.failed+lost,
-            dynamic_blas=s.dynamic, static_blas=s.static_blas,refits=s.refits,tlas=s.tlas,compacted=s.compacted+s.auto_compacted, auto_compacted=s.auto_compacted, auto_refused=s.auto_refused,
+            dynamic_blas=s.dynamic, static_blas=s.static_blas,refits=s.refits,tlas=s.tlas,tlas_reused=s.tlas_reused,blas_batched=s.blas_batched,compacted=s.compacted+s.auto_compacted, auto_compacted=s.auto_compacted, auto_refused=s.auto_refused,
             missing_blas=s.missing_blas,stale_tlas=s.stale, empty_tlas_fallbacks=EMPTY_TLAS_FALLBACKS.load(Relaxed), pending_batches=self.pending.len(), reasons=?s.reasons,
             slab_mb=memory::slab_bytes()>>20, local_bytes=local, non_local_bytes=other, budget_bytes=budget,
             limit_bytes=memory::limit(self.mem.cap,budget), local_peak_bytes=local_peak,
@@ -401,26 +536,61 @@ impl Engine {
         self.collect()
     }
 
+    fn recycle_table(&mut self, table: Arc<Table>) {
+        // SAFETY of state/lifetime: `Arc::try_unwrap` succeeds only when neither
+        // `self.table` nor any remaining in-flight `Flight` holds `table`. All prior
+        // SRV reads have completed on DIRECT and decayed `table.buf` back to COMMON.
+        if let Ok(t) = Arc::try_unwrap(table)
+            && self.free_table_bufs.len() < MAX_FREE_TABLES
+        {
+            self.free_table_bufs.push(t.buf);
+        }
+    }
+
+    fn clear_table(&mut self) {
+        if let Some(old_table) = self.table.take() {
+            self.recycle_table(old_table);
+        }
+    }
+
     fn collect(&mut self) -> Checked<()> {
         let done = unsafe { self.fence.GetCompletedValue() };
         if done == u64::MAX {
             return Err("device removed from DXR fence");
         }
+        let strict = strict_tlas();
         while self.pending.front().is_some_and(|p| p.fence <= done) {
             let f = self.pending.pop_front().unwrap();
-            let bytes = commands::read_bytes(&f.cmd.read, f.bytes as usize)?;
+            let bytes = match commands::read_bytes(&f.cmd.read, f.bytes as usize) {
+                Ok(bytes) => bytes,
+                Err(why) => {
+                    retain_in_place_pins(&f.observations);
+                    return Err(why);
+                }
+            };
             let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
             self.stats.gpu_ticks += u64_at(8).saturating_sub(u64_at(0));
-            for obs in f.observations {
-                {
-                    let size = u64_at(obs.offset as usize);
-                    if size == 0 || size > obs.entry.storage.bytes {
-                        if matches!(obs.kind, Kind::AutoCompact) {
-                            self.stats.auto_refused += 1;
-                        } else if !matches!(obs.kind, Kind::Empty) {
-                            self.stats
-                                .reject(1, "invalid postbuild compacted size", false);
-                        }
+            let mut obs_iter = f.observations.into_iter();
+            while let Some(obs) = obs_iter.next() {
+                let is_latest_write = obs.entry.write_serial.load(Relaxed) == obs.write_serial;
+                let size = u64_at(obs.offset as usize);
+                if size == 0 || size > obs.entry.storage.bytes {
+                    if matches!(obs.kind, Kind::AutoCompact) {
+                        self.stats.auto_refused += 1;
+                    } else if !matches!(obs.kind, Kind::Empty) {
+                        self.stats
+                            .reject(1, "invalid postbuild compacted size", false);
+                    }
+                    if obs.in_place
+                        && let (Some(slot), Some(table)) = (&obs.entry.pins, &obs.table)
+                    {
+                        // Preserve every potential BLAS dependency on the TLAS resource's
+                        // destruction notifier before dropping `obs.table` so draws queued
+                        // after `f` cannot hit a freed BLAS slab slice before `finish_slot_readers()`.
+                        retain_table_pins(slot, table);
+                    }
+                    if is_latest_write {
+                        obs.entry.ready.store(false, Relaxed);
                         if self
                             .entries
                             .get(&obs.key)
@@ -428,27 +598,49 @@ impl Engine {
                         {
                             self.replace(obs.key, None);
                         }
-                        continue;
                     }
-                    obs.entry.compact_size.store(size, Relaxed);
-                    if matches!(obs.kind, Kind::Static)
-                        && obs.entry.storage.bytes.saturating_sub(size) >= 4096
-                        && size <= obs.entry.storage.bytes - obs.entry.storage.bytes / 8
-                        && self.compactions.len() < 4096
+                    if let Some(table) = obs.table {
+                        self.recycle_table(table);
+                    }
+                    // A prebuild-validated in-place TLAS (already bound to a live shader-visible
+                    // descriptor) or an exposed BLAS still referenced by a live/pending TLAS
+                    // reporting `size == 0 || size > storage.bytes` indicates a fatal GPU/driver
+                    // fault; fail closed instead of letting subsequent draws trace corrupted data.
+                    if obs.in_place {
+                        retain_in_place_pins(obs_iter.as_slice());
+                        return Err("invalid in-place TLAS postbuild size");
+                    }
+                    if !obs.entry.top
+                        && !matches!(obs.kind, Kind::AutoCompact | Kind::Empty)
+                        && !strict
+                        && Arc::strong_count(&obs.entry) > 1
                     {
-                        self.compactions.push_back((obs.key, obs.entry.serial));
+                        retain_in_place_pins(obs_iter.as_slice());
+                        return Err("invalid referenced BLAS postbuild size");
                     }
+                    continue;
+                }
+                obs.entry.compact_size.store(size, Relaxed);
+                if matches!(obs.kind, Kind::Static)
+                    && obs.entry.storage.bytes.saturating_sub(size) >= 4096
+                    && size <= obs.entry.storage.bytes - obs.entry.storage.bytes / 8
+                    && self.compactions.len() < 4096
+                {
+                    self.compactions.push_back((obs.key, obs.entry.serial));
                 }
                 if let Some(serial) = obs.compacted_from {
-                    // A guest TLAS may have started using the source while this
-                    // optional copy was in flight. Keep that valid version in place.
+                    // If the guest already rebuilt this BLAS while compaction was in flight,
+                    // never overwrite it. In strict mode also refuse if a TLAS started using it.
                     if self
                         .entries
                         .get(&obs.key)
                         .is_none_or(|e| e.serial != serial)
-                        || self.tlas_uses(obs.key, serial)
+                        || (strict && self.tlas_uses(obs.key, serial))
                     {
                         self.stats.auto_refused += 1;
+                        if let Some(table) = obs.table {
+                            self.recycle_table(table);
+                        }
                         continue;
                     }
                     self.replace(obs.key, Some(obs.entry.clone()));
@@ -462,47 +654,84 @@ impl Engine {
                     for (slot, key, entry) in &table.slots {
                         if bytes[base + 8 + slot / 8] & (1 << (slot % 8)) != 0 {
                             deps.push((*key, entry.serial));
-                            pins.push(entry.clone());
+                            pins.push((*key, entry.clone()));
                         }
                     }
                     // `patch.hlsl` already masks missing BLAS entries with `last.zw = 0`
                     // (legal null instance in DXR). Reject the whole TLAS only when zero
                     // valid instances survived or strict certification mode is requested.
-                    if missing != 0 && (deps.is_empty() || strict_tlas()) {
+                    if missing != 0 && (deps.is_empty() || strict) {
                         self.stats.reject(1, "TLAS references missing BLAS", false);
-                        if self
-                            .entries
-                            .get(&obs.key)
-                            .is_some_and(|e| Arc::ptr_eq(e, &obs.entry))
+                        if obs.in_place
+                            && let Some(slot) = &obs.entry.pins
                         {
-                            self.replace(obs.key, None);
+                            // Unconditionally retain candidate BLAS pins on the resource's
+                            // PinSlot (overwritten by any later queued rebuild on completion,
+                            // or released when the resource is destroyed after `finish_slot_readers()`).
+                            retain_table_pins(slot, &table);
                         }
+                        if is_latest_write {
+                            obs.entry.ready.store(false, Relaxed);
+                            if self
+                                .entries
+                                .get(&obs.key)
+                                .is_some_and(|e| Arc::ptr_eq(e, &obs.entry))
+                            {
+                                self.replace(obs.key, None);
+                            }
+                        }
+                        self.recycle_table(table);
                         continue;
                     }
-                    // A BLAS could already have been rebuilt by a later queued submission.
-                    let current = deps
-                        .iter()
-                        .all(|(k, g)| self.entries.get(k).is_some_and(|e| e.serial == *g));
-                    memory::keep_on_resource(&obs.entry.storage.buffer, pins)?;
-                    obs.entry.deps.set(deps).ok();
-                    obs.entry.ready.store(current, Relaxed);
-                    if !current {
-                        self.stats.stale += 1;
-                        if self
-                            .entries
-                            .get(&obs.key)
-                            .is_some_and(|e| Arc::ptr_eq(e, &obs.entry))
-                        {
-                            self.replace(obs.key, None);
-                        }
+                    // In strict mode invalidate if any referenced BLAS changed generation.
+                    // In live mode every BLAS slice is immutable and pinned in `obs.entry.pins`,
+                    // so the TLAS remains completely valid until the next TLAS build completes.
+                    let current = !strict
+                        || deps
+                            .iter()
+                            .all(|(k, g)| self.entries.get(k).is_some_and(|e| e.serial == *g));
+                    if let Some(slot) = &obs.entry.pins {
+                        // Prior readers of the previous TLAS generation finished before
+                        // `f.fence <= done`; swap in this generation's exact BLAS pins.
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = pins;
                     }
+                    *obs.entry.deps.lock().unwrap_or_else(|e| e.into_inner()) = Some(deps);
+                    if !current {
+                        if is_latest_write {
+                            obs.entry.ready.store(false, Relaxed);
+                            self.stats.stale += 1;
+                            if self
+                                .entries
+                                .get(&obs.key)
+                                .is_some_and(|e| Arc::ptr_eq(e, &obs.entry))
+                            {
+                                self.replace(obs.key, None);
+                            }
+                        }
+                    } else if self
+                        .entries
+                        .get(&obs.key)
+                        .is_some_and(|e| Arc::ptr_eq(e, &obs.entry))
+                    {
+                        obs.entry.ready.store(true, Relaxed);
+                    }
+                    self.recycle_table(table);
                 } else {
-                    let valid = obs.entry.deps.get().is_none_or(|ds| {
-                        ds.iter()
-                            .all(|(k, g)| self.entries.get(k).is_some_and(|e| e.serial == *g))
-                    });
+                    let valid = !strict
+                        || obs
+                            .entry
+                            .deps
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .is_none_or(|ds| {
+                                ds.iter().all(|(k, g)| {
+                                    self.entries.get(k).is_some_and(|e| e.serial == *g)
+                                })
+                            });
                     obs.entry.ready.store(valid, Relaxed);
                     if !valid
+                        && is_latest_write
                         && self
                             .entries
                             .get(&obs.key)
@@ -514,6 +743,20 @@ impl Engine {
                 }
                 self.stats.built(obs.kind);
             }
+            for buf in f.patched {
+                // SAFETY: `f.fence <= done`; buffer ended in NON_PIXEL_SHADER_RESOURCE and
+                // decayed to COMMON after ExecuteCommandLists.
+                if self.free_inst.len() < MAX_FREE_INST
+                    && unsafe { buf.GetDesc().Width } <= MAX_POOLED_INST_BYTES
+                {
+                    self.free_inst.push(buf);
+                }
+            }
+            for upload in f.table_uploads {
+                if self.free_table_uploads.len() < MAX_FREE_TABLES {
+                    self.free_table_uploads.push(upload);
+                }
+            }
             if self.pool.len() < 8 && f.cmd.capacity <= 2 << 20 {
                 self.pool.push(f.cmd);
             }
@@ -523,15 +766,22 @@ impl Engine {
 
     fn replace(&mut self, key: u64, new: Option<Arc<Entry>>) {
         let old = self.entries.remove(&key);
+        if let Some(ref evicted) = old
+            && evicted.top
+        {
+            evicted.ready.store(false, Relaxed);
+        }
         let changed_blas = old.as_ref().is_some_and(|e| !e.top);
         if changed_blas || new.as_ref().is_some_and(|e| !e.top) {
-            self.table = None;
+            self.clear_table();
         }
-        if changed_blas {
+        if changed_blas && strict_tlas() {
             self.entries.retain(|_, t| {
                 let stale = t.top
                     && t.deps
-                        .get()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
                         .is_some_and(|ds| ds.iter().any(|(k, _)| *k == key));
                 if stale {
                     t.ready.store(false, Relaxed);
@@ -549,14 +799,18 @@ impl Engine {
         self.pending
             .iter()
             .any(|f| f.observations.iter().any(|o| o.entry.top))
-            || self
-                .entries
-                .values()
-                .any(|t| t.top && t.deps.get().is_some_and(|ds| ds.contains(&(key, serial))))
+            || self.entries.values().any(|t| {
+                t.top
+                    && t.deps
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_some_and(|ds| ds.contains(&(key, serial)))
+            })
     }
 
     fn maintain(&mut self) -> Checked<()> {
-        // Do not churn dependencies of a valid/pending TLAS to save a few KiB.
+        // Avoid piling maintenance copies onto an active TLAS submission.
         if self
             .pending
             .iter()
@@ -564,12 +818,13 @@ impl Engine {
         {
             return Ok(());
         }
+        let strict = strict_tlas();
         let mut ops = Vec::new();
         while ops.len() < 8
             && let Some((key, serial)) = self.compactions.pop_front()
         {
             if self.entries.get(&key).is_none_or(|e| e.serial != serial)
-                || self.tlas_uses(key, serial)
+                || (strict && self.tlas_uses(key, serial))
             {
                 continue;
             }
@@ -610,7 +865,7 @@ impl Engine {
             // drop TLAS entries so no stale TLAS persists while keeping built BLASes.
             if strict_tlas() {
                 self.entries.retain(|&k, _| k == 0);
-                self.table = None;
+                self.clear_table();
             } else {
                 self.entries.retain(|&k, e| k == 0 || !e.top);
                 tracing::warn!(target: "victory_gpu::host", why, "native RT rejected batch without destination VA; invalidated TLAS entries");
@@ -626,15 +881,16 @@ impl Engine {
         if self.pending.len() >= 16 {
             self.wait(self.pending.front().unwrap().fence)?;
         }
-        // Real Copy is a separate ABI call/boundary. If its postbuild query is still
-        // in flight, wait for that producer, never substitute CLONE or guess a size.
+        // Real Copy is a separate ABI call/boundary. If its source has any pending
+        // build (initial build or in-place TLAS rebuild), wait for that producer so
+        // `compact_size` and TLAS `pins`/`deps` match the exact copied generation.
         if let [w] = &*work
             && let Op::Copy { src, mode: 1, .. } = w.op
             && let Some(e) = self.entries.get(&src)
-            && e.compact_size.load(Relaxed) == 0
             && let Some(f) = self
                 .pending
                 .iter()
+                .rev()
                 .find(|f| f.observations.iter().any(|o| Arc::ptr_eq(&o.entry, e)))
         {
             self.wait(f.fence)?;
@@ -665,13 +921,25 @@ impl Engine {
             _work: work.clone(),
             resources: vec![],
             patched: vec![],
+            table_uploads: vec![],
             sources: vec![],
         };
+        let mut scratch_batch = ScratchBatcher::default();
         let mut offset = 16;
         for w in work.iter() {
             let res = match &w.op {
-                Op::Build(b) => self.build(&mut f, w, b, offset, origin == Origin::Empty),
-                Op::Copy { dst, src, mode } => self.copy(&mut f, *dst, *src, *mode, offset, origin),
+                Op::Build(b) => self.build(
+                    &mut f,
+                    &mut scratch_batch,
+                    w,
+                    b,
+                    offset,
+                    origin == Origin::Empty,
+                ),
+                Op::Copy { dst, src, mode } => {
+                    scratch_batch.flush(&f.cmd.list);
+                    self.copy(&mut f, *dst, *src, *mode, offset, origin)
+                }
                 Op::Rejected { why, .. } => Err(*why),
             };
             if let Err(why) = res {
@@ -679,6 +947,7 @@ impl Engine {
             }
             offset += report_size(w);
         }
+        scratch_batch.flush(&f.cmd.list);
         let list = f.cmd.finish(needed)?;
         // No fallible allocation or publication outside the submit lock. Signal failure
         // is fatal, since without a fence no resource can safely be released.
@@ -693,6 +962,7 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn result(
         &mut self,
         bytes: u64,
@@ -701,26 +971,105 @@ impl Engine {
         shape: Option<Vec<geometry::UpdateGeometry>>,
         full_size: u64,
         update_scratch: u64,
+        consecutive_refits: u32,
     ) -> Checked<Arc<Entry>> {
         let storage = self.mem.as_storage(bytes, top)?;
+        let pins = if top {
+            let slot: PinSlot = Arc::new(Mutex::new(Vec::new()));
+            memory::keep_on_resource(&storage.buffer, slot.clone())?;
+            Some(slot)
+        } else {
+            None
+        };
         self.generation += 1;
         Ok(Arc::new(Entry {
             storage,
             top,
             serial: self.generation,
+            write_serial: AtomicU64::new(self.generation),
             flags,
             shape,
             update_scratch,
             full_size,
+            consecutive_refits,
             compact_size: AtomicU64::new(0),
             ready: AtomicBool::new(false),
-            deps: OnceLock::new(),
+            deps: Mutex::new(None),
+            pins,
         }))
+    }
+
+    fn take_inst_buffer(&mut self, need: u64) -> Checked<ID3D12Resource> {
+        let best = self
+            .free_inst
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let w = unsafe { b.GetDesc().Width };
+                (w >= need).then_some((i, w))
+            })
+            .min_by_key(|&(_, w)| w)
+            .map(|(i, _)| i);
+        if let Some(i) = best {
+            return Ok(self.free_inst.swap_remove(i));
+        }
+        let want = need
+            .checked_next_power_of_two()
+            .unwrap_or(need)
+            .max(MIN_INST_POOL_BYTES);
+        match self.mem.buffer(
+            want,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ) {
+            Ok(buf) => Ok(buf),
+            Err(_) if want > need => self.mem.buffer(
+                need,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ),
+            Err(why) => Err(why),
+        }
+    }
+
+    fn ensure_scratch(&mut self, need: u64) -> Checked<(u64, ID3D12Resource)> {
+        let aligned = need.max(AS_ALIGN).next_multiple_of(65536);
+        if self.scratch.as_ref().is_none_or(|(n, _)| *n < aligned) {
+            let cur = self.scratch.as_ref().map_or(0, |(n, _)| *n);
+            let want = aligned
+                .max(MIN_SCRATCH_BYTES)
+                .max(cur.saturating_mul(2).min(64 << 20))
+                .next_multiple_of(65536);
+            let (cap, buf) = match self.mem.buffer(
+                want,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ) {
+                Ok(buf) => (want, buf),
+                Err(_) if want > aligned => (
+                    aligned,
+                    self.mem.buffer(
+                        aligned,
+                        D3D12_HEAP_TYPE_DEFAULT,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    )?,
+                ),
+                Err(why) => return Err(why),
+            };
+            self.scratch = Some((cap, buf));
+        }
+        let (cap, buf) = self.scratch.as_ref().unwrap();
+        Ok((*cap, buf.clone()))
     }
 
     fn build(
         &mut self,
         f: &mut Flight,
+        scratch_batch: &mut ScratchBatcher,
         w: &Work,
         b: &capture::Build,
         off: u64,
@@ -731,6 +1080,8 @@ impl Engine {
         let native = w.input.as_ref().map_err(|e| *e)?;
         let top = matches!(native, Native::Tlas(..));
         let raw = b.desc.inputs.flags as i32;
+        let auto_refit = refit_dynamic_blas() && !top && b.rehydrate.is_none();
+        let period = refit_period();
         // The low six bits are the console's standard DXR flags. Do not pass
         // platform-only optimization bits through to NVIDIA's driver.
         let mut flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(
@@ -741,6 +1092,8 @@ impl Engine {
         }
         if top {
             flags.0 &= !ALLOW;
+        } else if auto_refit {
+            flags.0 |= ALLOW;
         }
         let shape = match native {
             Native::Blas(g) if flags.0 & ALLOW != 0 || raw & UPDATE != 0 => {
@@ -748,17 +1101,25 @@ impl Engine {
             }
             _ => None,
         };
-        let source = self
-            .entries
-            .get(&b.desc.source_va)
+        let explicit_update = raw & UPDATE != 0;
+        let candidate_va = if explicit_update {
+            b.desc.source_va
+        } else if auto_refit {
+            b.desc.dest_va
+        } else {
+            0
+        };
+        let source = (candidate_va != 0 && (explicit_update || auto_refit))
+            .then(|| self.entries.get(&candidate_va))
+            .flatten()
             .filter(|e| {
                 !top && !e.top
-                    && raw & UPDATE != 0
                     && e.flags.0 & ALLOW != 0
                     && (e.flags.0 & !ALLOW) == (flags.0 & !ALLOW)
                     && shape.is_some()
                     && e.shape == shape
                     && e.update_scratch > 0
+                    && (!auto_refit || period == 0 || e.consecutive_refits < period)
             })
             .cloned();
         let mut inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
@@ -792,65 +1153,109 @@ impl Engine {
         if pre.ResultDataMaxSizeInBytes == 0 {
             return Err("unsupported DXR prebuild inputs");
         }
-        let (result_bytes, scratch) = source.as_ref().map_or(
+        let (result_bytes, scratch_need) = source.as_ref().map_or(
             (pre.ResultDataMaxSizeInBytes, pre.ScratchDataSizeInBytes),
             |e| (e.full_size, e.update_scratch),
         );
-        if self
-            .scratch
+        let (scratch_cap, scratch) = self.ensure_scratch(scratch_need)?;
+        let reuse = if top && !empty && num > 0 && !strict_tlas() {
+            self.entries
+                .get(&b.desc.dest_va)
+                .filter(|e| e.top && e.ready.load(Relaxed) && e.storage.bytes >= result_bytes)
+                .cloned()
+        } else {
+            None
+        };
+        let in_place = reuse.is_some();
+        let next_refits = source
             .as_ref()
-            .is_none_or(|(n, _)| *n < scratch.max(256))
-        {
-            let n = scratch.max(256).next_multiple_of(65536);
-            let buf = self.mem.buffer(
-                n,
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            )?;
-            self.scratch = Some((n, buf));
-        }
-        let scratch = self.scratch.as_ref().unwrap().1.clone();
-        let entry = self.result(
-            result_bytes,
-            top,
-            source.as_ref().map_or(flags, |e| e.flags),
-            shape,
-            result_bytes,
-            source
-                .as_ref()
-                .map_or(pre.UpdateScratchDataSizeInBytes, |e| e.update_scratch),
-        )?;
-        let report = unsafe { f.cmd.report.GetGPUVirtualAddress() } + off;
-        let mut table = None;
-        if num != 0 {
-            let inst = self.mem.buffer(
-                u64::from(num) * 64,
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            )?;
-            if self.table.is_none() {
-                let (snapshot, upload) = Table::new(&mut self.mem, &self.entries)?;
-                // Each new hash version has its own immutable upload. Multiple TLAS
-                // builds in one batch can see different contents of the same guest VA.
-                unsafe {
-                    f.cmd.list.CopyBufferRegion(
-                        &snapshot.buf,
-                        0,
-                        &upload,
-                        0,
-                        commands::SLOTS as u64 * 16,
-                    );
-                    f.cmd.list.ResourceBarrier(&[crate::host::transition(
-                        &snapshot.buf,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    )]);
+            .map_or(0, |e| e.consecutive_refits.saturating_add(1));
+        let entry = if let Some(existing) = reuse {
+            existing
+        } else if top && !empty && num > 0 && !strict_tlas() {
+            let reserve = result_bytes
+                .checked_next_power_of_two()
+                .unwrap_or(result_bytes)
+                .max(MIN_TLAS_RESERVE_BYTES);
+            match self.result(reserve, top, flags, shape.clone(), result_bytes, 0, 0) {
+                Ok(e) => e,
+                Err(_) if reserve > result_bytes => {
+                    self.result(result_bytes, top, flags, shape, result_bytes, 0, 0)?
                 }
-                f.resources.push(upload);
-                self.table = Some(snapshot);
+                Err(why) => return Err(why),
             }
+        } else {
+            self.result(
+                result_bytes,
+                top,
+                source.as_ref().map_or(flags, |e| e.flags),
+                shape,
+                result_bytes,
+                source
+                    .as_ref()
+                    .map_or(pre.UpdateScratchDataSizeInBytes, |e| e.update_scratch),
+                next_refits,
+            )?
+        };
+        let report = unsafe { f.cmd.report.GetGPUVirtualAddress() } + off;
+        // Complete all fallible allocations before recording any GPU commands.
+        let (inst, new_table) = if num != 0 {
+            let inst = self.take_inst_buffer(u64::from(num) * 64)?;
+            let new_table = if self.table.is_none() {
+                match Table::build(
+                    &mut self.mem,
+                    &self.entries,
+                    &mut self.table_words,
+                    &mut self.free_table_bufs,
+                    &mut self.free_table_uploads,
+                ) {
+                    Ok(pair) => Some(pair),
+                    Err(why) => {
+                        if self.free_inst.len() < MAX_FREE_INST
+                            && unsafe { inst.GetDesc().Width } <= MAX_POOLED_INST_BYTES
+                        {
+                            self.free_inst.push(inst);
+                        }
+                        return Err(why);
+                    }
+                }
+            } else {
+                None
+            };
+            (Some(inst), new_table)
+        } else {
+            (None, None)
+        };
+
+        // Past this point every step is infallible.
+        if top {
+            // Flush any batched BLAS builds (and their postbuild report writes) before
+            // patching instances and building a TLAS that may reference them.
+            scratch_batch.flush(&f.cmd.list);
+        }
+        if let Some((snapshot, upload)) = new_table {
+            // Each new hash version uses its own upload + GPU snapshot until fence completion.
+            // Multiple TLAS builds in one batch can see different contents of the same guest VA.
+            unsafe {
+                f.cmd.list.ResourceBarrier(&[crate::host::transition(
+                    &snapshot.buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                f.cmd
+                    .list
+                    .CopyBufferRegion(&snapshot.buf, 0, &upload, 0, commands::TABLE_BYTES);
+                f.cmd.list.ResourceBarrier(&[crate::host::transition(
+                    &snapshot.buf,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+            f.table_uploads.push(upload);
+            self.table = Some(snapshot);
+        }
+        let mut table = None;
+        if let Some(inst) = inst {
             let t = self.table.as_ref().unwrap().clone();
             self.patch
                 .record(&f.cmd.list, num, inst_src, &t, &inst, report + 16);
@@ -872,11 +1277,30 @@ impl Engine {
         if let Some(src) = &source {
             inputs.Flags.0 = src.flags.0 | UPDATE;
         }
+        let src_gpu = source.as_ref().map_or(0, |e| e.storage.gpu);
+        let scratch_off = if top {
+            0
+        } else {
+            let (need_barrier, off) = scratch_batch.alloc(
+                scratch.as_raw() as usize,
+                scratch_cap,
+                scratch_need,
+                entry.storage.gpu,
+                src_gpu,
+            );
+            if need_barrier {
+                barrier(&f.cmd.list);
+            } else if scratch_batch.written_dests.len() > 1 {
+                self.stats.blas_batched += 1;
+            }
+            off
+        };
         let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             Inputs: inputs,
             DestAccelerationStructureData: entry.storage.gpu,
-            SourceAccelerationStructureData: source.as_ref().map_or(0, |e| e.storage.gpu),
-            ScratchAccelerationStructureData: unsafe { scratch.GetGPUVirtualAddress() },
+            SourceAccelerationStructureData: src_gpu,
+            ScratchAccelerationStructureData: unsafe { scratch.GetGPUVirtualAddress() }
+                + scratch_off,
         };
         let post = [
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
@@ -884,19 +1308,32 @@ impl Engine {
                 InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
             },
         ];
-        // All fallible setup precedes GPU mutation/publication. Immutable destinations
-        // preserve older TLAS snapshots, including when a title asks for in-place update.
+        // All fallible setup precedes GPU mutation/publication. BLAS destinations are
+        // always fresh immutable slab slices; steady-state TLASes rebuild in-place on
+        // DIRECT between UAV barriers so shader-visible descriptors remain stable.
         unsafe {
             f.cmd
                 .list
                 .BuildRaytracingAccelerationStructure(&desc, Some(&post))
         };
-        barrier(&f.cmd.list);
-        f.resources.push(scratch);
+        if top {
+            barrier(&f.cmd.list);
+        }
+        if !f.resources.iter().any(|r| r == &scratch) {
+            f.resources.push(scratch);
+        }
         if let Some(src) = source {
             f.sources.push(src);
         }
-        self.replace(b.desc.dest_va, Some(entry.clone()));
+        let write_serial = if in_place {
+            self.stats.tlas_reused += 1;
+            self.generation += 1;
+            entry.write_serial.store(self.generation, Relaxed);
+            self.generation
+        } else {
+            self.replace(b.desc.dest_va, Some(entry.clone()));
+            entry.serial
+        };
         f.observations.push(Observation {
             key: b.desc.dest_va,
             entry,
@@ -904,6 +1341,8 @@ impl Engine {
             table,
             kind,
             compacted_from: None,
+            in_place,
+            write_serial,
         });
         Ok(())
     }
@@ -932,6 +1371,8 @@ impl Engine {
         if n == 0 || n > s.storage.bytes || s.top && !s.ready.load(Relaxed) {
             return Err("compact source incomplete");
         }
+        // Always allocates a fresh non-overlapping slice/buffer (including when dst == src,
+        // because `s` remains alive through `f.sources` until `f.fence` completes).
         let e = self.result(
             n,
             s.top,
@@ -939,12 +1380,21 @@ impl Engine {
             s.shape.clone(),
             s.full_size,
             s.update_scratch,
+            s.consecutive_refits,
         )?;
         if s.top {
-            // A descriptor can hold the compacted resource after the source is replaced.
-            // Keep the original immutable dependency owner with this TLAS.
-            memory::keep_on_resource(&e.storage.buffer, s.clone())?;
-            e.deps.set(s.deps.get().cloned().unwrap_or_default()).ok();
+            // Snapshot the source TLAS's exact current BLAS pins into `e`'s own PinSlot
+            // so future in-place rebuilds of `s` cannot release BLASes referenced by `e`.
+            let copied_pins = s
+                .pins
+                .as_ref()
+                .map(|p| p.lock().unwrap_or_else(|err| err.into_inner()).clone())
+                .unwrap_or_default();
+            if let Some(dst_pins) = &e.pins {
+                *dst_pins.lock().unwrap_or_else(|err| err.into_inner()) = copied_pins;
+            }
+            let copied_deps = s.deps.lock().unwrap_or_else(|err| err.into_inner()).clone();
+            *e.deps.lock().unwrap_or_else(|err| err.into_inner()) = copied_deps;
         }
 
         unsafe {
@@ -969,6 +1419,7 @@ impl Engine {
         if compacted_from.is_none() {
             self.replace(dst, Some(e.clone()));
         }
+        let write_serial = e.serial;
         f.observations.push(Observation {
             key: dst,
             entry: e,
@@ -980,6 +1431,8 @@ impl Engine {
                 Kind::Copy
             },
             compacted_from,
+            in_place: false,
+            write_serial,
         });
         Ok(())
     }

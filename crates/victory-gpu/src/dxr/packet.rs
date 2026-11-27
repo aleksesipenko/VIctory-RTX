@@ -270,13 +270,28 @@ pub(super) fn save(
 }
 
 fn seeds(e: &mut Engine, t: &Transfer, out: &mut Output) -> io::Result<()> {
-    let mut live: Vec<_> = e
-        .entries
-        .iter()
-        .filter(|(_, v)| v.ready.load(Relaxed))
-        .map(|(&k, v)| (k, v.clone()))
-        .collect();
-    live.sort_by_key(|x| (x.1.top, x.0));
+    let mut seen = std::collections::HashSet::new();
+    let mut live: Vec<(u64, Arc<Entry>)> = Vec::new();
+    for (&key, entry) in &e.entries {
+        if entry.ready.load(Relaxed) && seen.insert(entry.storage.gpu) {
+            live.push((key, entry.clone()));
+        }
+    }
+    // Include older immutable BLAS generations retained only by a live TLAS's PinSlot
+    // so serialized TLAS relocation tables always resolve every referenced BLAS GPU VA.
+    for entry in e.entries.values() {
+        if entry.top
+            && entry.ready.load(Relaxed)
+            && let Some(slot) = &entry.pins
+        {
+            for (blas_key, blas) in slot.lock().unwrap_or_else(|err| err.into_inner()).iter() {
+                if blas.ready.load(Relaxed) && seen.insert(blas.storage.gpu) {
+                    live.push((*blas_key, blas.clone()));
+                }
+            }
+        }
+    }
+    live.sort_by_key(|(key, entry)| (entry.top, *key, entry.serial));
     let va: Vec<_> = live.iter().map(|(_, v)| v.storage.gpu).collect();
     out.data(b"VRTSEEDS")?;
     out.word(1)?;

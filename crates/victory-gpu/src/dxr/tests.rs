@@ -352,7 +352,11 @@ fn dxr_ada_debug_layer() {
         "Ada inline RayQuery dynamic GeometryIndex=0, rehydrated GeometryIndex=1, mask and instance attributes verified"
     );
     // A legal inactive float triangle (NaN x) cannot replace an active one
-    // by refit. A full build must invalidate the TLAS without harming its old SRV.
+    // by refit. In strict mode (`VICTORY_DXR_STRICT_TLAS=1`), a full build
+    // invalidates TLAS 0x3000 without harming its held `top` SRV; in live mode
+    // (`!strict_tlas()`), the full rebuild writes to a fresh immutable slab slice
+    // so TLAS 0x3000 stays live and traces its pinned previous BLAS.
+    let old_2000_gpu = side.lock().entries[&0x2000].storage.gpu;
     blas.desc.dest_va = 0x2000;
     blas.desc.source_va = 0x2000;
     blas.desc.inputs.flags = 0x21;
@@ -361,9 +365,83 @@ fn dxr_ada_debug_layer() {
     let changed = commands::upload(&mut side.lock().mem, &inactive).unwrap();
     send(&side, capture_build(1, &blas), &changed);
     finish(&side);
-    assert!(side.srv(0x3000).is_none());
+    if strict_tlas() {
+        assert!(side.srv(0x3000).is_none());
+    } else {
+        assert_eq!(side.srv(0x3000), Some(top.clone()));
+        // Verify P2 #3: diagnostic seed capture includes the older pinned BLAS 0x2000
+        // generation still referenced by live TLAS 0x3000 so every serialized TLAS
+        // relocation pointer resolves in `VRTSEEDS`.
+        let new_2000_gpu = side.lock().entries[&0x2000].storage.gpu;
+        assert_ne!(new_2000_gpu, old_2000_gpu);
+        let seed_dir = tempfile::tempdir().unwrap();
+        packet::save(&mut side.lock(), &[], seed_dir.path(), 8, 0).unwrap();
+        let raw = std::fs::read(seed_dir.path().join("native-rt").join("initial.vrt")).unwrap();
+        let (body, digest) = raw.split_at(raw.len() - 32);
+        assert_eq!(blake3::hash(body).as_bytes(), digest);
+        assert_eq!(&body[..8], b"VRTSEEDS");
+        let mut cursor = 16usize;
+        let read_u64 = |pos: &mut usize| -> u64 {
+            let v = u64::from_le_bytes(body[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            v
+        };
+        let count = read_u64(&mut cursor) as usize;
+        let mut blas_vas = std::collections::HashSet::new();
+        let mut blas_2000_count = 0usize;
+        let mut tlas_3000_blob = None;
+        for _ in 0..count {
+            let key = read_u64(&mut cursor);
+            let _serial = read_u64(&mut cursor);
+            let is_top = read_u64(&mut cursor) != 0;
+            let gpu_va = read_u64(&mut cursor);
+            let blob_len = read_u64(&mut cursor) as usize;
+            let blob = &body[cursor..cursor + blob_len];
+            cursor += blob_len;
+            if is_top {
+                if key == 0x3000 {
+                    tlas_3000_blob = Some(blob);
+                }
+            } else {
+                blas_vas.insert(gpu_va);
+                if key == 0x2000 {
+                    blas_2000_count += 1;
+                }
+            }
+        }
+        assert_eq!(cursor, body.len());
+        assert_eq!(
+            blas_2000_count, 2,
+            "VRTSEEDS must serialize both the older pinned and newer BLAS 0x2000 generations"
+        );
+        assert!(blas_vas.contains(&old_2000_gpu));
+        assert!(blas_vas.contains(&new_2000_gpu));
+        let tlas_blob = tlas_3000_blob.expect("live TLAS 0x3000 serialized in VRTSEEDS");
+        let hdr_size = size_of::<D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER>();
+        assert!(tlas_blob.len() >= hdr_size);
+        let num_ptrs = u64::from_le_bytes(tlas_blob[48..56].try_into().unwrap()) as usize;
+        assert!(num_ptrs >= 1, "TLAS 0x3000 must serialize BLAS relocation pointers");
+        let mut found_old = false;
+        for i in 0..num_ptrs {
+            let off = hdr_size + i * 8;
+            let ptr = u64::from_le_bytes(tlas_blob[off..off + 8].try_into().unwrap());
+            if ptr != 0 {
+                assert!(
+                    blas_vas.contains(&ptr),
+                    "TLAS relocation pointer {ptr:#x} missing from VRTSEEDS BLAS set"
+                );
+                if ptr == old_2000_gpu {
+                    found_old = true;
+                }
+            }
+        }
+        assert!(
+            found_old,
+            "TLAS 0x3000 relocation table must resolve old pinned BLAS 0x2000 VA"
+        );
+    }
     assert_eq!(side.lock().stats.refits, 0);
-    assert_trace(&h, &side, &top, 0); // this older SRV still owns the previous BLAS
+    assert_trace(&h, &side, &top, 0); // this SRV still pins the previous BLAS
     assert!(side.srv(0x9000).is_some());
 
     let mut norm_geom = triangle();
@@ -393,16 +471,299 @@ fn dxr_ada_debug_layer() {
     assert!(side.srv(0x4000).is_none());
     send(&side, Captured::copy(0x3000, 0x2000, 0), &vertex);
     finish(&side);
-    let e = side.lock();
-    assert_eq!(
-        (e.stats.missing_blas, e.stats.failed, e.stats.skipped),
-        (1, 1, 1)
+    {
+        let e = side.lock();
+        assert_eq!(
+            (e.stats.missing_blas, e.stats.failed, e.stats.skipped),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            e.stats.input,
+            e.stats.built + e.stats.skipped + e.stats.failed
+        );
+    }
+
+    // Track A hardware verification on Ada under D3D12 Debug Layer:
+    // 1. Canonicalization of Xbox typeless index formats (`R16_TYPELESS` = 53,
+    //    `R32_TYPELESS` = 39) + `ScratchBatcher` multi-BLAS batching in one submit.
+    // 2. Self-`CopyAs` (`dst == src`, mode=1) allocates a fresh non-overlapping slice.
+    // 3. Steady-state in-place TLAS reuse (in live mode) preserves the exact same
+    //    `ID3D12Resource`, replaces old BLAS pins after fence completion, preserves
+    //    later queued rebuilds when an earlier rebuild fails, and retains candidate
+    //    BLAS pins on failed latest in-place builds until resource destruction.
+    let mut ib_vb = vb.clone(); // offset 0..36: 3 float3 vertices
+    ib_vb.resize(64, 0);
+    for idx in [0u16, 1, 2] {
+        ib_vb.extend_from_slice(&idx.to_le_bytes()); // offset 64..70: R16 indices
+    }
+    ib_vb.resize(80, 0);
+    for idx in [0u32, 1, 2] {
+        ib_vb.extend_from_slice(&idx.to_le_bytes()); // offset 80..92: R32 indices
+    }
+    let idx_buf = commands::upload(&mut side.lock().mem, &ib_vb).unwrap();
+    let mut g_r16 = triangle();
+    g_r16.data.triangles.index_format = DXGI_FORMAT_R16_TYPELESS.0 as u32;
+    g_r16.data.triangles.index_count = 3;
+    g_r16.data.triangles.index_buffer = 0x20_0000;
+    let mut g_r32 = triangle();
+    g_r32.data.triangles.index_format = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+    g_r32.data.triangles.index_count = 3;
+    g_r32.data.triangles.index_buffer = 0x20_0100;
+    let typeless_batch = [
+        guest(0xc000, 1, 1, &raw const g_r16 as u64),
+        guest(0xd000, 1, 1, &raw const g_r32 as u64),
+    ];
+    let ops: Arc<[Work]> = capture_build(2, typeless_batch.as_ptr())
+        .0
+        .into_iter()
+        .map(|op| {
+            Work::bind(op, |va, _| {
+                let off = match va {
+                    0x10_0000 => 0,
+                    0x20_0000 => 64,
+                    0x20_0100 => 80,
+                    _ => unreachable!(),
+                };
+                Ok((idx_buf.clone(), off))
+            })
+        })
+        .collect();
+    side.execute(ops);
+    finish(&side);
+    assert!(
+        side.lock().stats.blas_batched >= 1,
+        "ScratchBatcher must batch independent BLASes in one submit"
     );
-    assert_eq!(
-        e.stats.input,
-        e.stats.built + e.stats.skipped + e.stats.failed
+
+    // Build TLAS 0xe000 referencing R16_TYPELESS BLAS 0xc000.
+    let inst_c = commands::upload(&mut side.lock().mem, &instance(0xc000)).unwrap();
+    send(
+        &side,
+        capture_build(1, &guest(0xe000, 0, 1, 0xe0_0000)),
+        &inst_c,
     );
-    drop(e);
+    finish(&side);
+    let stable_tlas = side.srv(0xe000).expect("R16_TYPELESS TLAS");
+    assert_trace(&h, &side, &stable_tlas, 0);
+
+    // Self-CopyAs (dst == src == 0xd000) must allocate a distinct non-overlapping slice.
+    let (old_d_gpu, old_d_bytes) = {
+        let e = side.lock();
+        let entry = &e.entries[&0xd000];
+        (entry.storage.gpu, entry.storage.bytes)
+    };
+    send(&side, Captured::copy(0xd000, 0xd000, 1), &vertex);
+    finish(&side);
+    {
+        let e = side.lock();
+        let entry = &e.entries[&0xd000];
+        let new_gpu = entry.storage.gpu;
+        let new_bytes = entry.storage.bytes;
+        assert_ne!(new_gpu, old_d_gpu, "self-CopyAs must not alias source VA");
+        assert!(
+            new_gpu + new_bytes <= old_d_gpu || old_d_gpu + old_d_bytes <= new_gpu,
+            "self-CopyAs must allocate a non-overlapping slice"
+        );
+    }
+
+    // Rebuild TLAS 0xe000 referencing self-compacted R32_TYPELESS BLAS 0xd000.
+    let c_entry = side.lock().entries[&0xc000].clone();
+    let d_entry = side.lock().entries[&0xd000].clone();
+    let inst_d = commands::upload(&mut side.lock().mem, &instance(0xd000)).unwrap();
+    send(
+        &side,
+        capture_build(1, &guest(0xe000, 0, 1, 0xe0_0000)),
+        &inst_d,
+    );
+    finish(&side);
+    if strict_tlas() {
+        let strict_rebuilt = side.srv(0xe000).expect("strict TLAS rebuild");
+        assert_ne!(
+            strict_rebuilt, stable_tlas,
+            "strict mode must allocate a fresh TLAS resource"
+        );
+        assert_eq!(side.lock().stats.tlas_reused, 0);
+        assert_trace(&h, &side, &strict_rebuilt, 0);
+        drop(strict_rebuilt);
+        drop(c_entry);
+        drop(d_entry);
+        drop(stable_tlas);
+    } else {
+        assert_eq!(
+            side.srv(0xe000),
+            Some(stable_tlas.clone()),
+            "steady-state TLAS rebuild must reuse the same ID3D12Resource in-place"
+        );
+        assert_trace(&h, &side, &stable_tlas, 0);
+        {
+            let e = side.lock();
+            assert!(e.stats.tlas_reused >= 1);
+            let pins = e.entries[&0xe000]
+                .pins
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            assert!(
+                !pins.iter().any(|(_, p)| Arc::ptr_eq(p, &c_entry)),
+                "old BLAS 0xc000 pin must be released after in-place TLAS fence completes"
+            );
+            assert!(
+                pins.iter().any(|(_, p)| Arc::ptr_eq(p, &d_entry)),
+                "new BLAS 0xd000 pin must be held by the reused TLAS PinSlot"
+            );
+        }
+
+        // P1 #2 regression 1 (same batch): failed in-place TLAS f1 (all missing)
+        // followed by valid in-place TLAS f2 (0xc000) in ONE batch must keep 0xe000
+        // present, ready, and traceable.
+        let both_inst_bytes: Vec<u8> = instance(0x5000)
+            .into_iter()
+            .chain(instance(0xc000))
+            .collect();
+        let both_inst = commands::upload(&mut side.lock().mem, &both_inst_bytes).unwrap();
+        let pair_batch = [
+            guest(0xe000, 0, 1, 0xe1_0000),
+            guest(0xe000, 0, 1, 0xe1_0040),
+        ];
+        let pair_ops: Arc<[Work]> = capture_build(2, pair_batch.as_ptr())
+            .0
+            .into_iter()
+            .map(|op| {
+                Work::bind(op, |va, _| {
+                    let off = if va == 0xe1_0000 { 0 } else { 64 };
+                    Ok((both_inst.clone(), off))
+                })
+            })
+            .collect();
+        side.execute(pair_ops);
+        finish(&side);
+        assert_eq!(
+            side.srv(0xe000),
+            Some(stable_tlas.clone()),
+            "earlier failed in-place rebuild in same batch must not evict later valid rebuild"
+        );
+        assert_trace(&h, &side, &stable_tlas, 0);
+        {
+            let e = side.lock();
+            let pins = e.entries[&0xe000]
+                .pins
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            assert!(pins.iter().any(|(_, p)| Arc::ptr_eq(p, &c_entry)));
+        }
+
+        // P1 #2 regression 2 (separate queued flights, deterministic): stall DIRECT
+        // behind an unsignaled fence so f1 (all missing) and f2 (valid 0xd000) are
+        // guaranteed to both be pending simultaneously before collection.
+        let gate: ID3D12Fence = unsafe {
+            h.device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("gate fence")
+        };
+        unsafe { queue.Wait(&gate, 1).expect("queue wait on gate") };
+        send(
+            &side,
+            capture_build(1, &guest(0xe000, 0, 1, 0xe2_0000)),
+            &missing,
+        );
+        send(
+            &side,
+            capture_build(1, &guest(0xe000, 0, 1, 0xe2_0040)),
+            &inst_d,
+        );
+        assert!(
+            side.lock().pending.len() >= 2,
+            "both f1 and f2 must be pending simultaneously before collection"
+        );
+        unsafe { gate.Signal(1).expect("signal gate fence") };
+        finish(&side);
+        assert_eq!(
+            side.srv(0xe000),
+            Some(stable_tlas.clone()),
+            "earlier failed in-place flight must not evict later queued valid flight"
+        );
+        assert_trace(&h, &side, &stable_tlas, 0);
+        {
+            let e = side.lock();
+            let pins = e.entries[&0xe000]
+                .pins
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            assert!(pins.iter().any(|(_, p)| Arc::ptr_eq(p, &d_entry)));
+            assert!(
+                !pins.iter().any(|(_, p)| Arc::ptr_eq(p, &c_entry)),
+                "c_entry must not be in PinSlot prior to the failed-latest retention test"
+            );
+        }
+
+        // P1 #1 regression: verify a brand-new candidate BLAS (`c_entry`, NOT in
+        // PinSlot before the failed build) is merged into PinSlot by `retain_table_pins`
+        // even when a later BLAS rebuild replaces `0xc000` and clears `self.table`
+        // before `f_bad` is collected, stays alive while the external `stable_tlas`
+        // COM resource is held, and releases once `stable_tlas` drops after
+        // `finish_slot_readers()`.
+        let c_weak = Arc::downgrade(&c_entry);
+        drop(c_entry);
+        drop(d_entry);
+        let gate2: ID3D12Fence = unsafe {
+            h.device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("gate2 fence")
+        };
+        unsafe { queue.Wait(&gate2, 1).expect("queue wait on gate2") };
+        send(
+            &side,
+            capture_build(1, &guest(0xe000, 0, 1, 0xe3_0000)),
+            &missing,
+        );
+        // Replace 0xc000 while f_bad is still pending on GPU (clears `self.table` too).
+        let replace_c: Arc<[Work]> = capture_build(1, &guest(0xc000, 1, 1, &raw const g_r16 as u64))
+            .0
+            .into_iter()
+            .map(|op| {
+                Work::bind(op, |va, _| {
+                    let off = if va == 0x10_0000 { 0 } else { 64 };
+                    Ok((idx_buf.clone(), off))
+                })
+            })
+            .collect();
+        side.execute(replace_c);
+        assert!(
+            side.lock().pending.len() >= 2,
+            "failed TLAS and replacement BLAS must both be pending before collection"
+        );
+        unsafe { gate2.Signal(1).expect("signal gate2 fence") };
+        finish(&side);
+        assert!(side.srv(0xe000).is_none());
+        assert!(
+            c_weak.strong_count() > 0,
+            "brand-new candidate BLAS must be retained by PinSlot while external TLAS handle is held"
+        );
+        side.finish_slot_readers();
+        drop(stable_tlas);
+        assert_eq!(
+            c_weak.strong_count(),
+            0,
+            "retained candidate BLAS must release once external TLAS handle drops"
+        );
+    }
+    {
+        let e = side.lock();
+        assert_eq!(
+            e.stats.input,
+            e.stats.built + e.stats.skipped + e.stats.failed
+        );
+        assert!(!e.free_inst.is_empty(), "inst buffer must be returned to pool");
+        assert!(
+            !e.free_table_uploads.is_empty(),
+            "table upload buffer must be returned to pool"
+        );
+    }
     drop(top);
     drop(empty);
     drop(heap);
@@ -410,6 +771,146 @@ fn dxr_ada_debug_layer() {
     unsafe { h.device.GetDeviceRemovedReason() }.unwrap();
     h.check_debug_errors().unwrap();
     eprintln!("D3D12 InfoQueue Error/Corruption=0");
+}
+
+#[test]
+fn index_format_canonicalizes_typeless_and_validates_non_indexed() {
+    let mut mock_addr = |va: u64, len: u64, align: u64| -> Checked<u64> {
+        if va == 0 || !va.is_multiple_of(align) || len == 0 || va.checked_add(len).is_none() {
+            return Err("invalid GPU input range");
+        }
+        Ok(0x1_0000_0000 + va)
+    };
+    let mut build_for = |index_format: DXGI_FORMAT,
+                         index_buffer: u64,
+                         index_count: u32,
+                         rehydrate: bool|
+     -> Checked<D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC> {
+        let mut t = unsafe { triangle().data.triangles };
+        t.index_format = index_format.0 as u32;
+        t.index_buffer = index_buffer;
+        t.index_count = index_count;
+        let b = capture::Build {
+            desc: GuestBuildAsDesc {
+                dest_va: 0x1000,
+                inputs: GuestBuildAsInputs {
+                    kind: 1,
+                    flags: 0,
+                    num_descs: 1,
+                    descs_layout: 0,
+                    ptr_or_va: 0,
+                },
+                source_va: 0,
+                scratch_va: 0,
+            },
+            inputs: Ok(capture::Inputs::Blas(vec![capture::Geometry::Triangles(
+                1, t,
+            )])),
+            postbuild: vec![],
+            stream: vec![],
+            rehydrate: rehydrate.then_some(capture::Rehydrate {
+                extra: None,
+                header: Ok([0x0100_0000; 16]),
+                hr: 0,
+            }),
+        };
+        match geometry::translate(&b, &mut mock_addr)? {
+            Native::Blas(geoms) => Ok(unsafe { geoms[0].Anonymous.Triangles }),
+            _ => panic!("expected BLAS"),
+        }
+    };
+
+    // R16_TYPELESS (53) -> canonical R16_UINT (57), both dynamic and rehydrated static.
+    for rehydrate in [false, true] {
+        let r16 = build_for(DXGI_FORMAT_R16_TYPELESS, 0x20_0002, 3, rehydrate).unwrap();
+        assert_eq!(r16.IndexFormat, DXGI_FORMAT_R16_UINT);
+        assert_eq!(r16.IndexCount, 3);
+        assert_eq!(r16.IndexBuffer, 0x1_0020_0002);
+    }
+
+    // R32_TYPELESS (39) -> canonical R32_UINT (42).
+    let r32 = build_for(DXGI_FORMAT_R32_TYPELESS, 0x20_0004, 3, false).unwrap();
+    assert_eq!(r32.IndexFormat, DXGI_FORMAT_R32_UINT);
+    assert_eq!(r32.IndexCount, 3);
+    assert_eq!(r32.IndexBuffer, 0x1_0020_0004);
+
+    // Non-indexed cases normalize to DXGI_FORMAT_UNKNOWN with IndexBuffer = 0.
+    let stale_unknown = build_for(DXGI_FORMAT_UNKNOWN, 0xdead_beef, 0, false).unwrap();
+    assert_eq!(stale_unknown.IndexFormat, DXGI_FORMAT_UNKNOWN);
+    assert_eq!(stale_unknown.IndexBuffer, 0);
+    assert_eq!(stale_unknown.IndexCount, 0);
+
+    let zero_typeless = build_for(DXGI_FORMAT_R16_TYPELESS, 0, 0, false).unwrap();
+    assert_eq!(zero_typeless.IndexFormat, DXGI_FORMAT_UNKNOWN);
+    assert_eq!(zero_typeless.IndexBuffer, 0);
+    assert_eq!(zero_typeless.IndexCount, 0);
+
+    // Malformed cases remain rejected.
+    assert_eq!(
+        build_for(DXGI_FORMAT_R16_TYPELESS, 0x20_0000, 0, false).unwrap_err(),
+        "invalid index format or buffer"
+    );
+    assert_eq!(
+        build_for(DXGI_FORMAT_R16_TYPELESS, 0, 3, false).unwrap_err(),
+        "invalid GPU input range"
+    );
+    assert_eq!(
+        build_for(DXGI_FORMAT_R8_UINT, 0x20_0000, 3, false).unwrap_err(),
+        "invalid index format or buffer"
+    );
+}
+
+#[test]
+fn scratch_batcher_bumps_aligns_and_flushes_on_hazards() {
+    let mut b = ScratchBatcher::default();
+    assert!(!b.has_pending());
+
+    // Consecutive independent BLAS builds bump-allocate on 256B boundaries without barriers.
+    assert_eq!(b.alloc(1, 2048, 100, 0x1000, 0), (false, 0));
+    assert_eq!(b.alloc(1, 2048, 300, 0x2000, 0), (false, 256));
+    assert_eq!(b.alloc(1, 2048, 512, 0x3000, 0), (false, 768));
+    assert!(b.has_pending());
+
+    // Reading an unbarriered dest as a refit source forces a UAV barrier and resets cursor.
+    assert_eq!(b.alloc(1, 2048, 256, 0x4000, 0x2000), (true, 0));
+
+    // Overwriting an unbarriered dest forces a UAV barrier and resets cursor.
+    assert_eq!(b.alloc(1, 2048, 256, 0x4000, 0), (true, 0));
+
+    // Exhausting scratch capacity forces a UAV barrier and resets cursor.
+    assert_eq!(b.alloc(1, 2048, 1536, 0x5000, 0), (false, 256));
+    assert_eq!(b.alloc(1, 2048, 512, 0x6000, 0), (true, 0));
+
+    // Growing to a new scratch buffer resets cursor to 0 without dropping hazard tracking.
+    assert_eq!(b.alloc(2, 4096, 512, 0x7000, 0), (false, 0));
+    assert_eq!(b.alloc(2, 4096, 256, 0x8000, 0x6000), (true, 0));
+
+    b.reset();
+    assert!(!b.has_pending());
+}
+
+#[test]
+fn cull_mask_and_refit_period_parsing() {
+    use commands::{CULL_MASK_TAG_MODE, parse_cull_mask_cfg};
+    assert_eq!(parse_cull_mask_cfg(None), 0);
+    assert_eq!(parse_cull_mask_cfg(Some("")), 0);
+    assert_eq!(parse_cull_mask_cfg(Some("0")), 0);
+    assert_eq!(parse_cull_mask_cfg(Some("off")), 0);
+    assert_eq!(parse_cull_mask_cfg(Some("false")), 0);
+    assert_eq!(parse_cull_mask_cfg(Some("1")), 0x80);
+    assert_eq!(parse_cull_mask_cfg(Some("on")), 0x80);
+    assert_eq!(parse_cull_mask_cfg(Some("0x80")), 0x80);
+    assert_eq!(parse_cull_mask_cfg(Some("64")), 0x40);
+    assert_eq!(parse_cull_mask_cfg(Some("tag:0x80")), CULL_MASK_TAG_MODE | 0x80);
+    assert_eq!(parse_cull_mask_cfg(Some("TAG:1")), CULL_MASK_TAG_MODE | 0x80);
+    assert_eq!(parse_cull_mask_cfg(Some("tag:0")), 0);
+    assert_eq!(parse_cull_mask_cfg(Some("256")), 0);
+    assert_eq!(parse_cull_mask_cfg(Some("bogus")), 0);
+
+    assert_eq!(parse_refit_period(None), DEFAULT_REFIT_PERIOD);
+    assert_eq!(parse_refit_period(Some("0")), 0);
+    assert_eq!(parse_refit_period(Some("128")), 128);
+    assert_eq!(parse_refit_period(Some("nope")), DEFAULT_REFIT_PERIOD);
 }
 
 fn assert_trace(

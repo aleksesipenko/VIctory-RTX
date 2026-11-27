@@ -1,12 +1,64 @@
 use super::{Entry, capture::Checked, memory::Memory};
 use crate::host::{compile, transition};
-use std::{collections::HashMap, sync::Arc};
+use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, s};
 
 pub(super) const SLOTS: usize = 65536;
+pub(super) const TABLE_BYTES: u64 = SLOTS as u64 * 16;
 pub(super) const PATCH_REPORT: u64 = 8 + SLOTS as u64 / 8;
 pub(super) type Slot = (usize, u64, Arc<Entry>);
+
+/// Bit in `cull_mask_cfg` selecting tag/set mode (`VICTORY_NATIVE_RT_CULL_MASK=tag:0x80`)
+/// instead of clear mode (default: clear mask bit(s) on `TRIANGLE_CULL_DISABLE` instances).
+pub(super) const CULL_MASK_TAG_MODE: u32 = 0x100;
+
+fn parse_u8_mask(s: &str) -> Option<u8> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16).ok()
+    } else if s.eq_ignore_ascii_case("1")
+        || s.eq_ignore_ascii_case("on")
+        || s.eq_ignore_ascii_case("true")
+    {
+        Some(0x80)
+    } else if s.eq_ignore_ascii_case("0")
+        || s.eq_ignore_ascii_case("off")
+        || s.eq_ignore_ascii_case("false")
+    {
+        Some(0)
+    } else {
+        s.parse::<u8>().ok()
+    }
+}
+
+pub(super) fn parse_cull_mask_cfg(raw: Option<&str>) -> u32 {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    let (tag_mode, rest) = if let Some(r) = s.strip_prefix("tag:").or_else(|| s.strip_prefix("TAG:"))
+    {
+        (true, r)
+    } else {
+        (false, s)
+    };
+    let mask = parse_u8_mask(rest).unwrap_or(0);
+    if mask == 0 {
+        0
+    } else if tag_mode {
+        CULL_MASK_TAG_MODE | u32::from(mask)
+    } else {
+        u32::from(mask)
+    }
+}
+
+fn cull_mask_cfg() -> u32 {
+    static CFG: OnceLock<u32> = OnceLock::new();
+    *CFG.get_or_init(|| {
+        parse_cull_mask_cfg(std::env::var("VICTORY_NATIVE_RT_CULL_MASK").ok().as_deref())
+    })
+}
 
 pub(super) fn barrier(list: &ID3D12GraphicsCommandList4) {
     // SAFETY: default UAV union is a null pResource (all UAV/AS writes).
@@ -18,13 +70,7 @@ pub(super) fn barrier(list: &ID3D12GraphicsCommandList4) {
     };
 }
 
-pub(super) fn upload(mem: &mut Memory, data: &[u8]) -> Checked<ID3D12Resource> {
-    let r = mem.buffer(
-        data.len() as u64,
-        D3D12_HEAP_TYPE_UPLOAD,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        D3D12_RESOURCE_FLAG_NONE,
-    )?;
+pub(super) fn write_upload(r: &ID3D12Resource, data: &[u8]) -> Checked<()> {
     let mut ptr = std::ptr::null_mut();
     // SAFETY: exact-size mapped upload. It is immutable from Unmap until retirement.
     unsafe {
@@ -33,6 +79,17 @@ pub(super) fn upload(mem: &mut Memory, data: &[u8]) -> Checked<ID3D12Resource> {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast(), data.len());
         r.Unmap(0, None);
     }
+    Ok(())
+}
+
+pub(super) fn upload(mem: &mut Memory, data: &[u8]) -> Checked<ID3D12Resource> {
+    let r = mem.buffer(
+        data.len() as u64,
+        D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_FLAG_NONE,
+    )?;
+    write_upload(&r, data)?;
     Ok(r)
 }
 
@@ -60,11 +117,18 @@ pub(super) struct Table {
     pub slots: Vec<Slot>,
 }
 impl Table {
-    pub fn new(
+    pub fn build(
         mem: &mut Memory,
         by_title: &HashMap<u64, Arc<Entry>>,
+        words: &mut Vec<[u32; 4]>,
+        free_bufs: &mut Vec<ID3D12Resource>,
+        free_uploads: &mut Vec<ID3D12Resource>,
     ) -> Checked<(Arc<Self>, ID3D12Resource)> {
-        let mut words = vec![[0u32; 4]; SLOTS];
+        if words.len() != SLOTS {
+            words.resize(SLOTS, [0; 4]);
+        } else {
+            words.fill([0; 4]);
+        }
         let mut slots = Vec::new();
         for (&guest, entry) in by_title.iter().filter(|(_, e)| !e.top) {
             let key = guest >> 8;
@@ -86,13 +150,33 @@ impl Table {
         }
         // SAFETY: no padding in arrays of four u32s. The shader reads little-endian words.
         let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), words.len() * 16) };
-        let staging = upload(mem, bytes)?;
-        let buf = mem.buffer(
-            bytes.len() as u64,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_FLAG_NONE,
-        )?;
+        let staging = match free_uploads.pop() {
+            Some(buf) => {
+                if let Err(why) = write_upload(&buf, bytes) {
+                    free_uploads.push(buf);
+                    return Err(why);
+                }
+                buf
+            }
+            None => upload(mem, bytes)?,
+        };
+        let buf = match free_bufs.pop() {
+            Some(buf) => buf,
+            None => match mem.buffer(
+                TABLE_BYTES,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_FLAG_NONE,
+            ) {
+                Ok(buf) => buf,
+                Err(why) => {
+                    if free_uploads.len() < 4 {
+                        free_uploads.push(staging);
+                    }
+                    return Err(why);
+                }
+            },
+        };
         Ok((Arc::new(Table { buf, slots }), staging))
     }
 }
@@ -133,8 +217,16 @@ impl Patcher {
         dst: &ID3D12Resource,
         stats: u64,
     ) {
+        let cull_cfg = cull_mask_cfg();
         // SAFETY: root views are sized by the checked allocations; parent flight pins all four.
+        // Pooled `dst` enters in COMMON (new or decayed from NON_PIXEL_SHADER_RESOURCE) and
+        // exits in NON_PIXEL_SHADER_RESOURCE (decays back to COMMON after ExecuteCommandLists).
         unsafe {
+            list.ResourceBarrier(&[transition(
+                dst,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
             list.SetComputeRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
             list.SetComputeRootShaderResourceView(1, src);
@@ -142,8 +234,8 @@ impl Patcher {
             list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(4, stats);
             for first in (0..count).step_by(65535 * 64) {
-                let args = [count, first];
-                list.SetComputeRoot32BitConstants(0, 2, args.as_ptr().cast(), 0);
+                let args = [count, first, cull_cfg];
+                list.SetComputeRoot32BitConstants(0, 3, args.as_ptr().cast(), 0);
                 list.Dispatch((count - first).div_ceil(64).min(65535), 1, 1);
             }
             list.ResourceBarrier(&[transition(

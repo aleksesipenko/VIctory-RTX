@@ -77,7 +77,10 @@ impl Work {
     }
 }
 
-fn translate(b: &Build, addr: &mut impl FnMut(u64, u64, u64) -> Checked<u64>) -> Checked<Native> {
+pub(super) fn translate(
+    b: &Build,
+    addr: &mut impl FnMut(u64, u64, u64) -> Checked<u64>,
+) -> Checked<Native> {
     if let Some(r) = &b.rehydrate {
         if r.hr < 0 {
             return Err("rehydrate HRESULT");
@@ -157,13 +160,30 @@ fn geometry(
                 span(u64::from(t.vertex_count), t.vertex_buffer_stride, bytes)?,
                 align,
             )?;
-            let fmt = DXGI_FORMAT(t.index_format as i32);
-            let (ib, vertices) = match (fmt, t.index_buffer, t.index_count) {
-                (DXGI_FORMAT_UNKNOWN, 0, 0) => (0, t.vertex_count),
-                (DXGI_FORMAT_R16_UINT, va, n) => (addr(va, u64::from(n) * 2, 2)?, n),
-                (DXGI_FORMAT_R32_UINT, va, n) => (addr(va, u64::from(n) * 4, 4)?, n),
-                _ => return Err("invalid index format or buffer"),
-            };
+            let raw_idx_fmt = DXGI_FORMAT(crate::resource::pc_format(t.index_format) as i32);
+            // Xbox Series X `XboxBvhBuilder.dll` accepts typeless 16/32-bit index formats
+            // (`DXGI_FORMAT_R16_TYPELESS` = 53, `DXGI_FORMAT_R32_TYPELESS` = 39), whereas
+            // PC D3D12 DXR 1.1 requires canonical `R16_UINT` (57) / `R32_UINT` (42) and
+            // `DXGI_FORMAT_UNKNOWN` with a null `IndexBuffer` for non-indexed triangles.
+            let (fmt, ib, index_count, vertices) =
+                match (raw_idx_fmt, t.index_buffer, t.index_count) {
+                    (DXGI_FORMAT_UNKNOWN, _, 0) => (DXGI_FORMAT_UNKNOWN, 0, 0, t.vertex_count),
+                    (
+                        DXGI_FORMAT_R16_UINT
+                        | DXGI_FORMAT_R16_TYPELESS
+                        | DXGI_FORMAT_R32_UINT
+                        | DXGI_FORMAT_R32_TYPELESS,
+                        0,
+                        0,
+                    ) => (DXGI_FORMAT_UNKNOWN, 0, 0, t.vertex_count),
+                    (DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_TYPELESS, va, n) if n > 0 => {
+                        (DXGI_FORMAT_R16_UINT, addr(va, u64::from(n) * 2, 2)?, n, n)
+                    }
+                    (DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_TYPELESS, va, n) if n > 0 => {
+                        (DXGI_FORMAT_R32_UINT, addr(va, u64::from(n) * 4, 4)?, n, n)
+                    }
+                    _ => return Err("invalid index format or buffer"),
+                };
             if vertices % 3 != 0 {
                 return Err("incomplete triangle");
             }
@@ -176,7 +196,7 @@ fn geometry(
                 Transform3x4: transform,
                 IndexFormat: fmt,
                 VertexFormat: vf,
-                IndexCount: t.index_count,
+                IndexCount: index_count,
                 VertexCount: t.vertex_count,
                 IndexBuffer: ib,
                 VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
