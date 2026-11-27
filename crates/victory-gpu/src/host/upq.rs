@@ -28,7 +28,7 @@
 
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -182,6 +182,68 @@ impl<S, R, F> UnconfirmedPool<S, R, F> {
     }
 }
 
+/// Outcome of [`send`], distinguishing a pre-submission fallback from a
+/// submission that already executed on the copy queue but could not be
+/// confirmed complete (in which case callers must keep source upload memory
+/// out of reusable pools).
+pub(super) enum Outcome {
+    /// Submitted on the copy queue and ordered ahead of the drawing queue.
+    Sent(Slot),
+    /// Nothing was submitted to the copy queue; safe to fall back and reuse
+    /// source memory normally.
+    NotSubmitted,
+    /// `ExecuteCommandLists` already ran on the copy queue, but completion
+    /// could not be confirmed: the copy queue is now poisoned, `slot` +
+    /// sources are pinned to the copy-queue fence (or leaked if unsignaled),
+    /// and the caller must NOT recycle source upload memory back into a pool.
+    SubmittedUnconfirmed,
+}
+
+/// Process-wide poison latch for the up-queue copy path. Tripped on the first
+/// unconfirmed copy-queue submission failure so all subsequent calls fall back
+/// directly to the graphics queue, capping unconfirmed resource retention to
+/// the single failing submission(s) already in flight.
+struct UpqState {
+    poisoned: AtomicBool,
+}
+
+impl UpqState {
+    const fn new() -> Self {
+        Self { poisoned: AtomicBool::new(false) }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    fn allow_send(&self) -> bool {
+        !self.is_poisoned()
+    }
+
+    /// Trips poisoned state; returns `true` on the first transition.
+    fn trip(&self) -> bool {
+        !self.poisoned.swap(true, Ordering::AcqRel)
+    }
+}
+
+static STATE: UpqState = UpqState::new();
+
+fn poison(why: &'static str) {
+    if STATE.trip() {
+        tracing::warn!(
+            why,
+            "disabling up-queue copy path after unconfirmed submission failure; falling back to drawing queue"
+        );
+    }
+}
+
+/// Sweeps any completed/device-removed unconfirmed copy-queue slots and
+/// reports whether the copy queue is still usable (not poisoned).
+pub(super) fn usable(device: &ID3D12Device) -> bool {
+    sweep_unconfirmed(Some(device));
+    STATE.allow_send()
+}
+
 /// Copy-queue slots whose GPU completion could not be confirmed: pinned to
 /// their copy-queue fence (never graphics-queue bury lag).
 static UNCONFIRMED: Mutex<UnconfirmedPool<Slot, ID3D12Resource, ID3D12Fence>> =
@@ -227,10 +289,12 @@ fn pin_sources(ranges: &[Range<'_>]) -> Vec<ID3D12Resource> {
 
 /// Pins an unconfirmed copy-queue slot (with `slot.bounce`, `allocator`, `list`,
 /// and `pinned_sources` intact) until the copy-queue fence confirms completion
-/// or the device is removed. If `Signal` failed (no copy-queue fence value) or
-/// `UNCONFIRMED` is full at `UNCONFIRMED_MAX`, intentionally leaks via
-/// `std::mem::forget` rather than freeing GPU-in-use COM objects.
-fn pin_unconfirmed(entry: UnconfirmedSlot, device: Option<&ID3D12Device>) {
+/// or the device is removed, and poisons the copy queue so no further
+/// copy-queue submissions are attempted. If `Signal` failed (no copy-queue
+/// fence value) or `UNCONFIRMED` is full at `UNCONFIRMED_MAX`, intentionally
+/// leaks via `std::mem::forget` rather than freeing GPU-in-use COM objects.
+fn pin_unconfirmed(entry: UnconfirmedSlot, device: Option<&ID3D12Device>, why: &'static str) {
+    poison(why);
     if entry.signaled.is_none() {
         std::mem::forget(entry);
         return;
@@ -304,10 +368,19 @@ impl Drop for Submitted<'_, '_, '_> {
             None => (0, 1),
         };
         match slot_outcome(true, signaled.is_some(), !self.wait_failed, completed, target) {
-            SlotOutcome::Recycle => give_back(slot),
+            SlotOutcome::Recycle => {
+                let _ = give_back(slot, || pin_sources(self.ranges));
+            }
             SlotOutcome::RetireUnconfirmed => {
+                let why = if signaled.is_none() {
+                    "copy-queue Signal failed"
+                } else if self.wait_failed {
+                    "copy-queue CPU wait did not confirm completion"
+                } else {
+                    "copy-queue submission unwound before fence confirmation"
+                };
                 let pinned_sources = pin_sources(self.ranges);
-                pin_unconfirmed(UnconfirmedSlot { slot, pinned_sources, signaled }, Some(self.device));
+                pin_unconfirmed(UnconfirmedSlot { slot, pinned_sources, signaled }, Some(self.device), why);
             }
         }
     }
@@ -374,24 +447,28 @@ pub(super) unsafe fn send(
     drawing: &ID3D12CommandQueue,
     ranges: &[Range<'_>],
     mut record: impl FnMut(usize, &ID3D12Resource, u64),
-) -> Option<Slot> {
+) -> Outcome {
+    sweep_unconfirmed(Some(&host.device));
+    if !STATE.allow_send() {
+        STATS[3].fetch_add(1, Relaxed);
+        return Outcome::NotSubmitted;
+    }
     let total: u64 = ranges.iter().map(|r| r.3.next_multiple_of(256)).sum();
     if total == 0 || total > MOST {
         STATS[3].fetch_add(1, Relaxed);
-        return None;
+        return Outcome::NotSubmitted;
     }
-    sweep_unconfirmed(Some(&host.device));
     let popped = {
         let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = guard.get_or_insert_with(|| make_queue(&host.device)).as_mut() else {
             STATS[3].fetch_add(1, Relaxed);
-            return None;
+            return Outcome::NotSubmitted;
         };
         q.free.pop()
     };
     let Some(mut slot) = popped.or_else(|| make_slot(&host.device)) else {
         STATS[3].fetch_add(1, Relaxed);
-        return None;
+        return Outcome::NotSubmitted;
     };
     if let Some(size) = bounce_size(slot.bounce.as_ref().map(|b| b.1), total) {
         // The slot's last submission has run, but a buffer let go goes
@@ -403,9 +480,9 @@ pub(super) unsafe fn send(
             super::retire_resource(old);
         }
         let Some(made) = host.uav_buffer(size) else {
-            give_back(slot);
+            let _ = give_back(slot, Vec::new);
             STATS[3].fetch_add(1, Relaxed);
-            return None;
+            return Outcome::NotSubmitted;
         };
         super::name(&made, || format!("copies in the card's memory: what goes up, {} MB", size >> 20));
         slot.bounce = Some((made, size));
@@ -415,9 +492,9 @@ pub(super) unsafe fn send(
     // `Submitted::drop` pins or recycles the slot.
     let mut submitted_guard = Submitted::new(&host.device, ranges);
     let Some((bounce, _)) = slot.bounce.clone() else {
-        give_back(slot);
+        let _ = give_back(slot, Vec::new);
         STATS[3].fetch_add(1, Relaxed);
-        return None;
+        return Outcome::NotSubmitted;
     };
     // SAFETY: the slot's last submission has run (it came back with its
     // plan); the caller's for the buffers.
@@ -439,18 +516,18 @@ pub(super) unsafe fn send(
         Err(e) => {
             // (Nothing waits for a copy that was not sent.)
             tracing::warn!(error = %e, "what goes up to copies in the card's memory could not go on the copy queue: as before");
-            give_back(slot);
+            let _ = give_back(slot, Vec::new);
             STATS[3].fetch_add(1, Relaxed);
-            return None;
+            return Outcome::NotSubmitted;
         }
     };
     let cpu_wait_fence = {
         let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = guard.as_mut().and_then(Option::as_mut) else {
             drop(guard);
-            give_back(slot);
+            let _ = give_back(slot, Vec::new);
             STATS[3].fetch_add(1, Relaxed);
-            return None;
+            return Outcome::NotSubmitted;
         };
         // SAFETY: `list_to_run` was closed above and belongs to `slot`.
         unsafe { q.queue.ExecuteCommandLists(&[Some(list_to_run)]) };
@@ -460,11 +537,12 @@ pub(super) unsafe fn send(
         submitted_guard.arm(slot, q.fence.clone(), target);
         // SAFETY: `q.fence` is a live fence owned by the copy queue.
         if let Err(e) = unsafe { q.queue.Signal(&q.fence, target) } {
-            // `ExecuteCommandLists` already ran: `submitted_guard` retires the
-            // bounce buffer and keeps the unconfirmed allocator out of `q.free`.
+            // `ExecuteCommandLists` already ran: `submitted_guard` poisons the
+            // copy queue, pins/leaks the bounce + allocator + sources, and the
+            // caller keeps its source upload memory out of reusable pools.
             tracing::warn!(error = %e, "what goes up to copies in the card's memory could not signal its fence: as before");
             STATS[3].fetch_add(1, Relaxed);
-            return None;
+            return Outcome::SubmittedUnconfirmed;
         }
         submitted_guard.mark_signaled();
         // SAFETY: a fence of ours that the copy queue signals.
@@ -494,7 +572,7 @@ pub(super) unsafe fn send(
             );
             submitted_guard.mark_wait_failed();
             STATS[3].fetch_add(1, Relaxed);
-            return None;
+            return Outcome::SubmittedUnconfirmed;
         }
     }
     let mut at = 0u64;
@@ -505,14 +583,18 @@ pub(super) unsafe fn send(
     STATS[0].fetch_add(1, Relaxed);
     STATS[1].fetch_add(ranges.iter().map(|r| r.3).sum::<u64>(), Relaxed);
     STATS[2].fetch_add(ranges.len() as u64, Relaxed);
-    submitted_guard.take()
+    match submitted_guard.take() {
+        Some(slot) => Outcome::Sent(slot),
+        None => Outcome::NotSubmitted,
+    }
 }
 
-/// A plan's slot, back once its submission has run. Only returns the slot to
-/// the reusable pool if its copy-queue fence is confirmed complete (or it was
-/// never submitted); unconfirmed slots stay pinned to the copy-queue fence
-/// outside `QUEUE`.
-pub(super) fn give_back(mut slot: Slot) {
+/// A plan's slot, back once its submission has run. Returns `true` if the copy
+/// queue's fence confirmed completion (safe for the caller to recycle source
+/// upload memory), or `false` if completion could not be confirmed (copy queue
+/// is poisoned, `slot` + `pin_extra()` sources stay pinned to the copy-queue
+/// fence outside `QUEUE`, and caller must NOT recycle source upload memory).
+pub(super) fn give_back(mut slot: Slot, pin_extra: impl FnOnce() -> Vec<ID3D12Resource>) -> bool {
     enum Back {
         Stored(ID3D12Device),
         PinUnconfirmed(Slot, Option<(ID3D12Fence, u64)>, Option<ID3D12Device>),
@@ -543,15 +625,24 @@ pub(super) fn give_back(mut slot: Slot) {
         }
     };
     match action {
-        Back::Stored(device) => sweep_unconfirmed(Some(&device)),
+        Back::Stored(device) => {
+            sweep_unconfirmed(Some(&device));
+            true
+        }
         Back::PinUnconfirmed(slot, signaled, device) => {
-            pin_unconfirmed(UnconfirmedSlot { slot, pinned_sources: Vec::new(), signaled }, device.as_ref());
+            pin_unconfirmed(
+                UnconfirmedSlot { slot, pinned_sources: pin_extra(), signaled },
+                device.as_ref(),
+                "copy-queue fence not confirmed at card_done",
+            );
+            false
         }
         Back::Orphan(mut slot) => {
             if let Some((old, _)) = slot.bounce.take() {
                 super::retire_resource(old);
             }
             drop(slot);
+            true
         }
     }
 }
@@ -692,5 +783,19 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn poisoning_stops_subsequent_upq_submissions() {
+        let state = UpqState::new();
+        assert!(state.allow_send());
+        assert!(!state.is_poisoned());
+        // First unconfirmed failure trips the latch once.
+        assert!(state.trip());
+        assert!(state.is_poisoned());
+        assert!(!state.allow_send());
+        // Subsequent trips are idempotent and keep submissions disabled.
+        assert!(!state.trip());
+        assert!(!state.allow_send());
     }
 }

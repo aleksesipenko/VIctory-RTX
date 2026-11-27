@@ -434,6 +434,68 @@ fn wait_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Per-frame global wait budget tracker (`SPENT[0]` for world pipelines,
+/// `SPENT[1]` for screen passes). `frame` advances monotonically so a stale
+/// thread from an earlier frame never resets the current frame's budget, and
+/// `Option<u64>` avoids any sentinel collision at `u64::MAX`.
+struct FrameSpent {
+    frame: Option<u64>,
+    used: Duration,
+}
+
+impl FrameSpent {
+    const fn new() -> Self {
+        Self { frame: None, used: Duration::ZERO }
+    }
+
+    /// Reserves wait budget for `p` in `frame`, returning `(left, reserved_again_us)`.
+    /// Stale frames (`frame < active`) receive zero budget and leave both the
+    /// global frame tracker and `wait_state` untouched.
+    fn reserve(
+        &mut self,
+        wait_state: &Mutex<WaitFrameState>,
+        frame: u64,
+        budget: Duration,
+        own: Duration,
+        again: Option<Duration>,
+        shared: bool,
+    ) -> (Duration, u64) {
+        match self.frame {
+            None => {
+                self.frame = Some(frame);
+                self.used = Duration::ZERO;
+            }
+            Some(active) if frame < active => return (Duration::ZERO, 0),
+            Some(active) if frame > active => {
+                self.frame = Some(frame);
+                self.used = Duration::ZERO;
+            }
+            Some(_) => {}
+        }
+        let available = budget.saturating_sub(self.used).min(own);
+        // Marked only when it may wait, so one dropped without waiting has
+        // its full budget the next frame. Up to five recording threads may
+        // wait for it at once. Only what is taken here is given back below.
+        let (left, reserved_again_us) = reserve_again_budget(wait_state, frame, available, again);
+        if shared {
+            self.used += left;
+        }
+        (left, reserved_again_us)
+    }
+
+    /// Reconciles `used` after a wait in `frame` finishes (ignored if a newer
+    /// frame has already started).
+    fn finish(&mut self, frame: u64, left: Duration, waited: Duration, shared: bool) {
+        if self.frame == Some(frame) {
+            if shared {
+                self.used = self.used.saturating_sub(left - waited);
+            } else {
+                self.used += waited;
+            }
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -452,24 +514,13 @@ fn wait(p: &Pending, frame: u64) {
     };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<FrameSpent>; 2] = [const { Mutex::new(FrameSpent::new()) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let again = if screen { None } else { wait_again_budget() };
     let shared = shared_budget();
     let (left, reserved_again_us) = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let available = budget.saturating_sub(spent.1).min(own);
-        // Marked only when it may wait, so one dropped without waiting has
-        // its full budget the next frame. Up to five recording threads may
-        // wait for it at once. Only what is taken here is given back below.
-        let (left, reserved_again_us) = reserve_again_budget(&p.wait_state, frame, available, again);
-        if shared {
-            spent.1 += left;
-        }
-        (left, reserved_again_us)
+        spent.reserve(&p.wait_state, frame, budget, own, again, shared)
     };
     if left.is_zero() {
         return;
@@ -512,13 +563,7 @@ fn wait(p: &Pending, frame: u64) {
     {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
+        spent.finish(frame, left, waited, shared);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
@@ -947,6 +992,66 @@ mod tests {
             }
         });
         assert_eq!(reserved_total.load(Ordering::Relaxed), 8_000);
+    }
+
+    /// Global `SPENT` advances monotonically: a late frame-11 call between two
+    /// distinct pipelines on frame 12 must not reset frame 12's shared budget.
+    #[test]
+    fn global_spent_is_monotonic_across_pipelines() {
+        let full = Duration::from_millis(500);
+        let again = Some(Duration::from_millis(8));
+        let p1 = Pending::new(Vec::new(), None);
+        let p2 = Pending::new(Vec::new(), None);
+        let p3 = Pending::new(Vec::new(), None);
+        let mut spent = FrameSpent::new();
+
+        // Pipeline 1 consumes 300 ms of frame 12's global budget.
+        assert_eq!(
+            spent.reserve(&p1.wait_state, 12, full, Duration::from_millis(300), again, true),
+            (Duration::from_millis(300), 0)
+        );
+        assert_eq!(spent.frame, Some(12));
+        assert_eq!(spent.used, Duration::from_millis(300));
+
+        // Stale frame 11 arrives: gets zero budget and leaves both global
+        // `SPENT` and `p2`'s per-pipeline state untouched.
+        assert_eq!(spent.reserve(&p2.wait_state, 11, full, full, again, true), (Duration::ZERO, 0));
+        assert_eq!(spent.frame, Some(12));
+        assert_eq!(spent.used, Duration::from_millis(300));
+        assert_eq!(p2.wait_state.lock().unwrap().first_frame, None);
+
+        // Pipeline 2 on frame 12 receives only the remaining 200 ms (NOT 500 ms).
+        assert_eq!(
+            spent.reserve(&p2.wait_state, 12, full, full, again, true),
+            (Duration::from_millis(200), 0)
+        );
+        assert_eq!(spent.used, full);
+
+        // Another stale frame-11 call cannot reset exhausted frame 12 for pipeline 3.
+        assert_eq!(spent.reserve(&p3.wait_state, 11, full, full, again, true), (Duration::ZERO, 0));
+        assert_eq!(spent.reserve(&p3.wait_state, 12, full, full, again, true), (Duration::ZERO, 0));
+        assert_eq!(p3.wait_state.lock().unwrap().first_frame, None);
+
+        // Advancing to frame 13 resets the global budget cleanly; stale finish
+        // from frame 12 is ignored.
+        assert_eq!(
+            spent.reserve(&p3.wait_state, 13, full, Duration::from_millis(100), again, true),
+            (Duration::from_millis(100), 0)
+        );
+        spent.finish(12, Duration::from_millis(200), Duration::ZERO, true);
+        assert_eq!(spent.frame, Some(13));
+        assert_eq!(spent.used, Duration::from_millis(100));
+        spent.finish(13, Duration::from_millis(100), Duration::from_millis(40), true);
+        assert_eq!(spent.used, Duration::from_millis(40));
+
+        // `frame == u64::MAX` works cleanly as an initial frame with no sentinel collision.
+        let mut max_spent = FrameSpent::new();
+        let p_max = Pending::new(Vec::new(), None);
+        assert_eq!(
+            max_spent.reserve(&p_max.wait_state, u64::MAX, full, full, again, true),
+            (full, 0)
+        );
+        assert_eq!(max_spent.reserve(&p_max.wait_state, u64::MAX - 1, full, full, again, true), (Duration::ZERO, 0));
     }
 
     /// Passes over the screen go before all others, and workers of their own
