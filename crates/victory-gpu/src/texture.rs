@@ -1990,7 +1990,7 @@ fn try_charge_unchanged(
 /// guest memory). For `!dense` with `fp_len == read.len() <= LIVE_WHOLE_BYTES`,
 /// reuses the already-computed `held.to_print()` as `dense_print` at zero extra
 /// hashing cost so the final `Plain` probe can verify the whole buffer.
-fn unchanged_snapshot_fingerprint(
+pub(crate) fn unchanged_snapshot_fingerprint(
     read: &[u8],
     held: Digest,
     fp_len: usize,

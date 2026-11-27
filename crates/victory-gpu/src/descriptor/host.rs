@@ -1247,7 +1247,7 @@ impl TextureQueue {
                 due[1].push((1, w.write, index, w.write));
             } else {
                 // Tier 2: regular `Plain` / `later` / `partly` slots, earliest
-                // due frame first, newest write first within the same frame.
+                // due frame first, oldest write first within the same frame.
                 due[1].push((2, w.due, index, w.write));
             }
         }
@@ -1258,20 +1258,85 @@ impl TextureQueue {
     /// ten thousand slots are sorted).
     ///
     /// Interleaves all 3 buckets (`again` = `Plain` recheck / `later` /
-    /// `partly`, `fresh` = newest/oldest alternating, and `live` =
-    /// `ChangedOnce` / `Live` / `Paused` + retiring final-dense `Plain`)
-    /// 1-for-1-for-1 (`[again, fresh, live, ...]`), preserving the upstream
-    /// rule that an `again` slot leads at index 0 while guaranteeing neither
-    /// 4,096 `again` nor 4,096 `live` slots can starve `fresh`, and sorting
-    /// `again` so deferred and older `Pending` slots drain FIFO ahead of
-    /// continuous new streams.
-    fn in_order([mut live, mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
-        live.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| b.3.cmp(&a.3)));
-        again.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| b.3.cmp(&a.3))
-        });
+    /// `partly`, `live` = `ChangedOnce` / `Live` / `Paused` + retiring
+    /// final-dense `Plain`, and `fresh` = newest/oldest alternating)
+    /// 1-for-1-for-1 (`[again, live, fresh, ...]`), preserving the upstream
+    /// rule that an `again` slot leads at index 0 while running `live` ahead
+    /// of `fresh` and guaranteeing neither 4,096 `again` nor 4,096 `live`
+    /// slots can starve `fresh`.
+    ///
+    /// Inside `again`, all 3 tiers are sorted strictly oldest-first — Tier 0
+    /// (budget-deferred, `defer_seq ASC`), Tier 1 (`Pending`, `write ASC`),
+    /// and Tier 2 (regular `Plain`/`later`/`partly`, `(due ASC, write ASC)`) —
+    /// and merged in a 4-slot cadence `[T0, T2, T1, T0]` (50% Tier 0, 25%
+    /// Tier 1, 25% Tier 2, falling back to non-empty tiers) so even an
+    /// unbounded flood past `max` in any tier never starves the other tiers.
+    fn in_order([mut live, again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
+        live.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)));
+        let mut tier0: Vec<(u8, u64, u32, u64)> = Vec::new();
+        let mut tier1: Vec<(u8, u64, u32, u64)> = Vec::new();
+        let mut tier2: Vec<(u8, u64, u32, u64)> = Vec::new();
+        for entry in again {
+            match entry.0 {
+                0 => tier0.push(entry),
+                1 => tier1.push(entry),
+                _ => tier2.push(entry),
+            }
+        }
+        // Sort each tier strictly oldest-first so newer higher-`write`
+        // arrivals can never jump ahead of older entries in the same tier.
+        tier0.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)));
+        tier1.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)));
+        tier2.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)));
+        let mut again_order: Vec<(u32, u64)> =
+            Vec::with_capacity((tier0.len() + tier1.len() + tier2.len()).min(max));
+        let (mut i0, mut i1, mut i2) = (0, 0, 0);
+        while again_order.len() < max && (i0 < tier0.len() || i1 < tier1.len() || i2 < tier2.len())
+        {
+            let pick = match again_order.len() % 4 {
+                1 => {
+                    if i2 < tier2.len() {
+                        2
+                    } else if i0 < tier0.len() {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                2 => {
+                    if i1 < tier1.len() {
+                        1
+                    } else if i0 < tier0.len() {
+                        0
+                    } else {
+                        2
+                    }
+                }
+                _ => {
+                    if i0 < tier0.len() {
+                        0
+                    } else if i1 < tier1.len() {
+                        1
+                    } else {
+                        2
+                    }
+                }
+            };
+            match pick {
+                0 => {
+                    again_order.push((tier0[i0].2, tier0[i0].3));
+                    i0 += 1;
+                }
+                1 => {
+                    again_order.push((tier1[i1].2, tier1[i1].3));
+                    i1 += 1;
+                }
+                _ => {
+                    again_order.push((tier2[i2].2, tier2[i2].3));
+                    i2 += 1;
+                }
+            }
+        }
         fresh.sort_unstable_by_key(|a| std::cmp::Reverse(a.3));
         let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
@@ -1284,20 +1349,22 @@ impl TextureQueue {
             }
         }
         let mut order: Vec<(u32, u64)> =
-            Vec::with_capacity(max.min(again.len() + fresh_order.len() + live.len()));
-        let (mut ag, mut fr, mut lv) = (0, 0, 0);
-        while order.len() < max && (ag < again.len() || fr < fresh_order.len() || lv < live.len()) {
-            if ag < again.len() {
-                order.push((again[ag].2, again[ag].3));
+            Vec::with_capacity(max.min(again_order.len() + live.len() + fresh_order.len()));
+        let (mut ag, mut lv, mut fr) = (0, 0, 0);
+        while order.len() < max
+            && (ag < again_order.len() || lv < live.len() || fr < fresh_order.len())
+        {
+            if ag < again_order.len() {
+                order.push(again_order[ag]);
                 ag += 1;
-            }
-            if order.len() < max && fr < fresh_order.len() {
-                order.push(fresh_order[fr]);
-                fr += 1;
             }
             if order.len() < max && lv < live.len() {
                 order.push((live[lv].2, live[lv].3));
                 lv += 1;
+            }
+            if order.len() < max && fr < fresh_order.len() {
+                order.push(fresh_order[fr]);
+                fr += 1;
             }
         }
         order
@@ -1400,7 +1467,6 @@ impl TextureQueue {
             let final_plain_dense = state == LiveState::Plain
                 && baseline == LiveBaseline::Strip
                 && looks >= PLAIN_FINAL_LOOK
-                && dense_print != 0
                 && at.1 > PLAIN_STRIP_BYTES;
             if state == LiveState::Plain && baseline == LiveBaseline::Strip && !final_plain_dense {
                 self.live.remove(&index);
@@ -1460,7 +1526,6 @@ impl TextureQueue {
             let final_plain_dense = state == LiveState::Plain
                 && baseline == LiveBaseline::Strip
                 && w.checked.3 >= PLAIN_FINAL_LOOK
-                && dense_print != 0
                 && w.checked.1 > PLAIN_STRIP_BYTES;
             if state == LiveState::Plain && baseline == LiveBaseline::Strip && !final_plain_dense {
                 self.live.remove(&index);
@@ -6405,11 +6470,112 @@ mod tests {
         );
     }
 
+    /// Even when a continuous flood keeps `> limit` entries in Tier 0 + Tier 1
+    /// AND injects newer Tier-2 entries every frame, older unselected Tier-1
+    /// (`Pending`) and Tier-2 (`Plain`) slots are both guaranteed to be
+    /// selected within bounded frames (never starved behind `limit`).
+    #[test]
+    fn unselected_tier2_slot_makes_bounded_progress_under_limit_flood() {
+        let mut q = TextureQueue::default();
+        const LIMIT: usize = 4;
+
+        // Seed 3 older Tier-2 Plain slots (slots 1, 2, 3; slot 3 sits behind 1 & 2)
+        // and 2 older Tier-1 Pending slots (slots 11, 12; slot 12 sits behind 11).
+        for slot in 1..=3u32 {
+            q.written(slot, 1, 0, false);
+            let w = q.slots.get(&slot).unwrap().write;
+            q.recheck(slot, w, 10, (0x1000, 0x10000), 7, 9, 0, 1, LiveState::Plain, LiveBaseline::Strip);
+        }
+        for slot in 11..=12u32 {
+            q.written(slot, 1, 0, false);
+            let w = q.slots.get(&slot).unwrap().write;
+            q.recheck(
+                slot,
+                w,
+                10,
+                (0x1800, 0x10000),
+                1,
+                0,
+                0,
+                1,
+                LiveState::Plain,
+                LiveBaseline::Pending(next_upload_attempt()),
+            );
+        }
+
+        let mut next_slot = 100u32;
+        let mut slot3_selected_frame = None;
+        let mut slot12_selected_frame = None;
+        for frame in 10..20u64 {
+            // Flood 15 brand-new Tier-0 (deferred) + Tier-1 (Pending) + newer Tier-2 slots EVERY frame!
+            for _ in 0..5 {
+                let s_t0 = next_slot;
+                next_slot += 1;
+                q.written(s_t0, frame, frame, false);
+                let w = q.slots.get(&s_t0).unwrap().write;
+                q.recheck(s_t0, w, frame, (0x2000, 0x10000), 3, 4, 0, frame, LiveState::Plain, LiveBaseline::Strip);
+                q.defer_recheck(s_t0, w, frame);
+            }
+            for _ in 0..5 {
+                let s_t1 = next_slot;
+                next_slot += 1;
+                q.written(s_t1, frame, frame, false);
+                let w = q.slots.get(&s_t1).unwrap().write;
+                q.recheck(
+                    s_t1,
+                    w,
+                    frame,
+                    (0x3000, 0x10000),
+                    1,
+                    0,
+                    0,
+                    frame,
+                    LiveState::Plain,
+                    LiveBaseline::Pending(next_upload_attempt()),
+                );
+            }
+            for _ in 0..5 {
+                let s_t2 = next_slot;
+                next_slot += 1;
+                q.written(s_t2, frame, frame, false);
+                let w = q.slots.get(&s_t2).unwrap().write;
+                q.recheck(s_t2, w, frame, (0x4000, 0x10000), 5, 6, 0, frame, LiveState::Plain, LiveBaseline::Strip);
+            }
+
+            // Select ONLY `LIMIT = 4` entries (remaining entries stay unselected and never get defer_seq).
+            let batch = q.due(frame, LIMIT);
+            assert_eq!(batch.len(), LIMIT);
+            for (slot, write) in batch {
+                if slot == 3 {
+                    slot3_selected_frame = Some(frame);
+                }
+                if slot == 12 {
+                    slot12_selected_frame = Some(frame);
+                }
+                q.done(slot, write);
+            }
+            if slot3_selected_frame.is_some() && slot12_selected_frame.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            slot12_selected_frame,
+            Some(11),
+            "older Tier-1 Pending slot 12 behind slot 11 must be selected on frame 11 despite >LIMIT Tier-0 flood"
+        );
+        assert_eq!(
+            slot3_selected_frame,
+            Some(12),
+            "older Tier-2 slot 3 behind 2 older Tier-2 slots must be selected on frame 12 despite >LIMIT Tier 0/1/2 flood"
+        );
+    }
+
     /// Even when 5,000 ready `again` (`Plain` recheck) slots AND 5,000 ready
     /// `Live` slots both exceed the 4,096 per-pass cap, `TextureQueue::in_order`
-    /// interleaves all 3 buckets 1-for-1-for-1 (`[again, fresh, live, ...]`),
-    /// so `batch[..3]` includes all three buckets on the very first pass and
-    /// neither 4,096 `again` nor 4,096 `live` can ever starve `fresh`.
+    /// interleaves all 3 buckets 1-for-1-for-1 (`[again, live, fresh, ...]`),
+    /// so `batch[..3]` includes all three buckets on the very first pass, `live`
+    /// runs ahead of `fresh`, and neither 4,096 `again` nor 4,096 `live` can
+    /// ever starve `fresh`.
     #[test]
     fn plain_slots_never_starve_behind_thousands_of_live_slots() {
         let mut q = TextureQueue::default();
@@ -6433,19 +6599,19 @@ mod tests {
         }
         let batch = q.due(2, 4096);
         assert_eq!(batch.len(), 4096);
-        // Even breaking after just the first 3 items serves again, fresh, AND live!
+        // Even breaking after just the first 3 items serves again, live, AND fresh (live ahead of fresh)!
         let first3: Vec<u32> = batch.iter().take(3).map(|&(s, _)| s).collect();
         assert!(
             (10_000..15_000).contains(&first3[0]),
             "slot 0 must be an again/Plain slot, got {}",
             first3[0]
         );
+        assert!(first3[1] < 5000, "slot 1 must be a Live slot (ahead of fresh), got {}", first3[1]);
         assert!(
-            (20_000..20_020).contains(&first3[1]),
-            "slot 1 must be a fresh slot, got {}",
-            first3[1]
+            (20_000..20_020).contains(&first3[2]),
+            "slot 2 must be a fresh slot, got {}",
+            first3[2]
         );
-        assert!(first3[2] < 5000, "slot 2 must be a Live slot, got {}", first3[2]);
 
         let returned: std::collections::HashSet<u32> = batch.iter().map(|&(s, _)| s).collect();
         for slot in 20_000..20_020u32 {
