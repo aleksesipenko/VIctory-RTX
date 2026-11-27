@@ -47,6 +47,16 @@ const MOST: u64 = 512 << 20;
 /// Our buffers are made in sizes of powers of two from this on.
 const LEAST: u64 = 4 << 20;
 
+/// The size of a new buffer for `total` bytes, or `None` if the one we
+/// have (`have` bytes) holds them.
+/// (GPL-3.0 provenance: Belobug/VIctory-Belobug-AMD#401.)
+fn bounce_size(have: Option<u64>, total: u64) -> Option<u64> {
+    if have.is_some_and(|have| have >= total) {
+        return None;
+    }
+    Some(total.next_power_of_two().max(LEAST))
+}
+
 /// One submission's: a copy list and our buffer in the card's memory.
 pub(super) struct Slot {
     allocator: ID3D12CommandAllocator,
@@ -144,31 +154,44 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     }
-    let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(q) = guard.get_or_insert_with(|| make_queue(&host.device)).as_mut() else {
+    let popped = {
+        let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(q) = guard.get_or_insert_with(|| make_queue(&host.device)).as_mut() else {
+            STATS[3].fetch_add(1, Relaxed);
+            return None;
+        };
+        q.free.pop()
+    };
+    let Some(mut slot) = popped.or_else(|| make_slot(&host.device)) else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
-    let Some(mut slot) = q.free.pop().or_else(|| make_slot(&host.device)) else {
-        STATS[3].fetch_add(1, Relaxed);
-        return None;
-    };
-    if slot.bounce.as_ref().is_none_or(|b| b.1 < total) {
-        let size = total.next_power_of_two().max(LEAST);
-        slot.bounce = None;
+    if let Some(size) = bounce_size(slot.bounce.as_ref().map(|b| b.1), total) {
+        // The slot's last submission has run, but a buffer let go goes
+        // through the bury lag like every other object of ours: the device
+        // losses of 2026-11-25 were memory freed too early. Retired outside
+        // `QUEUE` so no lock is held across retire/drop or buffer creation
+        // (GPL-3.0 provenance: Belobug/VIctory-Belobug-AMD#401).
+        if let Some((old, _)) = slot.bounce.take() {
+            super::retire_resource(old);
+        }
         let Some(made) = host.uav_buffer(size) else {
-            q.free.push(slot);
+            give_back(slot);
             STATS[3].fetch_add(1, Relaxed);
             return None;
         };
         super::name(&made, || format!("copies in the card's memory: what goes up, {} MB", size >> 20));
         slot.bounce = Some((made, size));
     }
-    let (bounce, _) = slot.bounce.clone()?;
+    let Some((bounce, _)) = slot.bounce.clone() else {
+        give_back(slot);
+        STATS[3].fetch_add(1, Relaxed);
+        return None;
+    };
     // SAFETY: the slot's last submission has run (it came back with its
     // plan); the caller's for the buffers.
-    let recorded = unsafe {
-        (|| -> windows::core::Result<()> {
+    let list_to_run = unsafe {
+        (|| -> windows::core::Result<ID3D12CommandList> {
             slot.allocator.Reset()?;
             slot.list.Reset(&slot.allocator, None)?;
             let mut at = 0u64;
@@ -177,26 +200,51 @@ pub(super) unsafe fn send(
                 at += bytes.next_multiple_of(256);
             }
             slot.list.Close()?;
-            q.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list)?)]);
-            q.sent += 1;
-            q.queue.Signal(&q.fence, q.sent)?;
-            Ok(())
+            windows::core::Interface::cast(&slot.list)
         })()
     };
-    if let Err(e) = recorded {
-        // (Nothing waits for a copy that was not sent.)
-        tracing::warn!(error = %e, "what goes up to copies in the card's memory could not go on the copy queue: as before");
-        q.free.push(slot);
-        STATS[3].fetch_add(1, Relaxed);
-        return None;
-    }
-    // SAFETY: a fence of ours that the copy queue signals.
-    if let Err(e) = unsafe { drawing.Wait(&q.fence, q.sent) } {
-        // The drawing queue cannot be made to wait: wait here, so that
-        // what follows still finds the bytes.
-        tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
-        // SAFETY: as above; a null event waits until the value is reached.
-        let _ = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) };
+    let list_to_run = match list_to_run {
+        Ok(list) => list,
+        Err(e) => {
+            // (Nothing waits for a copy that was not sent.)
+            tracing::warn!(error = %e, "what goes up to copies in the card's memory could not go on the copy queue: as before");
+            give_back(slot);
+            STATS[3].fetch_add(1, Relaxed);
+            return None;
+        }
+    };
+    {
+        let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(q) = guard.as_mut().and_then(Option::as_mut) else {
+            drop(guard);
+            give_back(slot);
+            STATS[3].fetch_add(1, Relaxed);
+            return None;
+        };
+        // SAFETY: `list_to_run` was closed above and belongs to `slot`.
+        let submitted = unsafe {
+            (|| -> windows::core::Result<()> {
+                q.queue.ExecuteCommandLists(&[Some(list_to_run)]);
+                q.sent += 1;
+                q.queue.Signal(&q.fence, q.sent)?;
+                Ok(())
+            })()
+        };
+        if let Err(e) = submitted {
+            // (Nothing waits for a copy that was not sent.)
+            tracing::warn!(error = %e, "what goes up to copies in the card's memory could not go on the copy queue: as before");
+            q.free.push(slot);
+            STATS[3].fetch_add(1, Relaxed);
+            return None;
+        }
+        // SAFETY: a fence of ours that the copy queue signals.
+        if let Err(e) = unsafe { drawing.Wait(&q.fence, q.sent) } {
+            // The drawing queue cannot be made to wait: wait here, so that
+            // what follows still finds the bytes.
+            tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
+            // SAFETY: as above; a null event waits until the value is reached.
+            let _ = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) };
+        }
     }
     let mut at = 0u64;
     for (i, r) in ranges.iter().enumerate() {
@@ -210,10 +258,18 @@ pub(super) unsafe fn send(
 }
 
 /// A plan's slot, back once its submission has run.
-pub(super) fn give_back(slot: Slot) {
-    let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(Some(q)) = guard.as_mut() {
-        q.free.push(slot);
+pub(super) fn give_back(mut slot: Slot) {
+    let orphan = {
+        let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(q)) = guard.as_mut() {
+            q.free.push(slot);
+            None
+        } else {
+            slot.bounce.take().map(|(old, _)| old)
+        }
+    };
+    if let Some(old) = orphan {
+        super::retire_resource(old);
     }
 }
 
@@ -226,5 +282,21 @@ pub(super) fn line(frames: f64) {
              {copies:.0} ranges, {:.1} MB; {before:.1} submissions sent up on the drawing queue (too big, or nothing to send with)",
             bytes / 1048576.0
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_buffer_is_made_only_when_the_one_we_have_is_too_small() {
+        assert_eq!(bounce_size(None, 1), Some(LEAST));
+        assert_eq!(bounce_size(Some(LEAST), LEAST), None);
+        assert_eq!(bounce_size(Some(LEAST), LEAST + 256), Some(2 * LEAST));
+        assert_eq!(bounce_size(Some(64 << 20), 5 << 20), None);
+        assert_eq!(bounce_size(None, (5 << 20) + 1), Some(8 << 20));
+        assert_eq!(bounce_size(None, MOST), Some(MOST));
+        assert_eq!(bounce_size(Some(MOST), MOST), None);
     }
 }
