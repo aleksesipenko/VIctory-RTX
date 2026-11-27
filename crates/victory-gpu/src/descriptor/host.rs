@@ -998,6 +998,14 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// Whole/dense baseline fingerprint captured alongside a `Plain` 3-strip
+    /// baseline so the final `Plain` probe can verify the entire texture
+    /// before retiring (0 if none or already dense in `checked.2`).
+    dense_print: u64,
+    /// Non-zero monotonic FIFO sequence assigned on the first budget deferral
+    /// (`TextureQueue::defer_recheck`) so deferred `Plain`/`Pending` slots
+    /// jump ahead of newer arriving streams on the next pass (starvation-free).
+    defer_seq: u64,
     /// When the slot first waited for this (`crate::host::now_ms`), for
     /// `crate::texlate`: kept over writes until it is brought up to date;
     /// and whether it waited for its memory meanwhile.
@@ -1083,9 +1091,14 @@ pub(crate) struct TextureQueue {
     /// GPL-3.0 provenance: avatarmanz/VIctory-7900XTX #390).
     live: std::collections::HashMap<u32, (LiveState, LiveBaseline, u64)>,
     /// Monotonic sequence bumped whenever a dense/live (`ChangedOnce`/`Live`/
-    /// `Paused`) slot is updated, so deferred over-budget slots rotate fairly
-    /// ahead of recently hashed slots on the next pass.
+    /// `Paused` or retiring final-dense `Plain`) slot is updated, so deferred
+    /// over-budget slots rotate fairly ahead of recently hashed slots on the
+    /// next pass.
     live_polls: u64,
+    /// Monotonic FIFO sequence bumped when a `Plain`/`Pending` slot is budget-
+    /// deferred (`defer_recheck`), preventing starvation under continuous
+    /// streaming of newer higher-write-ID slots.
+    defer_ticks: u64,
 }
 
 /// A bit for each slot of a heap's [`TextureQueue`], changed under its lock
@@ -1121,9 +1134,18 @@ impl Queued {
 }
 
 /// Slots due of a [`TextureQueue`]: `[0]` dense/live (`ChangedOnce`/`Live`/
-/// `Paused`), `[1]` plain rechecks & `later`/`partly`, `[2]` fresh writes.
-/// Each entry holds `(poll_rank, slot, write)`.
-type Due = [Vec<(u64, u32, u64)>; 3];
+/// `Paused` and retiring final-dense `Plain` checks), `[1]` plain rechecks &
+/// `later`/`partly`, `[2]` fresh writes.
+/// Each entry holds `(priority_tier, rank, slot, write)`.
+type Due = [Vec<(u8, u64, u32, u64)>; 3];
+
+/// Number of `Plain` probes in `draw::RECHECK_FRAMES`; the final look
+/// (`PLAIN_FINAL_LOOK = 4`) runs a dense check against `Waiting::dense_print`
+/// before retiring `Plain` when `len > 48 KiB`.
+const PLAIN_FINAL_LOOK: u8 = 4;
+
+/// Minimum texture byte size for which 3 × 16 KiB strips leave unprobed gaps.
+const PLAIN_STRIP_BYTES: u64 = 3 * (16 << 10);
 
 impl TextureQueue {
     fn insert(&mut self, index: u32, waiting: Waiting) {
@@ -1153,7 +1175,22 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(
+            index,
+            Waiting {
+                due,
+                written: frame,
+                write,
+                looks: 0,
+                mapped: 0,
+                checked: (0, 0, 0, 0, 0),
+                dense_print: 0,
+                defer_seq: 0,
+                since,
+                waited,
+                away,
+            },
+        );
     }
 
     /// What a slot written again keeps of its wait.
@@ -1193,14 +1230,25 @@ impl TextureQueue {
     fn all_due(&self, frame: u64) -> Due {
         let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            if let Some(&(state, _, poll)) = self.live.get(&index)
-                && state.whole_fingerprint()
+            if let Some(&(state, baseline, poll)) = self.live.get(&index)
+                && (state.whole_fingerprint()
+                    || (state == LiveState::Plain && baseline == LiveBaseline::Strip))
             {
-                due[0].push((poll, index, w.write));
+                due[0].push((0, poll, index, w.write));
             } else if w.looks == 0 && w.mapped == 0 {
-                due[2].push((0, index, w.write));
+                due[2].push((0, 0, index, w.write));
+            } else if w.defer_seq != 0 {
+                // Tier 0: budget-deferred slots drain strictly FIFO ahead of
+                // newer arriving streams (starvation-free).
+                due[1].push((0, w.defer_seq, index, w.write));
+            } else if matches!(self.live.get(&index), Some(&(_, LiveBaseline::Pending(_), _))) {
+                // Tier 1: older `Pending` slots run FIFO by `write` ahead of
+                // newer higher-ID streams and routine probes.
+                due[1].push((1, w.write, index, w.write));
             } else {
-                due[1].push((0, index, w.write));
+                // Tier 2: regular `Plain` / `later` / `partly` slots, earliest
+                // due frame first, newest write first within the same frame.
+                due[1].push((2, w.due, index, w.write));
             }
         }
         due
@@ -1211,23 +1259,28 @@ impl TextureQueue {
     ///
     /// Interleaves all 3 buckets (`again` = `Plain` recheck / `later` /
     /// `partly`, `fresh` = newest/oldest alternating, and `live` =
-    /// `ChangedOnce` / `Live` / `Paused`) 1-for-1-for-1 (`[again, fresh, live,
-    /// ...]`), preserving the upstream rule that an `again` slot leads at
-    /// index 0 while guaranteeing neither 4,096 `again` nor 4,096 `live`
-    /// slots can starve `fresh` (and an early break after 3 slots serves all
-    /// three buckets).
+    /// `ChangedOnce` / `Live` / `Paused` + retiring final-dense `Plain`)
+    /// 1-for-1-for-1 (`[again, fresh, live, ...]`), preserving the upstream
+    /// rule that an `again` slot leads at index 0 while guaranteeing neither
+    /// 4,096 `again` nor 4,096 `live` slots can starve `fresh`, and sorting
+    /// `again` so deferred and older `Pending` slots drain FIFO ahead of
+    /// continuous new streams.
     fn in_order([mut live, mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
-        live.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
-        again.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
-        fresh.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
+        live.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| b.3.cmp(&a.3)));
+        again.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| b.3.cmp(&a.3))
+        });
+        fresh.sort_unstable_by_key(|a| std::cmp::Reverse(a.3));
         let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
         while new < old && fresh_order.len() < max {
-            fresh_order.push((fresh[new].1, fresh[new].2));
+            fresh_order.push((fresh[new].2, fresh[new].3));
             new += 1;
             if new < old && fresh_order.len() < max {
                 old -= 1;
-                fresh_order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].2, fresh[old].3));
             }
         }
         let mut order: Vec<(u32, u64)> =
@@ -1235,7 +1288,7 @@ impl TextureQueue {
         let (mut ag, mut fr, mut lv) = (0, 0, 0);
         while order.len() < max && (ag < again.len() || fr < fresh_order.len() || lv < live.len()) {
             if ag < again.len() {
-                order.push((again[ag].1, again[ag].2));
+                order.push((again[ag].2, again[ag].3));
                 ag += 1;
             }
             if order.len() < max && fr < fresh_order.len() {
@@ -1243,7 +1296,7 @@ impl TextureQueue {
                 fr += 1;
             }
             if order.len() < max && lv < live.len() {
-                order.push((live[lv].1, live[lv].2));
+                order.push((live[lv].2, live[lv].3));
                 lv += 1;
             }
         }
@@ -1270,6 +1323,8 @@ impl TextureQueue {
             w.looks = w.looks.saturating_add(1);
             w.away = crate::host::now_ms();
             w.checked = (0, 0, 0, 0, 0);
+            w.dense_print = 0;
+            w.defer_seq = 0;
             self.live.remove(&index);
         }
     }
@@ -1311,15 +1366,18 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
             w.checked = (0, 0, 0, 0, 0);
+            w.dense_print = 0;
+            w.defer_seq = 0;
             self.live.remove(&index);
         }
     }
 
     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
-    /// with fingerprint `print`: looked at again from frame `due`, for a
-    /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame; `state`:
-    /// [`LiveState`]; `baseline`: [`LiveBaseline`]).
+    /// with fingerprint `print` (and optional `dense_print` for final `Plain`
+    /// verification): looked at again from frame `due`, for a title that fills
+    /// a texture's memory after it wrote the view (the `looks`-th such look;
+    /// `uploaded` is the upload's frame; `state`: [`LiveState`]; `baseline`:
+    /// [`LiveBaseline`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn recheck(
         &mut self,
@@ -1328,6 +1386,7 @@ impl TextureQueue {
         due: u64,
         at: (u64, u64),
         print: u64,
+        dense_print: u64,
         looks: u8,
         uploaded: u64,
         state: LiveState,
@@ -1336,7 +1395,14 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
-            if state == LiveState::Plain && baseline == LiveBaseline::Strip {
+            w.dense_print = dense_print;
+            w.defer_seq = 0;
+            let final_plain_dense = state == LiveState::Plain
+                && baseline == LiveBaseline::Strip
+                && looks >= PLAIN_FINAL_LOOK
+                && dense_print != 0
+                && at.1 > PLAIN_STRIP_BYTES;
+            if state == LiveState::Plain && baseline == LiveBaseline::Strip && !final_plain_dense {
                 self.live.remove(&index);
             } else {
                 self.live_polls += 1;
@@ -1346,12 +1412,17 @@ impl TextureQueue {
         }
     }
 
-    /// Defers a recheck slot to `due` when the pass's shared recheck byte
-    /// budget is exhausted, preserving its `checked` state, `looks`,
-    /// `baseline`, and older `live_polls` rank so it runs first next pass.
+    /// Defers a recheck slot to `due` when the pass's recheck byte budget is
+    /// exhausted, preserving its `checked` state, `looks`, `baseline`, and
+    /// older `live_polls` rank, and stamping a FIFO `defer_seq` so deferred
+    /// `Plain`/`Pending` slots drain ahead of newer arriving streams.
     pub(crate) fn defer_recheck(&mut self, index: u32, write: u64, due: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.slots.get_mut(&index).filter(|w| w.write == write) {
             w.due = w.due.max(due);
+            if w.defer_seq == 0 {
+                self.defer_ticks += 1;
+                w.defer_seq = self.defer_ticks;
+            }
         }
     }
 
@@ -1368,6 +1439,7 @@ impl TextureQueue {
         attempt: u64,
         due: u64,
         print: u64,
+        dense_print: u64,
         state: LiveState,
         baseline: LiveBaseline,
     ) {
@@ -1383,7 +1455,14 @@ impl TextureQueue {
         {
             w.due = due;
             w.checked.2 = print;
-            if state == LiveState::Plain && baseline == LiveBaseline::Strip {
+            w.dense_print = dense_print;
+            w.defer_seq = 0;
+            let final_plain_dense = state == LiveState::Plain
+                && baseline == LiveBaseline::Strip
+                && w.checked.3 >= PLAIN_FINAL_LOOK
+                && dense_print != 0
+                && w.checked.1 > PLAIN_STRIP_BYTES;
+            if state == LiveState::Plain && baseline == LiveBaseline::Strip && !final_plain_dense {
                 self.live.remove(&index);
             } else {
                 let poll = self.live.get(&index).map_or_else(
@@ -1399,15 +1478,19 @@ impl TextureQueue {
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look, plus its [`LiveState`] and [`LiveBaseline`].
-    pub(crate) fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, LiveState, LiveBaseline)> {
-        let (at, len, print, looks, uploaded) =
-            self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)?;
+    /// waiting for such a look, plus its `dense_print`, [`LiveState`], and
+    /// [`LiveBaseline`].
+    pub(crate) fn checked(
+        &self,
+        index: u32,
+    ) -> Option<(u64, u64, u64, u64, u8, u64, LiveState, LiveBaseline)> {
+        let w = self.slots.get(&index).filter(|w| w.checked.2 != 0)?;
+        let (at, len, print, looks, uploaded) = w.checked;
         let (state, baseline) = self
             .live
             .get(&index)
             .map_or((LiveState::Plain, LiveBaseline::Strip), |&(s, b, _)| (s, b));
-        Some((at, len, print, looks, uploaded, state, baseline))
+        Some((at, len, print, w.dense_print, looks, uploaded, state, baseline))
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1419,7 +1502,22 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(
+            index,
+            Waiting {
+                due,
+                written: frame,
+                write,
+                looks: 0,
+                mapped: 0,
+                checked: (0, 0, 0, 0, 0),
+                dense_print: 0,
+                defer_seq: 0,
+                since,
+                waited,
+                away,
+            },
+        );
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -2357,13 +2455,14 @@ impl HostHeap {
         due: u64,
         at: (u64, u64),
         print: u64,
+        dense_print: u64,
         looks: u8,
         uploaded: u64,
         state: LiveState,
         baseline: LiveBaseline,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded, state, baseline);
+        textures.recheck(index, write, due, at, print, dense_print, looks, uploaded, state, baseline);
     }
 
     /// See [`TextureQueue::defer_recheck`].
@@ -2384,7 +2483,7 @@ impl HostHeap {
     pub(crate) fn texture_slot_checked(
         &self,
         index: u32,
-    ) -> Option<(u64, u64, u64, u8, u64, LiveState, LiveBaseline)> {
+    ) -> Option<(u64, u64, u64, u64, u8, u64, LiveState, LiveBaseline)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
@@ -6097,29 +6196,29 @@ mod tests {
         let mut q = TextureQueue::default();
         q.written(7, 1, 0, false);
         let write = q.due(1, 10)[0].1;
-        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, LiveState::Live, LiveBaseline::Dense);
+        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 0, 1, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(
             q.checked(7),
-            Some((0x1000, 0x2000, 5, 0, 1, LiveState::Live, LiveBaseline::Dense))
+            Some((0x1000, 0x2000, 5, 0, 0, 1, LiveState::Live, LiveBaseline::Dense))
         );
         assert!(q.due(1, 10).is_empty(), "due again from frame 2");
         assert_eq!(q.due(2, 10), [(7, write)], "a recheck is served");
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 1, 1, LiveState::Plain, LiveBaseline::Strip);
-        assert_eq!(q.checked(7).map(|c| (c.5, c.6)), Some((LiveState::Plain, LiveBaseline::Strip)));
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, 1, LiveState::Plain, LiveBaseline::Strip);
+        assert_eq!(q.checked(7).map(|c| (c.6, c.7)), Some((LiveState::Plain, LiveBaseline::Strip)));
         assert!(q.live.is_empty(), "Plain removes map entry");
-        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 1, LiveState::Paused, LiveBaseline::Dense);
-        assert_eq!(q.checked(7).map(|c| (c.5, c.6)), Some((LiveState::Paused, LiveBaseline::Dense)));
+        q.recheck(7, write, 3, (0x1000, 0x2000), 6, 0, 0, 1, LiveState::Paused, LiveBaseline::Dense);
+        assert_eq!(q.checked(7).map(|c| (c.6, c.7)), Some((LiveState::Paused, LiveBaseline::Dense)));
         q.done(7, write);
         assert_eq!(q.checked(7), None);
         assert!(q.live.is_empty(), "a slot out of the queue is not live");
         // Another write: a fresh slot, not live, whatever it was.
         q.written(7, 4, 4, false);
         let write = q.due(4, 10)[0].1;
-        q.recheck(7, write, 5, (0x1000, 0x2000), 6, 0, 4, LiveState::Live, LiveBaseline::Dense);
+        q.recheck(7, write, 5, (0x1000, 0x2000), 6, 0, 0, 4, LiveState::Live, LiveBaseline::Dense);
         q.written(7, 5, 5, false);
         assert!(q.live.is_empty(), "overwritten slot clears stale live entry");
-        q.recheck(7, q.due(5, 10)[0].1, 6, (0x1000, 0x2000), 6, 0, 5, LiveState::Plain, LiveBaseline::Strip);
-        assert_eq!(q.checked(7).map(|c| c.5), Some(LiveState::Plain));
+        q.recheck(7, q.due(5, 10)[0].1, 6, (0x1000, 0x2000), 6, 0, 0, 5, LiveState::Plain, LiveBaseline::Strip);
+        assert_eq!(q.checked(7).map(|c| c.6), Some(LiveState::Plain));
 
         // Round-robin fairness across budget deferrals: deferred slot 12 keeps
         // its older poll rank and comes before newly hashed slots 10 and 11 next frame.
@@ -6129,16 +6228,16 @@ mod tests {
         }
         let writes: Vec<(u32, u64)> = rr.due(1, 10);
         let w = |slot: u32| writes.iter().find(|&&(s, _)| s == slot).unwrap().1;
-        rr.recheck(10, w(10), 2, (0x1000, 0x2000), 1, 0, 1, LiveState::Live, LiveBaseline::Dense);
-        rr.recheck(11, w(11), 2, (0x3000, 0x2000), 2, 0, 1, LiveState::Live, LiveBaseline::Dense);
-        rr.recheck(12, w(12), 2, (0x5000, 0x2000), 3, 0, 1, LiveState::Live, LiveBaseline::Dense);
+        rr.recheck(10, w(10), 2, (0x1000, 0x2000), 1, 0, 0, 1, LiveState::Live, LiveBaseline::Dense);
+        rr.recheck(11, w(11), 2, (0x3000, 0x2000), 2, 0, 0, 1, LiveState::Live, LiveBaseline::Dense);
+        rr.recheck(12, w(12), 2, (0x5000, 0x2000), 3, 0, 0, 1, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(rr.due(2, 10), [(10, w(10)), (11, w(11)), (12, w(12))]);
         // Frame 2: hash 10 and 11, defer 12 for budget.
-        rr.recheck(10, w(10), 3, (0x1000, 0x2000), 1, 1, 1, LiveState::Live, LiveBaseline::Dense);
-        rr.recheck(11, w(11), 3, (0x3000, 0x2000), 2, 1, 1, LiveState::Live, LiveBaseline::Dense);
+        rr.recheck(10, w(10), 3, (0x1000, 0x2000), 1, 0, 1, 1, LiveState::Live, LiveBaseline::Dense);
+        rr.recheck(11, w(11), 3, (0x3000, 0x2000), 2, 0, 1, 1, LiveState::Live, LiveBaseline::Dense);
         rr.defer_recheck(12, w(12), 3);
         assert_eq!(rr.due(3, 10), [(12, w(12)), (10, w(10)), (11, w(11))]);
-        assert_eq!(rr.checked(12).map(|c| c.3), Some(0), "deferred slot keeps looks count");
+        assert_eq!(rr.checked(12).map(|c| c.4), Some(0), "deferred slot keeps looks count");
     }
 
     /// `TextureQueue::commit_baseline` upgrades a record-time `Pending(attempt)`
@@ -6152,28 +6251,28 @@ mod tests {
         q.written(42, 10, 10, false);
         let w42 = q.due(10, 10)[0].1;
         let a1 = next_upload_attempt();
-        q.recheck(42, w42, 11, (0x1000, 0x2000), 1, 0, 10, LiveState::Live, LiveBaseline::Pending(a1));
-        q.commit_baseline(42, w42, a1, 11, 0xbeef_cafe, LiveState::Live, LiveBaseline::Dense);
+        q.recheck(42, w42, 11, (0x1000, 0x2000), 1, 0, 0, 10, LiveState::Live, LiveBaseline::Pending(a1));
+        q.commit_baseline(42, w42, a1, 11, 0xbeef_cafe, 0, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(
             q.checked(42),
-            Some((0x1000, 0x2000, 0xbeef_cafe, 0, 10, LiveState::Live, LiveBaseline::Dense))
+            Some((0x1000, 0x2000, 0xbeef_cafe, 0, 0, 10, LiveState::Live, LiveBaseline::Dense))
         );
         // Repeat/stale callback once already Dense must no-op.
-        q.commit_baseline(42, w42, a1, 99, 0x1111, LiveState::Live, LiveBaseline::Dense);
+        q.commit_baseline(42, w42, a1, 99, 0x1111, 0, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(q.checked(42).map(|c| c.2), Some(0xbeef_cafe));
 
-        // 2) Plain slot: Pending(a2) -> Strip commits print, updates due to frame + 4, and clears `live` map.
+        // 2) Plain slot: Pending(a2) -> Strip commits print + dense_print, updates due to frame + 4, and clears `live` map.
         q.written(43, 10, 10, false);
         let w43 = q.due(10, 10)[0].1;
         let a2 = next_upload_attempt();
         assert!(a2 > a1);
-        q.recheck(43, w43, 11, (0x2000, 0x1000), 1, 0, 10, LiveState::Plain, LiveBaseline::Pending(a2));
+        q.recheck(43, w43, 11, (0x2000, 0x1000), 1, 0, 0, 10, LiveState::Plain, LiveBaseline::Pending(a2));
         assert!(q.live.contains_key(&43), "Pending Plain stays tracked until submit commits Strip");
-        q.commit_baseline(43, w43, a2, 14, 0xface_b00c, LiveState::Plain, LiveBaseline::Strip);
+        q.commit_baseline(43, w43, a2, 14, 0xface_b00c, 0x9999_8888, LiveState::Plain, LiveBaseline::Strip);
         assert!(!q.live.contains_key(&43), "Committed Plain Strip leaves `live` map");
         assert_eq!(
             q.checked(43),
-            Some((0x2000, 0x1000, 0xface_b00c, 0, 10, LiveState::Plain, LiveBaseline::Strip))
+            Some((0x2000, 0x1000, 0xface_b00c, 0x9999_8888, 0, 10, LiveState::Plain, LiveBaseline::Strip))
         );
         assert!(!q.due(13, 10).iter().any(|&(s, _)| s == 43));
         assert!(q.due(14, 10).iter().any(|&(s, _)| s == 43));
@@ -6191,6 +6290,7 @@ mod tests {
             (0x1000, 0x2000),
             1,
             0,
+            0,
             10,
             LiveState::Live,
             LiveBaseline::Pending(same_frame_first),
@@ -6202,13 +6302,14 @@ mod tests {
             (0x1000, 0x2000),
             1,
             0,
+            0,
             10,
             LiveState::Live,
             LiveBaseline::Pending(same_frame_second),
         );
-        q.commit_baseline(42, w42, same_frame_first, 11, 0xdead, LiveState::Live, LiveBaseline::Dense);
+        q.commit_baseline(42, w42, same_frame_first, 11, 0xdead, 0, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(
-            q.checked(42).map(|c| (c.2, c.6)),
+            q.checked(42).map(|c| (c.2, c.7)),
             Some((1, LiveBaseline::Pending(same_frame_second))),
             "stale same-frame upload callback must not overwrite newer Pending(attempt)"
         );
@@ -6218,11 +6319,12 @@ mod tests {
             same_frame_second,
             11,
             0x2222_3333,
+            0,
             LiveState::Live,
             LiveBaseline::Dense,
         );
         assert_eq!(
-            q.checked(42).map(|c| (c.2, c.6)),
+            q.checked(42).map(|c| (c.2, c.7)),
             Some((0x2222_3333, LiveBaseline::Dense))
         );
 
@@ -6235,13 +6337,72 @@ mod tests {
             (0x1000, 0x2000),
             1,
             0,
+            0,
             12,
             LiveState::Live,
             LiveBaseline::Pending(a_over),
         );
         q.written(42, 13, 13, false);
-        q.commit_baseline(42, w42, a_over, 13, 0xdead, LiveState::Live, LiveBaseline::Dense);
+        q.commit_baseline(42, w42, a_over, 13, 0xdead, 0, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(q.checked(42), None, "stale write must not revive overwritten slot");
+    }
+
+    /// Under continuous streaming of newer higher-write-ID `Plain` slots
+    /// exceeding the 2 MiB plain hash budget every frame, older `Pending` and
+    /// deferred `Plain` slots are never starved and are probed within bounded
+    /// frames.
+    #[test]
+    fn older_pending_and_deferred_plain_slots_never_starve_under_streaming() {
+        let mut q = TextureQueue::default();
+        // Older Pending slot (slot 1, low write ID) and older Plain recheck slot (slot 2).
+        q.written(1, 1, 0, false);
+        q.written(2, 1, 0, false);
+        let init = q.due(1, 10);
+        let w1 = init.iter().find(|&&(s, _)| s == 1).unwrap().1;
+        let w2 = init.iter().find(|&&(s, _)| s == 2).unwrap().1;
+        q.recheck(1, w1, 10, (0x1000, 0x40000), 1, 0, 0, 1, LiveState::Plain, LiveBaseline::Pending(next_upload_attempt()));
+        q.recheck(2, w2, 10, (0x50000, 0x40000), 7, 9, 0, 1, LiveState::Plain, LiveBaseline::Strip);
+
+        let mut next_slot = 100u32;
+        let mut slot1_served_frame = None;
+        let mut slot2_served_frame = None;
+        const PLAIN_CAP_PER_FRAME: usize = 42; // 42 × 48 KiB <= 2 MiB
+
+        for frame in 10..15u64 {
+            // Stream 60 brand-new higher-ID Plain slots every single frame (> 42 budget).
+            for _ in 0..60 {
+                let s = next_slot;
+                next_slot += 1;
+                q.written(s, frame, frame, false);
+                let w = q.slots.get(&s).unwrap().write;
+                q.recheck(s, w, frame, (0x10_0000, 0x40000), 5, 6, 0, frame, LiveState::Plain, LiveBaseline::Strip);
+            }
+            let batch = q.due(frame, 4096);
+            let mut serviced = 0usize;
+            for (slot, write) in batch {
+                if serviced < PLAIN_CAP_PER_FRAME {
+                    serviced += 1;
+                    if slot == 1 && slot1_served_frame.is_none() {
+                        slot1_served_frame = Some(frame);
+                    }
+                    if slot == 2 && slot2_served_frame.is_none() {
+                        slot2_served_frame = Some(frame);
+                    }
+                    q.done(slot, write);
+                } else {
+                    q.defer_recheck(slot, write, frame + 1);
+                }
+            }
+        }
+        assert_eq!(
+            slot1_served_frame,
+            Some(10),
+            "older Pending slot must be prioritized ahead of newer higher-ID streams on frame 10"
+        );
+        assert!(
+            slot2_served_frame.is_some_and(|f| f <= 12),
+            "older deferred Plain slot must be serviced within bounded frames under continuous streaming, got {slot2_served_frame:?}"
+        );
     }
 
     /// Even when 5,000 ready `again` (`Plain` recheck) slots AND 5,000 ready
@@ -6257,14 +6418,14 @@ mod tests {
             q.written(slot, 1, 0, false);
         }
         for (slot, write) in q.due(1, 6000) {
-            q.recheck(slot, write, 2, (0x1000, 0x2000), 7, 0, 1, LiveState::Live, LiveBaseline::Dense);
+            q.recheck(slot, write, 2, (0x1000, 0x2000), 7, 0, 0, 1, LiveState::Live, LiveBaseline::Dense);
         }
         // 5,000 Plain recheck (`again`) slots (10_000..15_000)
         for slot in 10_000..15_000u32 {
             q.written(slot, 1, 0, false);
         }
         for (slot, write) in q.due(1, 6000) {
-            q.recheck(slot, write, 2, (0x4000, 0x2000), 9, 0, 1, LiveState::Plain, LiveBaseline::Strip);
+            q.recheck(slot, write, 2, (0x4000, 0x2000), 9, 0, 0, 1, LiveState::Plain, LiveBaseline::Strip);
         }
         // 20 fresh newly created slots (20_000..20_020)
         for slot in 20_000..20_020u32 {

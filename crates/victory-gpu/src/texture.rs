@@ -110,11 +110,11 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct OnUploadState {
     started_without_snapshot: bool,
-    callbacks: Vec<Box<dyn FnOnce(&[u8]) + Send>>,
+    callbacks: Vec<Box<dyn FnOnce(&[u8], Option<Digest>) + Send>>,
 }
 
 impl OnUploadState {
-    fn attach(&mut self, f: Box<dyn FnOnce(&[u8]) + Send>) -> bool {
+    fn attach(&mut self, f: Box<dyn FnOnce(&[u8], Option<Digest>) + Send>) -> bool {
         if self.started_without_snapshot {
             return false;
         }
@@ -131,7 +131,7 @@ impl OnUploadState {
         }
     }
 
-    fn take_callbacks(&mut self) -> Vec<Box<dyn FnOnce(&[u8]) + Send>> {
+    fn take_callbacks(&mut self) -> Vec<Box<dyn FnOnce(&[u8], Option<Digest>) + Send>> {
         if self.started_without_snapshot || self.callbacks.is_empty() {
             return Vec::new();
         }
@@ -741,57 +741,115 @@ fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_none_or(|v| v != "0"))
 }
 
+const DIGEST_K: [u64; 8] = [
+    0xa076_1d64_78bd_642f,
+    0xe703_7ed1_a0b4_28db,
+    0x8ebc_6af0_9c88_c6e3,
+    0x5899_65cc_7537_4cc3,
+    0x1d8e_4e27_c47d_124f,
+    0xeb44_acca_b455_d165,
+    0x9e37_79b9_7f4a_7c15,
+    0xc2b2_ae3d_27d4_eb4f,
+];
+
+#[inline]
+fn digest_fold(a: u64, b: u64) -> u64 {
+    let p = u128::from(a) * u128::from(b);
+    p as u64 ^ (p >> 64) as u64
+}
+
+/// Incremental 64-byte-block state for [`digest`] so chunked reads of guest
+/// memory produce the exact bit-for-bit same [`Digest`] without allocating a
+/// full-texture buffer.
+struct StreamingDigest {
+    lanes: [u64; 4],
+    tail: [u8; 64],
+    tail_len: usize,
+    total_len: u64,
+}
+
+impl StreamingDigest {
+    fn new() -> Self {
+        Self {
+            lanes: [DIGEST_K[0], DIGEST_K[1], DIGEST_K[2], DIGEST_K[3]],
+            tail: [0; 64],
+            tail_len: 0,
+            total_len: 0,
+        }
+    }
+
+    #[inline]
+    fn step(&mut self, block: &[u8; 64]) {
+        for (i, lane) in self.lanes.iter_mut().enumerate() {
+            let a = u64::from_le_bytes(block[16 * i..16 * i + 8].try_into().unwrap());
+            let b = u64::from_le_bytes(block[16 * i + 8..16 * i + 16].try_into().unwrap());
+            // (What went in is added again: a product with a factor of zero
+            // forgets neither the lane nor the block.)
+            *lane = digest_fold(a ^ DIGEST_K[4 + i], b ^ *lane)
+                .wrapping_add(a.rotate_left(23) ^ lane.rotate_left(41))
+                ^ b;
+        }
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        self.total_len = self.total_len.saturating_add(bytes.len() as u64);
+        if self.tail_len > 0 {
+            let need = 64 - self.tail_len;
+            let take = need.min(bytes.len());
+            self.tail[self.tail_len..self.tail_len + take].copy_from_slice(&bytes[..take]);
+            self.tail_len += take;
+            bytes = &bytes[take..];
+            if self.tail_len == 64 {
+                let block = self.tail;
+                self.step(&block);
+                self.tail_len = 0;
+            }
+        }
+        let mut blocks = bytes.chunks_exact(64);
+        for block in &mut blocks {
+            self.step(block.try_into().unwrap_or(&[0; 64]));
+        }
+        let rest = blocks.remainder();
+        if !rest.is_empty() {
+            self.tail[..rest.len()].copy_from_slice(rest);
+            self.tail_len = rest.len();
+        }
+    }
+
+    fn finish(mut self) -> Digest {
+        self.tail[self.tail_len..].fill(0);
+        let last = self.tail;
+        self.step(&last);
+        let len = self.total_len;
+        let low = digest_fold(self.lanes[0] ^ DIGEST_K[1], self.lanes[1] ^ len)
+            ^ digest_fold(self.lanes[2] ^ DIGEST_K[3], self.lanes[3] ^ DIGEST_K[5]);
+        let high = digest_fold(self.lanes[0].rotate_left(32) ^ DIGEST_K[6], self.lanes[2] ^ len)
+            ^ digest_fold(self.lanes[1].rotate_left(32) ^ DIGEST_K[7], self.lanes[3] ^ DIGEST_K[2]);
+        Digest(u128::from(low) << 64 | u128::from(high))
+    }
+}
+
 /// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
 /// lanes of folded multiplications over 64 bytes at a time. (Not a
 /// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
 /// it was to spare; nobody makes up textures to collide.)
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
-    const K: [u64; 8] = [
-        0xa076_1d64_78bd_642f,
-        0xe703_7ed1_a0b4_28db,
-        0x8ebc_6af0_9c88_c6e3,
-        0x5899_65cc_7537_4cc3,
-        0x1d8e_4e27_c47d_124f,
-        0xeb44_acca_b455_d165,
-        0x9e37_79b9_7f4a_7c15,
-        0xc2b2_ae3d_27d4_eb4f,
-    ];
-    let fold = |a: u64, b: u64| {
-        let p = u128::from(a) * u128::from(b);
-        p as u64 ^ (p >> 64) as u64
-    };
-    let word = |b: &[u8]| {
-        let mut w = [0; 8];
-        w[..b.len()].copy_from_slice(b);
-        u64::from_le_bytes(w)
-    };
-    let mut lanes = [K[0], K[1], K[2], K[3]];
-    let mut step = |block: &[u8; 64]| {
-        for (i, lane) in lanes.iter_mut().enumerate() {
-            let a = word(&block[16 * i..16 * i + 8]);
-            let b = word(&block[16 * i + 8..16 * i + 16]);
-            // (What went in is added again: a product with a factor of zero
-            // forgets neither the lane nor the block.)
-            *lane = fold(a ^ K[4 + i], b ^ *lane).wrapping_add(a.rotate_left(23) ^ lane.rotate_left(41)) ^ b;
-        }
-    };
-    let mut blocks = bytes.chunks_exact(64);
-    for block in &mut blocks {
-        step(block.try_into().unwrap_or(&[0; 64]));
-    }
-    let rest = blocks.remainder();
-    let mut last = [0u8; 64];
-    last[..rest.len()].copy_from_slice(rest);
-    step(&last);
-    let len = bytes.len() as u64;
-    let low = fold(lanes[0] ^ K[1], lanes[1] ^ len) ^ fold(lanes[2] ^ K[3], lanes[3] ^ K[5]);
-    let high = fold(lanes[0].rotate_left(32) ^ K[6], lanes[2] ^ len) ^ fold(lanes[1].rotate_left(32) ^ K[7], lanes[3] ^ K[2]);
-    Digest(u128::from(low) << 64 | u128::from(high))
+    let mut s = StreamingDigest::new();
+    s.update(bytes);
+    s.finish()
 }
 
 /// See [`digest`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Digest(pub(crate) u128);
+
+impl Digest {
+    /// Non-zero 64-bit recheck fingerprint folded from this 128-bit [`Digest`].
+    #[inline]
+    pub(crate) fn to_print(self) -> u64 {
+        ((self.0 as u64) ^ ((self.0 >> 64) as u64)) | 1
+    }
+}
 
 /// Normalizes `first` the same way [`upload_from`] does for its per-list
 /// deduplication key.
@@ -1286,11 +1344,12 @@ impl Staging {
     }
 
     /// Registers a submit-time callback invoked with the exact `tiled` guest
-    /// byte slice uploaded to the GPU when this staging buffer refreshes.
-    /// Returns `false` (without attaching) if an unsnapshotted in-place
-    /// refresh already began, so callers leave the slot `Pending` for next
-    /// frame instead of running against live guest memory.
-    pub(crate) fn on_uploaded(&self, f: impl FnOnce(&[u8]) + Send + 'static) -> bool {
+    /// byte slice uploaded to the GPU (and its already-computed full-buffer
+    /// [`Digest`] when available) when this staging buffer refreshes. Returns
+    /// `false` (without attaching) if an unsnapshotted in-place refresh already
+    /// began, so callers leave the slot `Pending` for next frame instead of
+    /// running against live guest memory.
+    pub(crate) fn on_uploaded(&self, f: impl FnOnce(&[u8], Option<Digest>) + Send + 'static) -> bool {
         self.on_upload
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1310,14 +1369,14 @@ impl Staging {
 
     /// Runs any pending `on_upload` baseline callbacks with the exact `tiled`
     /// byte slice just detiled (or confirmed unchanged) for GPU upload.
-    fn notify_uploaded(&self, tiled: &[u8]) {
+    fn notify_uploaded(&self, tiled: &[u8], whole_hash: Option<Digest>) {
         let callbacks = self
             .on_upload
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take_callbacks();
         for cb in callbacks {
-            cb(tiled);
+            cb(tiled, whole_hash);
         }
     }
 
@@ -1373,7 +1432,9 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                // Write-watch path does not compute `digest(read)`; pass `None`
+                // so no unbudgeted whole-buffer hash runs here.
+                self.detile(read, None);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1469,7 +1530,7 @@ impl Staging {
                 let hash = digest(read);
                 if last.hash == Some(hash) {
                     if !read.iter().all(|&b| b == 0) {
-                        self.notify_uploaded(read);
+                        self.notify_uploaded(read, Some(hash));
                     }
                     return false;
                 }
@@ -1477,7 +1538,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                self.detile(read, Some(hash));
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1495,12 +1556,12 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
-                    self.notify_uploaded(tiled);
+                    self.notify_uploaded(tiled, Some(hash));
                     return size;
                 }
                 last.hash = Some(hash);
                 found_blind(last);
-                self.detile(tiled);
+                self.detile(tiled, Some(hash));
                 self.keep_whole(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1519,12 +1580,12 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            self.notify_uploaded(tiled);
+            self.notify_uploaded(tiled, Some(hash));
             return size;
         }
         last.hash = Some(hash);
         found_blind(last);
-        self.detile(tiled);
+        self.detile(tiled, Some(hash));
         self.keep_whole(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1547,10 +1608,10 @@ impl Staging {
             let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                self.detile(read);
+                self.detile(read, Some(hash));
                 self.keep_whole(read);
             } else {
-                self.notify_uploaded(read);
+                self.notify_uploaded(read, Some(hash));
             }
             true
         });
@@ -1589,8 +1650,9 @@ impl Staging {
                 crate::watch::change_over();
             }
             if got != 0 {
-                last.hash = Some(digest(read));
-                self.detile(read);
+                let hash = digest(read);
+                last.hash = Some(hash);
+                self.detile(read, Some(hash));
             }
             got
         });
@@ -1633,7 +1695,7 @@ impl Staging {
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8], whole_hash: Option<Digest>) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1683,7 +1745,7 @@ impl Staging {
                 return;
             }
         }
-        self.notify_uploaded(tiled);
+        self.notify_uploaded(tiled, whole_hash);
     }
 }
 
@@ -1743,7 +1805,7 @@ pub(crate) const LIVE_WHOLE_BYTES: u64 = 16 << 20;
 /// than [`LIVE_WHOLE_BYTES`]: 64 evenly-spaced 4 KiB slices (256 KiB total).
 const LIVE_GRID_SLICES: usize = 64;
 const LIVE_GRID_SLICE_BYTES: usize = 4 << 10;
-const LIVE_GRID_BYTES: u64 = (LIVE_GRID_SLICES * LIVE_GRID_SLICE_BYTES) as u64;
+pub(crate) const LIVE_GRID_BYTES: u64 = (LIVE_GRID_SLICES * LIVE_GRID_SLICE_BYTES) as u64;
 
 /// Bytes [`fingerprint_for`] reads from title memory for `(len, dense)`.
 pub(crate) fn fingerprint_bytes(len: u64, dense: bool) -> u64 {
@@ -1776,9 +1838,12 @@ fn mix_chunk(acc: u64, chunk: u128, index: usize) -> u64 {
 /// Computes the exact same fingerprint as [`fingerprint_for`] directly over an
 /// already-read byte slice `bytes` (e.g. the exact `tiled` slice that
 /// [`Staging::detile`] just detiled into the GPU upload staging buffer).
+///
+/// For `dense == true` and `bytes.len() <= LIVE_WHOLE_BYTES` (16 MiB), folds
+/// the full [`digest`] so initial `Plain` uploads reuse `Staging`'s already
+/// computed [`Digest`] at zero extra hashing cost.
 pub(crate) fn fingerprint_slice(bytes: &[u8], dense: bool) -> u64 {
     const WINDOW: usize = 16 << 10;
-    const CHUNK: usize = 64 << 10;
     let len = bytes.len();
     if !dense {
         let mut print = 0u128;
@@ -1796,34 +1861,26 @@ pub(crate) fn fingerprint_slice(bytes: &[u8], dense: bool) -> u64 {
         return u64::from_le_bytes(first) | 1;
     }
     let len_u64 = len as u64;
-    let mut acc = len_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     if len_u64 <= LIVE_WHOLE_BYTES {
-        let mut from = 0;
-        let mut index = 0usize;
-        while from < len {
-            let n = CHUNK.min(len - from);
-            acc = mix_chunk(acc, digest(&bytes[from..from + n]).0, index);
-            from += n;
-            index += 1;
-        }
-    } else {
-        let span = len - LIVE_GRID_SLICE_BYTES;
-        for i in 0..LIVE_GRID_SLICES {
-            let from = (i as u128 * span as u128 / (LIVE_GRID_SLICES - 1) as u128) as usize;
-            acc = mix_chunk(acc, digest(&bytes[from..from + LIVE_GRID_SLICE_BYTES]).0, i);
-        }
+        return digest(bytes).to_print();
+    }
+    let mut acc = len_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let span = len - LIVE_GRID_SLICE_BYTES;
+    for i in 0..LIVE_GRID_SLICES {
+        let from = (i as u128 * span as u128 / (LIVE_GRID_SLICES - 1) as u128) as usize;
+        acc = mix_chunk(acc, digest(&bytes[from..from + LIVE_GRID_SLICE_BYTES]).0, i);
     }
     acc | 1
 }
 
 /// [`fingerprint`], or for a dense/live slot: all bytes up to
-/// [`LIVE_WHOLE_BYTES`] (16 MiB), and above 16 MiB a uniform 64×4 KiB grid
-/// (256 KiB) spanning the entire texture (GPL-3.0 base:
-/// avatarmanz/VIctory-7900XTX #390). The three 16 KiB windows miss a video
-/// plane's change when its start, middle and end rows are a still background
-/// (a TV news shot: the reporter moves between them), so a plane looked
-/// unchanged and waited while the other planes of the same video frame were
-/// uploaded: one frame's luma under another's chroma.
+/// [`LIVE_WHOLE_BYTES`] (16 MiB) via incremental [`StreamingDigest`] (identical
+/// to [`digest`]), and above 16 MiB a uniform 64×4 KiB grid (256 KiB) spanning
+/// the entire texture (GPL-3.0 base: avatarmanz/VIctory-7900XTX #390). The
+/// three 16 KiB windows miss a video plane's change when its start, middle and
+/// end rows are a still background (a TV news shot: the reporter moves between
+/// them), so a plane looked unchanged and waited while the other planes of the
+/// same video frame were uploaded: one frame's luma under another's chroma.
 pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
     if !dense {
         return fingerprint(at, len);
@@ -1834,13 +1891,12 @@ pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
     }
     let len_u64 = len;
     let len = len as usize;
-    let mut acc = len_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if len_u64 <= LIVE_WHOLE_BYTES {
             read.resize(CHUNK, 0);
+            let mut hasher = StreamingDigest::new();
             let mut from = 0;
-            let mut index = 0usize;
             while from < len {
                 let bytes = CHUNK.min(len - from);
                 read[..bytes].fill(0);
@@ -1850,12 +1906,13 @@ pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
                     bytes,
                     false,
                 );
-                acc = mix_chunk(acc, digest(&read[..bytes]).0, index);
+                hasher.update(&read[..bytes]);
                 from += bytes;
-                index += 1;
             }
+            hasher.finish().to_print()
         } else {
             read.resize(LIVE_GRID_SLICE_BYTES, 0);
+            let mut acc = len_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let span = len - LIVE_GRID_SLICE_BYTES;
             for i in 0..LIVE_GRID_SLICES {
                 let from = (i as u128 * span as u128 / (LIVE_GRID_SLICES - 1) as u128) as usize;
@@ -1868,9 +1925,9 @@ pub(crate) fn fingerprint_for(at: u64, len: u64, dense: bool) -> u64 {
                 );
                 acc = mix_chunk(acc, digest(&read[..LIVE_GRID_SLICE_BYTES]).0, i);
             }
+            acc | 1
         }
-    });
-    acc | 1
+    })
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -1928,19 +1985,28 @@ fn try_charge_unchanged(
     true
 }
 
-/// Verifies `read` against `held` and, if equal, computes the recheck
-/// fingerprint for the `fp_len` prefix from the exact same immutable `read`
-/// snapshot (zero second read of live guest memory).
+/// Verifies `read` against `held` and, if equal, computes `(print, dense_print)`
+/// from the exact same immutable `read` snapshot (zero second read of live
+/// guest memory). For `!dense` with `fp_len == read.len() <= LIVE_WHOLE_BYTES`,
+/// reuses the already-computed `held.to_print()` as `dense_print` at zero extra
+/// hashing cost so the final `Plain` probe can verify the whole buffer.
 fn unchanged_snapshot_fingerprint(
     read: &[u8],
     held: Digest,
     fp_len: usize,
     dense: bool,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     if digest(read) != held {
         return None;
     }
-    Some(fingerprint_slice(&read[..fp_len.min(read.len())], dense))
+    let slice = &read[..fp_len.min(read.len())];
+    let print = fingerprint_slice(slice, dense);
+    let dense_print = if !dense && slice.len() == read.len() && (slice.len() as u64) <= LIVE_WHOLE_BYTES {
+        held.to_print()
+    } else {
+        0
+    };
+    Some((print, dense_print))
 }
 
 /// Whether the levels from `first` on of `resource`'s host copy were filled
@@ -1952,16 +2018,16 @@ fn unchanged_snapshot_fingerprint(
 /// Enforces `budget` strictly before reading across BOTH `digest(read)`
 /// (`size`) AND `fingerprint_slice` (`fingerprint_bytes(fp_len, dense)`): if
 /// `*hashed_bytes + size + fp_cost > budget`, the read is skipped and `None`
-/// is returned. When equal, returns `Some((address, span_len, fingerprint))`
-/// computed from the **exact same** snapshot slice that proved equality (zero
-/// second read of guest memory).
+/// is returned. When equal, returns
+/// `Some((address, span_len, print, dense_print))` computed from the **exact
+/// same** snapshot slice that proved equality (zero second read of guest memory).
 pub(crate) fn unchanged(
     resource: This,
     first: u32,
     dense: bool,
     hashed_bytes: &mut u64,
     budget: u64,
-) -> Option<(u64, u64, u64)> {
+) -> Option<(u64, u64, u64, u64)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
         return None;
@@ -1985,7 +2051,7 @@ pub(crate) fn unchanged(
             return None;
         }
         unchanged_snapshot_fingerprint(read, held, fp_len as usize, dense)
-            .map(|print| (memory as u64, fp_len, print))
+            .map(|(print, dense_print)| (memory as u64, fp_len, print, dense_print))
     })
 }
 
@@ -2540,14 +2606,19 @@ mod title_memory_tests {
         );
 
         // 3) unchanged_snapshot_fingerprint verifies `held` and hashes the exact same slice
-        //    (including prefix slicing when `fp_len < read.len()`).
+        //    (including prefix slicing when `fp_len < read.len()` and free `dense_print` for Plain).
         let mut buf = vec![0x44u8; 256 << 10];
         let held = super::digest(&buf);
         let fp_full = super::unchanged_snapshot_fingerprint(&buf, held, buf.len(), true);
-        assert_eq!(fp_full, Some(super::fingerprint_slice(&buf, true)));
+        assert_eq!(fp_full, Some((super::fingerprint_slice(&buf, true), 0)));
+        let fp_plain = super::unchanged_snapshot_fingerprint(&buf, held, buf.len(), false);
+        assert_eq!(
+            fp_plain,
+            Some((super::fingerprint_slice(&buf, false), held.to_print()))
+        );
         let prefix = 128 << 10;
         let fp_prefix = super::unchanged_snapshot_fingerprint(&buf, held, prefix, false);
-        assert_eq!(fp_prefix, Some(super::fingerprint_slice(&buf[..prefix], false)));
+        assert_eq!(fp_prefix, Some((super::fingerprint_slice(&buf[..prefix], false), 0)));
         // Mismatched digest returns None.
         buf[100] ^= 1;
         assert_eq!(super::unchanged_snapshot_fingerprint(&buf, held, buf.len(), true), None);
@@ -2562,7 +2633,7 @@ mod title_memory_tests {
         assert!(!state.begin_in_place_refresh(), "empty state takes zero-copy borrow");
         assert!(state.started_without_snapshot);
         assert!(
-            !state.attach(Box::new(|_| panic!("late callback must never run on live memory"))),
+            !state.attach(Box::new(|_, _| panic!("late callback must never run on live memory"))),
             "late attachment after started_without_snapshot must return false"
         );
         assert!(state.take_callbacks().is_empty());
@@ -2571,14 +2642,14 @@ mod title_memory_tests {
         let mut snap_state = super::OnUploadState::default();
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_cb = ran.clone();
-        assert!(snap_state.attach(Box::new(move |_| {
+        assert!(snap_state.attach(Box::new(move |_, _| {
             ran_cb.store(true, std::sync::atomic::Ordering::Release);
         })));
         assert!(snap_state.begin_in_place_refresh(), "attached callback forces immutable snapshot");
         let cbs = snap_state.take_callbacks();
         assert_eq!(cbs.len(), 1);
         for cb in cbs {
-            cb(&[1, 2, 3, 4]);
+            cb(&[1, 2, 3, 4], None);
         }
         assert!(ran.load(std::sync::atomic::Ordering::Acquire));
     }

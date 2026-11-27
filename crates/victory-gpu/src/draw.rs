@@ -750,12 +750,13 @@ fn live_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIVE_TEXTURES").is_none_or(|v| v != "0"))
 }
 
-/// Short per-frame dense/whole poll window after a slot's first post-upload
-/// change (governed by [`LIVE_PASS_BUDGET_BYTES`]) so a video texture updating
-/// even between the three 16 KiB strips promotes to `Live` on its 2nd change,
-/// while a one-shot streaming texture drops cleanly to `Done` after 4 static
-/// frames without lingering overhead.
-const CHANGED_ONCE_FAST_LOOKS: u8 = 4;
+/// Per-frame dense/whole poll window after a slot's first post-upload change
+/// (governed by [`LIVE_PASS_BUDGET_BYTES`]). Sized to 32 unchanged probes so a
+/// 24–30 fps video playing across a 3–4 texture ring at 60–120+ game FPS
+/// (updating each ring slot every ~8–20 frames) is reliably caught on its 2nd
+/// update and promoted to `Live`, while one-shot streaming textures still
+/// retire cleanly to `Done` after ~0.3–0.5 s.
+const CHANGED_ONCE_FAST_LOOKS: u8 = 32;
 
 /// Unchanged looks in a row after which a live slot switches from per-frame
 /// polling to periodic paused polling ([`LIVE_PAUSED_FRAMES`]).
@@ -828,10 +829,11 @@ enum RecheckAction {
     /// Deferred to `due` because the per-pass recheck hash budget is full; slot
     /// stays in queue with its existing baseline and older poll rank.
     Defer(u64),
-    /// Memory unchanged: reschedule recheck with `(due, print, looks, state, baseline)`.
+    /// Memory unchanged: reschedule recheck with `(due, print, dense_print, looks, state, baseline)`.
     Recheck {
         due: u64,
         print: u64,
+        dense_print: u64,
         looks: u8,
         state: crate::descriptor::host::LiveState,
         baseline: crate::descriptor::host::LiveBaseline,
@@ -853,6 +855,7 @@ enum RecheckAction {
 fn unchanged_transition(
     frame: u64,
     print: u64,
+    dense_print: u64,
     looks: u8,
     was_state: crate::descriptor::host::LiveState,
     baseline: crate::descriptor::host::LiveBaseline,
@@ -865,6 +868,7 @@ fn unchanged_transition(
                 RecheckAction::Recheck {
                     due: frame + 1,
                     print,
+                    dense_print: 0,
                     looks: next_looks,
                     state: LiveState::Live,
                     baseline,
@@ -873,6 +877,7 @@ fn unchanged_transition(
                 RecheckAction::Recheck {
                     due: frame + LIVE_PAUSED_FRAMES,
                     print,
+                    dense_print: 0,
                     looks: 0,
                     state: LiveState::Paused,
                     baseline,
@@ -882,6 +887,7 @@ fn unchanged_transition(
         LiveState::Paused => RecheckAction::Recheck {
             due: frame + LIVE_PAUSED_FRAMES,
             print,
+            dense_print: 0,
             looks: 0,
             state: LiveState::Paused,
             baseline,
@@ -891,6 +897,7 @@ fn unchanged_transition(
                 RecheckAction::Recheck {
                     due: frame + 1,
                     print,
+                    dense_print: 0,
                     looks: next_looks,
                     state: LiveState::ChangedOnce,
                     baseline,
@@ -903,6 +910,7 @@ fn unchanged_transition(
             Some(&wait) => RecheckAction::Recheck {
                 due: frame + wait,
                 print,
+                dense_print,
                 looks: next_looks,
                 state: LiveState::Plain,
                 baseline: crate::descriptor::host::LiveBaseline::Strip,
@@ -915,8 +923,15 @@ fn unchanged_transition(
 /// Evaluates one due recheck slot against the live-texture state machine and
 /// separate hard per-pass byte budgets (`PLAIN_PASS_BUDGET_BYTES` = 2 MiB for
 /// `Plain` 3-strip probes; `LIVE_PASS_BUDGET_BYTES` = 16 MiB for dense
-/// `ChangedOnce`/`Live`/`Paused` checks), checked and charged strictly BEFORE
-/// every fingerprint read.
+/// `ChangedOnce`/`Live`/`Paused` checks and final `Plain` full-frame checks),
+/// checked and charged strictly BEFORE every fingerprint read.
+///
+/// Before retiring a `Plain` slot on its final probe (`looks + 1 >=
+/// RECHECK_FRAMES.len()`), performs ONE dense verification against
+/// `dense_print` (when `len > 48 KiB` and `dense_print != 0`), deferring if
+/// dense budget is full rather than retiring unchecked so localized motion
+/// strictly between the 3 sparse bands is caught and promotes `Plain ->
+/// ChangedOnce`.
 ///
 /// Any slot whose stored baseline is `Pending` (or `Strip` for a dense state)
 /// has no verified baseline for the last-uploaded content, so once remaining
@@ -929,6 +944,7 @@ fn decide_recheck(
     at: u64,
     len: u64,
     print: u64,
+    dense_print: u64,
     looks: u8,
     was_state: crate::descriptor::host::LiveState,
     was_baseline: crate::descriptor::host::LiveBaseline,
@@ -963,14 +979,26 @@ fn decide_recheck(
         }
         return RecheckAction::Upload { again_in, next_state, force: true };
     }
-    let cost = crate::texture::fingerprint_bytes(len, want_dense);
-    if !budget.try_charge(want_dense, cost) {
+    // On the final `Plain` probe before retiring, verify the full texture via
+    // dense fingerprinting so localized motion strictly between the 3 sparse
+    // bands cannot escape and freeze a bindless video texture.
+    let final_plain_dense = live_on
+        && was_state == LiveState::Plain
+        && was_baseline == LiveBaseline::Strip
+        && usize::from(looks) + 1 >= RECHECK_FRAMES.len()
+        && dense_print != 0
+        && len > 3 * (16 << 10);
+    let probe_dense = want_dense || final_plain_dense;
+    let expected_print = if final_plain_dense { dense_print } else { print };
+    let cost = crate::texture::fingerprint_bytes(len, probe_dense);
+    if !budget.try_charge(probe_dense, cost) {
         return RecheckAction::Defer(frame + 1);
     }
-    if fingerprint(at, len, want_dense) == print {
+    if fingerprint(at, len, probe_dense) == expected_print {
         return unchanged_transition(
             frame,
             print,
+            dense_print,
             looks,
             was_state,
             if want_dense { LiveBaseline::Dense } else { LiveBaseline::Strip },
@@ -2818,7 +2846,7 @@ impl State {
             // and drops to periodic paused checks after LIVE_LOOKS static frames.
             let mut live_state = crate::descriptor::host::LiveState::Plain;
             let mut force_upload = false;
-            if let Some((at, len, print, looks, uploaded, was_state, was_baseline)) =
+            if let Some((at, len, print, dense_print, looks, uploaded, was_state, was_baseline)) =
                 host.texture_slot_checked(index)
             {
                 match decide_recheck(
@@ -2826,6 +2854,7 @@ impl State {
                     at,
                     len,
                     print,
+                    dense_print,
                     looks,
                     was_state,
                     was_baseline,
@@ -2838,10 +2867,11 @@ impl State {
                         host.texture_slot_defer_recheck(index, write, next);
                         continue;
                     }
-                    RecheckAction::Recheck { due, print, looks, state, baseline } => {
+                    RecheckAction::Recheck { due, print, dense_print, looks, state, baseline } => {
                         HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_recheck(
-                            index, write, due, (at, len), print, looks, uploaded, state, baseline,
+                            index, write, due, (at, len), print, dense_print, looks, uploaded,
+                            state, baseline,
                         );
                         continue;
                     }
@@ -3030,7 +3060,7 @@ impl State {
             } else {
                 None
             };
-            if let Some((at, len, print)) = same {
+            if let Some((at, len, print, dense_print)) = same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if shows_other && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -3045,9 +3075,9 @@ impl State {
                 }
                 let again = partly.map(|mapped| (frame + 1, mapped));
                 if again.is_none() && heap_recheck() {
-                    // `print` was computed from the exact same snapshot slice
-                    // inside `texture::unchanged` that proved GPU == guest
-                    // bytes (zero second read of live guest memory).
+                    // `print` (and `dense_print` for Plain) were computed from
+                    // the exact same snapshot slice inside `texture::unchanged`
+                    // that proved GPU == guest bytes (zero second read).
                     let baseline = if dense {
                         crate::descriptor::host::LiveBaseline::Dense
                     } else {
@@ -3059,6 +3089,7 @@ impl State {
                         frame + again_in,
                         (at, len),
                         print,
+                        dense_print,
                         0,
                         frame,
                         live_state,
@@ -3205,6 +3236,7 @@ impl State {
                         (at, len),
                         1,
                         0,
+                        0,
                         frame,
                         live_state,
                         crate::descriptor::host::LiveBaseline::Pending(attempt),
@@ -3212,19 +3244,36 @@ impl State {
                     if let Some(verified_baseline) =
                         reserve_deferred_recheck(len, live_state, &mut hash_budget)
                     {
+                        // For `Plain` textures > 16 MiB, also reserve the 256 KiB
+                        // uniform-grid baseline so the final `Plain` check covers
+                        // the whole texture; `<= 16 MiB` reuses `Staging`'s
+                        // already-computed `Digest::to_print()` at zero extra cost.
+                        let have_dense_grid = !dense
+                            && len > crate::texture::LIVE_WHOLE_BYTES
+                            && hash_budget.try_charge(true, crate::texture::LIVE_GRID_BYTES);
                         let queue = host.texture_queue();
                         let verified_due = frame + again_in;
                         // If an unsnapshotted in-place refresh already started
                         // concurrently, `on_uploaded` returns `false` and the
                         // slot simply remains `Pending(attempt)` for `frame + 1`.
-                        let _ = staging.on_uploaded(move |tiled| {
+                        let _ = staging.on_uploaded(move |tiled, whole_hash| {
                             let print = crate::texture::fingerprint_slice(tiled, dense);
+                            let dense_print = if dense {
+                                0
+                            } else if (tiled.len() as u64) <= crate::texture::LIVE_WHOLE_BYTES {
+                                whole_hash.map_or(0, crate::texture::Digest::to_print)
+                            } else if have_dense_grid {
+                                crate::texture::fingerprint_slice(tiled, true)
+                            } else {
+                                0
+                            };
                             queue.lock().unwrap_or_else(|e| e.into_inner()).commit_baseline(
                                 index,
                                 write,
                                 attempt,
                                 verified_due,
                                 print,
+                                dense_print,
                                 live_state,
                                 verified_baseline,
                             );
@@ -3247,6 +3296,7 @@ impl State {
                                 due,
                                 (at, len),
                                 1,
+                                0,
                                 0,
                                 frame,
                                 state,
@@ -5298,6 +5348,7 @@ mod tests {
             len,
             10,
             0,
+            0,
             LiveState::Plain,
             LiveBaseline::Strip,
             true,
@@ -5317,7 +5368,7 @@ mod tests {
         );
 
         // 2) One-shot streaming texture (no 2nd change): exits to Done after
-        // EXACTLY `CHANGED_ONCE_FAST_LOOKS` (4) unchanged checks.
+        // EXACTLY `CHANGED_ONCE_FAST_LOOKS` (32) unchanged checks.
         let mut frame = 6u64;
         let mut looks = 0u8;
         let mut unchanged_checks = 0u8;
@@ -5328,6 +5379,7 @@ mod tests {
                 0x1000,
                 len,
                 20,
+                0,
                 looks,
                 LiveState::ChangedOnce,
                 LiveBaseline::Dense,
@@ -5346,6 +5398,7 @@ mod tests {
                 RecheckAction::Recheck {
                     due,
                     print: 20,
+                    dense_print: 0,
                     looks: next_looks,
                     state: LiveState::ChangedOnce,
                     baseline: LiveBaseline::Dense,
@@ -5384,6 +5437,7 @@ mod tests {
             p_at,
             p_len,
             p_print,
+            0,
             1,
             p_state,
             p_base,
@@ -5408,6 +5462,7 @@ mod tests {
                 0x1000,
                 len,
                 30,
+                0,
                 looks,
                 LiveState::Live,
                 LiveBaseline::Dense,
@@ -5426,6 +5481,7 @@ mod tests {
                     RecheckAction::Recheck {
                         due: frame + 1,
                         print: 30,
+                        dense_print: 0,
                         looks: step,
                         state: LiveState::Live,
                         baseline: LiveBaseline::Dense,
@@ -5439,6 +5495,7 @@ mod tests {
                     RecheckAction::Recheck {
                         due: frame + LIVE_PAUSED_FRAMES,
                         print: 30,
+                        dense_print: 0,
                         looks: 0,
                         state: LiveState::Paused,
                         baseline: LiveBaseline::Dense,
@@ -5457,6 +5514,7 @@ mod tests {
                 len,
                 30,
                 0,
+                0,
                 LiveState::Paused,
                 LiveBaseline::Dense,
                 true,
@@ -5473,6 +5531,7 @@ mod tests {
                 RecheckAction::Recheck {
                     due: frame + LIVE_PAUSED_FRAMES,
                     print: 30,
+                    dense_print: 0,
                     looks: 0,
                     state: LiveState::Paused,
                     baseline: LiveBaseline::Dense,
@@ -5488,6 +5547,7 @@ mod tests {
             0x1000,
             len,
             30,
+            0,
             0,
             LiveState::Paused,
             LiveBaseline::Dense,
@@ -5511,6 +5571,7 @@ mod tests {
             0x1000,
             len,
             10,
+            0,
             0,
             LiveState::Plain,
             LiveBaseline::Strip,
@@ -5586,6 +5647,7 @@ mod tests {
                 size,
                 p5,
                 0,
+                0,
                 s5,
                 b5,
                 true,
@@ -5604,6 +5666,7 @@ mod tests {
             0x50_0000,
             size,
             p5,
+            0,
             0,
             s5,
             b5,
@@ -5631,6 +5694,7 @@ mod tests {
             size,
             555,
             0,
+            0,
             LiveState::ChangedOnce,
             LiveBaseline::Strip,
             true,
@@ -5656,6 +5720,7 @@ mod tests {
             0x70_0000,
             size,
             1,
+            0,
             0,
             LiveState::Plain,
             LiveBaseline::Pending(next_upload_attempt()),
@@ -5697,6 +5762,7 @@ mod tests {
                 plane_len,
                 9,
                 0,
+                0,
                 LiveState::Plain,
                 LiveBaseline::Strip,
                 true,
@@ -5714,6 +5780,7 @@ mod tests {
                 RecheckAction::Recheck {
                     due: 112,
                     print: 9,
+                    dense_print: 0,
                     looks: 1,
                     state: LiveState::Plain,
                     baseline: LiveBaseline::Strip,
@@ -5731,6 +5798,7 @@ mod tests {
             0x100_0000,
             full_16mib,
             77,
+            0,
             0,
             LiveState::Live,
             LiveBaseline::Dense,
@@ -5753,6 +5821,7 @@ mod tests {
             RecheckAction::Recheck {
                 due: 101,
                 print: 77,
+                dense_print: 0,
                 looks: 1,
                 state: LiveState::Live,
                 baseline: LiveBaseline::Dense,
@@ -5766,6 +5835,7 @@ mod tests {
                 0x200_0000,
                 plane_len,
                 7,
+                0,
                 0,
                 LiveState::Live,
                 LiveBaseline::Dense,
@@ -5782,6 +5852,7 @@ mod tests {
             0x300_0000,
             plane_len,
             9,
+            0,
             0,
             LiveState::Plain,
             LiveBaseline::Strip,
@@ -5804,6 +5875,7 @@ mod tests {
                 0xa000,
                 plane_len,
                 11,
+                0,
                 0,
                 LiveState::Plain,
                 LiveBaseline::Strip,
@@ -5852,6 +5924,7 @@ mod tests {
             live_16mib,
             99,
             0,
+            0,
             LiveState::Live,
             LiveBaseline::Dense,
             true,
@@ -5870,6 +5943,7 @@ mod tests {
             RecheckAction::Recheck {
                 due: 51,
                 print: 99,
+                dense_print: 0,
                 looks: 1,
                 state: LiveState::Live,
                 baseline: LiveBaseline::Dense,
@@ -5954,6 +6028,7 @@ mod tests {
             len,
             uploaded_b_print,
             0,
+            0,
             LiveState::Live,
             LiveBaseline::Dense,
             true,
@@ -5965,6 +6040,214 @@ mod tests {
             act,
             RecheckAction::Upload { again_in: 1, next_state: LiveState::Live, force: false },
             "recheck against submit-time uploaded baseline must catch A->B->A revert"
+        );
+    }
+
+    /// Starting from a brand-new `Plain` slot (NOT `ChangedOnce`), localized
+    /// pixel changes strictly between the 3 sparse fingerprint bands are caught
+    /// by the final dense `Plain` verification probe before retiring, deferring
+    /// when dense budget is full and promoting `Plain -> ChangedOnce` with
+    /// re-upload once budget permits; genuinely static `Plain` textures retire
+    /// cleanly to `Done`.
+    #[test]
+    fn plain_final_probe_catches_mid_strip_change_before_retiring() {
+        use super::{
+            LIVE_PASS_BUDGET_BYTES, PassHashBudget, RECHECK_FRAMES, RecheckAction, decide_recheck,
+        };
+        use crate::descriptor::host::{LiveBaseline, LiveState};
+
+        let mut plane = vec![0x33u8; 256 << 10];
+        let at = plane.as_ptr() as u64;
+        let len = plane.len() as u64;
+        // Initial upload captures both cheap 3-strip print and free dense print (`digest.to_print()`).
+        let strip_print = crate::texture::fingerprint_slice(&plane, false);
+        let dense_print = crate::texture::digest(&plane).to_print();
+
+        // Mutate a byte strictly BETWEEN start (0..16 KiB) and middle (128..144 KiB) bands.
+        plane[48 << 10] ^= 0xff;
+        assert_eq!(
+            crate::texture::fingerprint(at, len),
+            strip_print,
+            "3-strip sparse probe must miss mid-band motion"
+        );
+
+        // Probes 0..RECHECK_FRAMES.len()-1 are cheap 48 KiB probes that advance `looks`.
+        let mut frame = 4u64;
+        let mut looks = 0u8;
+        let mut cur_dense_print = dense_print;
+        for step in 0..(RECHECK_FRAMES.len() - 1) {
+            let mut budget = PassHashBudget::default();
+            let act = decide_recheck(
+                frame,
+                at,
+                len,
+                strip_print,
+                cur_dense_print,
+                looks,
+                LiveState::Plain,
+                LiveBaseline::Strip,
+                true,
+                true,
+                &mut budget,
+                crate::texture::fingerprint_for,
+            );
+            assert_eq!(budget.live, 0, "non-final Plain probe must not touch live budget");
+            match act {
+                RecheckAction::Recheck {
+                    due,
+                    print,
+                    dense_print: dp,
+                    looks: next_looks,
+                    state: LiveState::Plain,
+                    baseline: LiveBaseline::Strip,
+                } => {
+                    assert_eq!(print, strip_print);
+                    assert_eq!(dp, dense_print);
+                    assert_eq!(next_looks as usize, step + 1);
+                    frame = due;
+                    looks = next_looks;
+                    cur_dense_print = dp;
+                }
+                other => panic!("expected Plain advance on probe {step}, got {other:?}"),
+            }
+        }
+
+        // Final Plain probe with exhausted live budget must DEFER rather than retire unchecked!
+        let mut full_live = PassHashBudget { plain: 0, live: LIVE_PASS_BUDGET_BYTES };
+        assert_eq!(
+            decide_recheck(
+                frame,
+                at,
+                len,
+                strip_print,
+                cur_dense_print,
+                looks,
+                LiveState::Plain,
+                LiveBaseline::Strip,
+                true,
+                true,
+                &mut full_live,
+                |_, _, _| panic!("must defer when dense budget is full"),
+            ),
+            RecheckAction::Defer(frame + 1)
+        );
+
+        // Final Plain probe with fresh budget catches the mid-band change and promotes to ChangedOnce!
+        let mut budget = PassHashBudget::default();
+        let act = decide_recheck(
+            frame + 1,
+            at,
+            len,
+            strip_print,
+            cur_dense_print,
+            looks,
+            LiveState::Plain,
+            LiveBaseline::Strip,
+            true,
+            true,
+            &mut budget,
+            crate::texture::fingerprint_for,
+        );
+        assert_eq!(budget.live, len);
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::ChangedOnce, force: false },
+            "final Plain dense probe must catch mid-strip change and promote Plain -> ChangedOnce"
+        );
+
+        // Genuinely static texture passes final dense check and retires cleanly to Done.
+        plane[48 << 10] ^= 0xff; // revert to original uploaded bytes
+        let mut static_budget = PassHashBudget::default();
+        assert_eq!(
+            decide_recheck(
+                frame + 1,
+                at,
+                len,
+                strip_print,
+                cur_dense_print,
+                looks,
+                LiveState::Plain,
+                LiveBaseline::Strip,
+                true,
+                true,
+                &mut static_budget,
+                crate::texture::fingerprint_for,
+            ),
+            RecheckAction::Done
+        );
+        assert_eq!(static_budget.live, len);
+    }
+
+    /// A 24–30 fps video playing across a 3-slot texture ring at 60–90 game FPS
+    /// updates each individual slot only once every ~8–12 frames; `ChangedOnce`
+    /// stays monitored across 12 unchanged frames and promotes to `Live` when
+    /// the 2nd video update lands on frame 13.
+    #[test]
+    fn changed_once_survives_video_ring_cadence_and_promotes_to_live() {
+        use super::{PassHashBudget, RecheckAction, decide_recheck};
+        use crate::descriptor::host::{LiveBaseline, LiveState};
+
+        let mut plane = vec![0x22u8; 256 << 10];
+        let at = plane.as_ptr() as u64;
+        let len = plane.len() as u64;
+        let base_print = crate::texture::fingerprint_slice(&plane, true);
+
+        let mut frame = 20u64;
+        let mut looks = 0u8;
+        // 12 unchanged game frames (~3-slot ring at 60–90 fps for a 24–30 fps video).
+        for step in 1..=12u8 {
+            let mut budget = PassHashBudget::default();
+            let act = decide_recheck(
+                frame,
+                at,
+                len,
+                base_print,
+                0,
+                looks,
+                LiveState::ChangedOnce,
+                LiveBaseline::Dense,
+                true,
+                true,
+                &mut budget,
+                crate::texture::fingerprint_for,
+            );
+            assert_eq!(
+                act,
+                RecheckAction::Recheck {
+                    due: frame + 1,
+                    print: base_print,
+                    dense_print: 0,
+                    looks: step,
+                    state: LiveState::ChangedOnce,
+                    baseline: LiveBaseline::Dense,
+                },
+                "ChangedOnce must not drop on unchanged frame {step}"
+            );
+            frame += 1;
+            looks = step;
+        }
+
+        // Frame 13: 2nd video update lands strictly between the 3 sparse strips -> promotes to Live!
+        plane[48 << 10] ^= 0xff;
+        let mut budget = PassHashBudget::default();
+        let act = decide_recheck(
+            frame,
+            at,
+            len,
+            base_print,
+            0,
+            looks,
+            LiveState::ChangedOnce,
+            LiveBaseline::Dense,
+            true,
+            true,
+            &mut budget,
+            crate::texture::fingerprint_for,
+        );
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::Live, force: false },
+            "2nd video frame on frame 13 must promote ChangedOnce -> Live"
         );
     }
 }
