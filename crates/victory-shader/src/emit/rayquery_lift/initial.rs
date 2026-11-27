@@ -10,6 +10,7 @@ enum Fact {
     Int(u32),
     // The incoming EXEC mask, as a mask (never an integer value).
     Incoming,
+    Outside,    // bitwise complement of the incoming EXEC mask
     Root(bool), // signed root > 0
 }
 use Fact::{Incoming, Int, Root, Unknown};
@@ -120,6 +121,9 @@ impl First<'_, '_> {
                 ("v_bfe_u32", Int(x), Int(k), Int(n)) => {
                     Int((x >> (k & 31)) & ((1u32 << (n & 31)) - 1))
                 }
+                ("s_xor_b32", Int(a), Int(b), _) => Int(a ^ b),
+                ("s_xor_b32", Incoming, Int(u32::MAX), _) => Fact::Outside,
+                ("s_and_saveexec_b32", Fact::Outside, _, _) if exec == Some(Incoming) => Int(0),
                 ("s_andn2_b32", a, b, _) if a != Unknown && a == b => Int(0),
                 ("s_andn2_b32", a, Int(0), _) => a,
                 ("s_and_b32", a, b, _) if a != Unknown && a == b => a,
@@ -162,6 +166,7 @@ impl First<'_, '_> {
                 ("v_cmp_gt_u32" | "v_cmpx_gt_u32", Int(a), Int(b), _) => self.lane_mask(a > b),
                 ("v_cmp_eq_u32" | "v_cmpx_eq_u32", Int(a), Int(b), _) => self.lane_mask(a == b),
                 ("v_cmp_ne_u32" | "v_cmpx_ne_u32", Int(a), Int(b), _) => self.lane_mask(a != b),
+                ("s_and_saveexec_b32", Int(u32::MAX), _, _) => exec.unwrap_or(Unknown),
                 ("s_and_saveexec_b32", a, _, _) => a,
                 _ if pop => Int(u32::MAX),
                 _ => Unknown,

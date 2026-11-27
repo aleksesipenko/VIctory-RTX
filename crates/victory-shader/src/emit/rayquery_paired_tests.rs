@@ -144,6 +144,8 @@ fn kernel(wide: bool) -> (Vec<u8>, usize, usize) {
             })
             .collect(),
         completed_timeouts: vec![],
+        dead_exit_masks: vec![],
+        shared_entry: None,
         committed_meta_loads: meta
             .into_iter()
             .enumerate()

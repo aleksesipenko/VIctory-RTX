@@ -20,10 +20,15 @@
 //! Under VICTORY_NATIVE_RT=1 an entered hardware traversal may finish even
 //! when a guest step watchdog would expire later. A lane that skips the first
 //! guest intersection must retain its guest outputs, including timeout.
+//! An explicit ACCEPT_FIRST_HIT_AND_END_SEARCH flag uses the first accepted
+//! triangle in the hardware BVH order, including its distance and metadata.
 
+mod accept;
 mod address;
 pub(super) mod entry;
 mod initial;
+mod shadow;
+mod shared;
 mod watchdog;
 use address::Word;
 use std::collections::{HashMap, HashSet};
@@ -247,6 +252,9 @@ pub(crate) struct RayLoop {
     /// Every live-out IR `Value` defined in the loop, mapped to its `RayQuery` output.
     pub outputs: Vec<RayOutputBinding>,
     /// Post-loop BVH metadata `global_load_*` sites replaced by `COMMITTED_*` queries.
+    /// Mask PHIs observed solely after an intervening definition on this path.
+    pub dead_exit_masks: Vec<Value>,
+    pub shared_entry: Option<(crate::ir::SharedRayEntry, usize)>,
     pub committed_meta_loads: Vec<(Site, RayMetaKind)>,
     /// Original watchdog comparisons whose limit can be zero.
     pub completed_timeouts: Vec<Site>,
@@ -998,6 +1006,18 @@ impl<'a> Analyzer<'a> {
             .1;
 
         // 5. Extract world-space ray inputs (origin, dir, t_max) and optional per-lane active mask.
+        let shared_entry = if template == RayTemplate::Bvh32SharedTlas
+            && !self.p.wave64
+            && self.p.blocks[entry_block]
+                .insts
+                .iter()
+                .any(|i| i.name() == "s_and_saveexec_b32")
+            && primary_bvh.0 != entry_block
+        {
+            Some(self.shared_entry(entry_block, nodes, primary_bvh)?)
+        } else {
+            None
+        };
         let (origin, dir, t_max, extent_val) =
             self.extract_ray_vectors(template, primary_bvh, nodes, entry_block)?;
         let active_ray_mask = self.extract_active_ray_mask(template, nodes, entry_block)?;
@@ -1023,8 +1043,13 @@ impl<'a> Analyzer<'a> {
         }
 
         // 7. Extract `RayFlags` + `InstanceMask`.
-        let ray_flags = self.extract_ray_flags(nodes, &tri_hit)?;
-        let instance_mask = self.extract_instance_mask(template, nodes, entry_block)?;
+        let ray_flags =
+            self.extract_ray_flags(nodes, &tri_hit, entry_block, primary_bvh, tri_bvh)?;
+        let instance_mask = if let Some((guard, _, bit)) = shared_entry {
+            self.shared_filter(entry_block, tri_bvh, nodes, guard, bit)?
+        } else {
+            self.extract_instance_mask(template, nodes, entry_block)?
+        };
 
         // Closest-hit `AnyHit` loops with `FORCE_NON_OPAQUE` (or dynamic flags) exit hardware
         // traversal on every opaque triangle (`020`/`018`/`024` L0..2), which trails the inline
@@ -1050,7 +1075,7 @@ impl<'a> Analyzer<'a> {
 
         // 8. Compute true live-outs outside `loop_all`, classify every single one, and collect
         //    any verified post-loop committed BVH metadata loads.
-        let (outputs, committed_meta_loads) = self.classify_live_outs(
+        let (outputs, committed_meta_loads, dead_exit_masks) = self.classify_live_outs(
             tlas_base,
             &loop_all,
             nodes,
@@ -1110,6 +1135,8 @@ impl<'a> Analyzer<'a> {
             outputs,
             completed_timeouts,
             committed_meta_loads,
+            dead_exit_masks,
+            shared_entry: shared_entry.map(|(guard, pre, _)| (guard, pre)),
         })
     }
 
@@ -2060,7 +2087,10 @@ impl<'a> Analyzer<'a> {
         }
 
         // Locate `v_bfe_u32 _, _, 4, 2` -> `v_and_or_b32 op, _, 1, bfe` -> `v_cmpx_ne_u32 exec, 1, op`.
-        let cmpx_idx = self.find_opacity_cmpx_in_block(opacity_block)?;
+        let cmpx_idx = self.find_opacity_cmpx_in_block(opacity_block).or_else(|| {
+            self.hoisted_opacity_gate(hit_block, opacity_block)
+                .map(|(idx, _)| idx)
+        })?;
 
         let opacity_branches = self.p.blocks[opacity_block].insts[cmpx_idx + 1..]
             .iter()
@@ -2286,6 +2316,66 @@ impl<'a> Analyzer<'a> {
             }
         }
         None
+    }
+
+    /// Some shadow shaders compute the opacity mask before the distance
+    /// test and reuse its complement when branching to the AnyHit program.
+    fn hoisted_opacity_gate(&self, hit: usize, opacity: usize) -> Option<(usize, Value)> {
+        if self.p.wave64 {
+            return None;
+        }
+        let block = &self.p.blocks[opacity];
+        if block.preds != [hit] || self.p.blocks[hit].preds.len() != 1 {
+            return None;
+        }
+        let before = self.p.blocks[hit].preds[0];
+        let gate_idx = block.insts.len().checked_sub(2)?;
+        let gate = &block.insts[gate_idx];
+        if gate.name() != "s_and_saveexec_b32"
+            || block.insts.last()?.name() != "s_cbranch_execz"
+            || gate.write(Reg::S(EXEC)) != block.insts.last()?.read(Reg::S(EXEC))
+        {
+            return None;
+        }
+        let mask = operand_val(gate, first_src_operand(gate)?)?;
+        let ((bb, _), invert) = self.def_inst(mask)?;
+        if bb != opacity || invert.name() != "s_xor_b32" {
+            return None;
+        }
+        let opaque = other_val_from_const_op(invert, u32::MAX)?;
+        let ((b, _), cmp) = self.def_inst(opaque)?;
+        if b != before || cmp.name() != "v_cmp_eq_u32" || !address::plain(cmp) {
+            return None;
+        }
+        let combined = other_val_from_const_op(cmp, 1)?;
+        let ((b, _), combine) = self.def_inst(combined)?;
+        let Fields::Valu(f) = &combine.fields else {
+            return None;
+        };
+        let [tri, one, inst] = f.src.as_slice() else {
+            return None;
+        };
+        let ((b2, _), extract) = self.def_inst(operand_val(combine, inst)?)?;
+        let Fields::Valu(e) = &extract.fields else {
+            return None;
+        };
+        let [_word, four, two] = e.src.as_slice() else {
+            return None;
+        };
+        if b != before
+            || b2 != before
+            || combine.name() != "v_and_or_b32"
+            || extract.name() != "v_bfe_u32"
+            || !address::plain(combine)
+            || !address::plain(extract)
+            || const_operand(one) != Some(1)
+            || const_operand(four) != Some(4)
+            || const_operand(two) != Some(2)
+            || operand_val(combine, tri).is_none()
+        {
+            return None;
+        }
+        Some((gate_idx, opaque))
     }
 
     fn is_front_face_cndmask(&self, inst: &Inst) -> bool {
@@ -3251,20 +3341,19 @@ impl<'a> Analyzer<'a> {
                 // Check this BEFORE `is_unchanged_copy` so dead guarded reads don't create
                 // spurious cross-loop dependencies on earlier loops' dead scratch VGPRs!
                 inputs.push((v, CandidateInput::Constant(0)));
-            } else if let Some(pre) = self.is_unchanged_copy(v, nodes, 0)
-                && self
-                    .def_block(pre)
-                    .is_some_and(|db| !nodes.contains(&db) && self.dominates(db, entry_block))
-            {
-                inputs.push((v, CandidateInput::CopyOf(pre)));
             } else {
-                // Unknown scaffolding value read inside any-hit: fail-safe reject!
-                fail_ah!(
-                    "step8 unknown scaffolding read {v:?} reg={:?} def={:?} state_regs={:?}",
-                    self.value_reg(v),
-                    self.defs.get(v.0 as usize),
-                    state_vars.iter().map(|s| s.reg).collect::<Vec<_>>()
-                );
+                let input = self.is_unchanged_copy(v, nodes).and_then(|w| match w {
+                    Word::Imm(k) => Some(CandidateInput::Constant(k)),
+                    Word::Ssa(pre)
+                        if self.def_block(pre).is_some_and(|b| {
+                            !nodes.contains(&b) && self.dominates(b, entry_block)
+                        }) =>
+                    {
+                        Some(CandidateInput::CopyOf(pre))
+                    }
+                    _ => None,
+                })?;
+                inputs.push((v, input));
             }
         }
 
@@ -3824,7 +3913,18 @@ impl<'a> Analyzer<'a> {
         &self,
         nodes: &HashSet<usize>,
         tri_hit: &TriangleHitInfo,
+        header: usize,
+        primary_bvh: Site,
+        tri_bvh: Site,
     ) -> Option<RayInput> {
+        if tri_hit
+            .opacity_block
+            .is_some_and(|b| self.hoisted_opacity_gate(tri_hit.hit_block, b).is_some())
+        {
+            return self
+                .shadow_flags(nodes, tri_hit, header, primary_bvh, tri_bvh)
+                .map(RayInput::Val);
+        }
         let anyhit_set: HashSet<usize> = match &tri_hit.mode {
             HitMode::AnyHit(ah) => ah.body_blocks.iter().copied().collect(),
             _ => HashSet::new(),
@@ -4475,7 +4575,7 @@ impl<'a> Analyzer<'a> {
         lifted_blocks: &HashSet<usize>,
         claimed_committed_meta: &HashMap<Site, (RayMetaKind, usize)>,
         claimed_cand_meta: &HashSet<Site>,
-    ) -> Option<(Vec<RayOutputBinding>, Vec<(Site, RayMetaKind)>)> {
+    ) -> Option<(Vec<RayOutputBinding>, Vec<(Site, RayMetaKind)>, Vec<Value>)> {
         // 1. Seed true live values from all instructions & structured conditions outside `loop_all`
         //    and outside other already-lifted ray loops (whose real inputs are seeded explicitly).
         let mut live: HashSet<Value> = HashSet::new();
@@ -4573,6 +4673,7 @@ impl<'a> Analyzer<'a> {
             }
         }
 
+        let mut dead_exit_masks = Vec::new();
         // Propagate liveness backward through PHIs outside `loop_all` and `other_skipped_blocks`.
         while let Some(v) = work.pop() {
             if let Some(Def::Phi(b, pi)) = self.defs.get(v.0 as usize).copied().flatten()
@@ -4580,6 +4681,29 @@ impl<'a> Analyzer<'a> {
                 && !other_skipped_blocks.contains(&b)
             {
                 let phi = &self.p.blocks[b].phis[pi];
+                if b == exit_block
+                    && self.st.phi_masks.contains_key(&v)
+                    && !self.p.wave64
+                    && self.st.wide.is_empty()
+                    && self.only_lane_selects(v)
+                    && self.post_uses_match(
+                        v,
+                        loop_all,
+                        entry_block,
+                        lifted,
+                        &other_skipped_blocks,
+                        |_, _| false,
+                    )
+                {
+                    dead_exit_masks.push(v);
+                    // Guest bypass edges keep their original masks.
+                    for (&pred, &arg) in self.p.blocks[b].preds.iter().zip(&phi.args) {
+                        if !loop_all.contains(&pred) && live.insert(arg) {
+                            work.push(arg);
+                        }
+                    }
+                    continue;
+                }
                 for &arg in &phi.args {
                     if live.insert(arg) {
                         work.push(arg);
@@ -4608,7 +4732,7 @@ impl<'a> Analyzer<'a> {
         let mut required: HashSet<Value> = HashSet::new();
 
         for phi in &self.p.blocks[exit_block].phis {
-            if !live.contains(&phi.value) {
+            if !live.contains(&phi.value) || dead_exit_masks.contains(&phi.value) {
                 continue;
             }
             if let Some(mask_args) = self.st.phi_masks.get(&phi.value) {
@@ -4777,7 +4901,7 @@ impl<'a> Analyzer<'a> {
             Vec::new()
         };
 
-        Some((bindings, committed_meta_loads))
+        Some((bindings, committed_meta_loads, dead_exit_masks))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4793,12 +4917,26 @@ impl<'a> Analyzer<'a> {
         lifted_blocks: &HashSet<usize>,
     ) -> Option<RayOutputBinding> {
         // 1. Copy of an unmodified pre-loop value?
-        if let Some(pre) = self.is_unchanged_copy(v, nodes, 0) {
-            return Some(RayOutputBinding {
-                value: v,
-                output: RayOutput::CopyOf(pre),
-                fallback: Some(pre),
-            });
+        match self.is_unchanged_copy(v, nodes) {
+            Some(Word::Ssa(pre))
+                if self
+                    .def_block(pre)
+                    .is_some_and(|b| self.dominates(b, entry_block)) =>
+            {
+                return Some(RayOutputBinding {
+                    value: v,
+                    output: RayOutput::CopyOf(pre),
+                    fallback: Some(pre),
+                });
+            }
+            Some(Word::Imm(0)) => {
+                return Some(RayOutputBinding {
+                    value: v,
+                    output: RayOutput::Zero,
+                    fallback: None,
+                });
+            }
+            _ => {}
         }
 
         // 2. Which register carries `v`?
@@ -4901,7 +5039,9 @@ impl<'a> Analyzer<'a> {
         // A merge PHI can carry scratch to a real post-loop use on any of
         // its incoming edges. Follow the value through PHIs and predicated writes.
         if matches!(reg, Reg::V(_))
-            && self.uses_disjoint_from_entry(v, loop_all, entry_block, lifted, lifted_blocks)
+            && self.post_uses_match(v, loop_all, entry_block, lifted, lifted_blocks, |_, _| {
+                false
+            })
         {
             return Some(RayOutputBinding {
                 value: v,
@@ -4911,19 +5051,55 @@ impl<'a> Analyzer<'a> {
         }
 
         // Unclassified live-out: fail-safe reject!
+
         None
     }
 
-    /// Returns `true` if every post-loop operand use of `root` (outside `loop_all` and
-    /// `lifted_blocks`) occurs only in lanes provably disjoint from `self.st.reach[entry_block]`
-    /// (tracking negated guards across guarded VGPR overwrites), or is an unguarded overwrite.
-    fn uses_disjoint_from_entry(
+    /// A scalar mask can be dead per lane only when all its uses consume
+    /// that lane's bit, including mask words forwarded by post-loop PHIs.
+    fn only_lane_selects(&self, root: Value) -> bool {
+        let mut work = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            for &(b, site) in &self.uses[v.0 as usize] {
+                if let Some(j) = site {
+                    let i = &self.p.blocks[b].insts[j];
+                    let Fields::Valu(f) = &i.fields else {
+                        return false;
+                    };
+                    if i.name() != "v_cndmask_b32"
+                        || !address::plain(i)
+                        || !matches!(f.src.as_slice(),[a,c,m] if operand_val(i,m)==Some(v) && operand_val(i,a)!=Some(v) && operand_val(i,c)!=Some(v))
+                    {
+                        return false;
+                    }
+                } else {
+                    work.extend(
+                        self.p.blocks[b]
+                            .phis
+                            .iter()
+                            .filter(|p| p.args.contains(&v))
+                            .map(|p| p.value),
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    /// Track incoming values through copies, guarded overwrites and feasible
+    /// PHI edges. The caller identifies the operand uses it can reproduce.
+    fn post_uses_match(
         &self,
         root: Value,
         loop_all: &HashSet<usize>,
         entry_block: usize,
         lifted: &[RayLoop],
         lifted_blocks: &HashSet<usize>,
+        mut accept: impl FnMut(Site, Value) -> bool,
     ) -> bool {
         let entry_reach = self.st.reach[entry_block];
         let mut seen: HashMap<Value, Vec<(Bool, bool)>> = HashMap::new();
@@ -4971,9 +5147,7 @@ impl<'a> Analyzer<'a> {
                         if !phi.args.contains(&v) {
                             continue;
                         }
-                        for (k, (&pred, &arg)) in
-                            self.p.blocks[b].preds.iter().zip(&phi.args).enumerate()
-                        {
+                        for (&pred, &arg) in self.p.blocks[b].preds.iter().zip(&phi.args) {
                             if arg != v {
                                 continue;
                             }
@@ -4985,16 +5159,7 @@ impl<'a> Analyzer<'a> {
                             }) {
                                 continue;
                             }
-                            let mut next = if let Some(masks) = self.st.phi_masks.get(&phi.value) {
-                                let mut next = facts.clone();
-                                let m = masks[k];
-                                if m != Bool::TRUE && !next.contains(&(m, true)) {
-                                    next.push((m, true))
-                                }
-                                next
-                            } else {
-                                self.edge_facts(pred, b, &facts)
-                            };
+                            let mut next = self.edge_facts(pred, b, &facts);
                             if !self.bools_meet(&next) {
                                 continue;
                             }
@@ -5025,13 +5190,25 @@ impl<'a> Analyzer<'a> {
                     .iter()
                     .any(|&(r, rv)| rv == v && ops.contains(&r));
                 if is_op_read {
+                    // A destination lane's reach/EXEC says nothing about the source
+                    // lane selected by a permutation or an indexed lane read.
+                    if reads_across_lanes(inst) {
+                        return false;
+                    }
                     let mut check = facts.clone();
                     check.push((self.st.reach[b], true));
                     if let Some(g) = self.st.guards[b][i] {
                         check.push((g, true));
                     }
                     if self.bools_meet(&check) {
-                        return false;
+                        if inst.name() == "v_mov_b32"
+                            && address::plain(inst)
+                            && single_reg_src(inst) == Some(v)
+                        {
+                            work.push((inst.writes[0].1, check));
+                        } else if !accept((b, i), v) {
+                            return false;
+                        }
                     }
                 }
                 if let Some(g) = self.st.guards[b][i] {
@@ -5105,58 +5282,66 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn is_unchanged_copy(&self, v: Value, nodes: &HashSet<usize>, depth: u32) -> Option<Value> {
-        if depth > 8 {
-            return None;
-        }
-        match self.defs.get(v.0 as usize).copied().flatten()? {
-            Def::Input(_) => Some(v),
-            Def::Inst(b, i) => {
-                if !nodes.contains(&b) {
-                    return Some(v);
-                }
-                let inst = &self.p.blocks[b].insts[i];
-                if matches!(inst.name(), "v_mov_b32" | "s_mov_b32") {
-                    let src = single_reg_src(inst)?;
-                    let copy = self.is_unchanged_copy(src, nodes, depth + 1)?;
-                    let &(dst, result) = inst.writes.first()?;
-                    if result != v || !address::plain(inst) {
-                        return None;
-                    }
-                    if self.st.guards[b][i].is_some()
-                        && inst
-                            .read(dst)
-                            .and_then(|old| self.is_unchanged_copy(old, nodes, depth + 1))
-                            != Some(copy)
+    fn is_unchanged_copy(&self, root: Value, nodes: &HashSet<usize>) -> Option<Word> {
+        // A loop-carried value may flow through several PHIs before returning
+        // to the header. All finite execution paths start at a pre-loop value.
+        let mut work = vec![root];
+        let mut seen = HashSet::new();
+        let mut seed = None;
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            let def = self.defs[v.0 as usize]?;
+            let outside = match def {
+                Def::Input(_) => true,
+                Def::Inst(b, _) | Def::Phi(b, _) => !nodes.contains(&b),
+            };
+            if outside {
+                // Copies at the preheader and inside the loop can refer to
+                // the same value under different SSA names.
+                let mut src = v;
+                while let Some(i) = self.unguarded_def(src) {
+                    if !matches!(i.name(), "s_mov_b32" | "v_mov_b32") || i.writes.first()?.1 != src
                     {
+                        break;
+                    }
+                    let Some(arg) = single_reg_src(i) else { break };
+                    src = arg;
+                }
+                let word = self.copy_word(Word::Ssa(src));
+                if seed.replace(word).is_some_and(|prev| prev != word) {
+                    return None;
+                }
+                continue;
+            }
+            match def {
+                Def::Phi(b, i) => work.extend(&self.p.blocks[b].phis[i].args),
+                Def::Inst(b, j) => {
+                    let i = &self.p.blocks[b].insts[j];
+                    if !matches!(i.name(), "v_mov_b32" | "s_mov_b32") || !address::plain(i) {
                         return None;
                     }
-                    return Some(copy);
-                }
-                None
-            }
-            Def::Phi(b, pi) => {
-                if !nodes.contains(&b) {
-                    return Some(v);
-                }
-                let phi = &self.p.blocks[b].phis[pi];
-                let mut pre: Option<Value> = None;
-                for &arg in &phi.args {
-                    if arg == v {
-                        continue;
+                    let &(reg, val) = i.writes.first()?;
+                    if val != v {
+                        return None;
                     }
-                    let c = self.is_unchanged_copy(arg, nodes, depth + 1)?;
-                    if let Some(prev) = pre {
-                        if prev != c {
-                            return None;
+                    match Word::operand(i, first_src_operand(i)?)? {
+                        Word::Ssa(src) => work.push(src),
+                        word => {
+                            if seed.replace(word).is_some_and(|prev| prev != word) {
+                                return None;
+                            }
                         }
-                    } else {
-                        pre = Some(c);
+                    }
+                    if self.st.guards[b][j].is_some() {
+                        work.push(i.read(reg)?);
                     }
                 }
-                pre
+                Def::Input(_) => unreachable!(),
             }
         }
+        seed
     }
 
     /// Verifies that every use of `inst_roots` / `tri_roots` inside `scope` is either a
@@ -6030,6 +6215,25 @@ impl<'a> Analyzer<'a> {
                             }
                         }
                         BvhTag::TriSlot => {
+                            // Valid triangle leaf types are 0..=3. The status
+                            // surrogate (0 on miss, 1 on hit) satisfies the same
+                            // type test. Require the actual low-three-bit extract.
+                            if n == "v_cmpx_gt_u32"
+                                && address::plain(inst)
+                                && two_src_operands(inst).is_some_and(|(a, b)| {
+                                    const_operand(a) == Some(4) && operand_val(inst, b) == Some(v)
+                                })
+                                && self.def_inst(v).is_some_and(|(_, def)| {
+                                    address::plain(def)
+                                        && def.name() == "v_and_b32"
+                                        && def.writes.first().is_some_and(|w| w.1 == v)
+                                        && other_val_from_const_op(def, 7).is_some_and(|src| {
+                                            tags.get(&src) == Some(&BvhTag::TriNode)
+                                        })
+                                })
+                            {
+                                continue;
+                            }
                             if n == "v_lshl_add_u32"
                                 && let Fields::Valu(f) = &inst.fields
                                 && f.src.len() >= 3
@@ -6504,14 +6708,14 @@ impl<'a> Analyzer<'a> {
             {
                 return false;
             }
-            needed.push(lo);
+            needed.push((lo, Some((b, i))));
             if tags.contains_key(&hi) {
-                needed.push(hi);
+                needed.push((hi, Some((b, i))));
             }
         }
         let mut checked = HashSet::new();
-        while let Some(v) = needed.pop() {
-            if !checked.insert(v) {
+        while let Some((v, load)) = needed.pop() {
+            if !checked.insert((v, load)) {
                 continue;
             }
             match self.defs[v.0 as usize] {
@@ -6529,7 +6733,7 @@ impl<'a> Analyzer<'a> {
                             continue;
                         }
                         if tags.get(&arg) == tags.get(&v) {
-                            needed.push(arg);
+                            needed.push((arg, None));
                         } else if self.phi_incoming_reaches_use_in_scope(
                             arg,
                             v,
@@ -6547,6 +6751,11 @@ impl<'a> Analyzer<'a> {
                     // may install an unrelated guest address on the rest. A tagged
                     // operand alone also cannot establish both arms of a select.
                     if self.st.guards[b][i].is_some()
+                        && !load.is_some_and(|(lb, lj)| {
+                            lb == b
+                                && i < lj
+                                && self.mask_covers(inst, &self.p.blocks[lb].insts[lj], &[])
+                        })
                         || (matches!(
                             inst.name(),
                             "v_cndmask_b32" | "s_cselect_b32" | "s_cselect_b64"
@@ -6557,7 +6766,7 @@ impl<'a> Analyzer<'a> {
                     }
                     needed.extend(inst.reads.iter().filter_map(|&(r, arg)| {
                         (operand_reads(self.p, inst).contains(&r) && tags.contains_key(&arg))
-                            .then_some(arg)
+                            .then_some((arg, load))
                     }));
                 }
                 _ => {}
@@ -8178,6 +8387,21 @@ fn ray_loop_reads_real_input(rl: &RayLoop, v: Value) -> bool {
             || ah.inputs.iter().any(|&(_, ci)| ci == CandidateInput::CopyOf(v)))
 }
 
+pub(super) fn reads_across_lanes(inst: &Inst) -> bool {
+    match &inst.fields {
+        Fields::Valu(f) => {
+            f.dpp.is_some()
+                || matches!(
+                    inst.name(),
+                    "v_readlane_b32" | "v_readfirstlane_b32" | "v_writelane_b32"
+                )
+                || inst.name().contains("permlane")
+        }
+        Fields::Ds { .. } => inst.name().contains("permute") || inst.name().contains("swizzle"),
+        _ => false,
+    }
+}
+
 fn ray_loop_reads_value(rl: &RayLoop, v: Value) -> bool {
     ray_loop_reads_real_input(rl, v)
         || rl
@@ -8408,7 +8632,11 @@ mod tests {
         let scalar = HashMap::new();
         let a = Analyzer::new(&p, &st, &res, &scalar);
         let old = p.blocks[0].insts[0].write(Reg::V(2)).unwrap();
-        assert!(!a.uses_disjoint_from_entry(old, &HashSet::from([0]), 0, &[], &HashSet::new()));
+        assert!(
+            !a.post_uses_match(old, &HashSet::from([0]), 0, &[], &HashSet::new(), |_, _| {
+                false
+            })
+        );
     }
 
     #[test]
@@ -8587,6 +8815,8 @@ mod tests {
             ],
             completed_timeouts: vec![],
             committed_meta_loads: vec![],
+            dead_exit_masks: vec![],
+            shared_entry: None,
         };
 
         let rq = RayQuery::allocate(
@@ -8677,6 +8907,8 @@ mod tests {
             ],
             completed_timeouts: vec![],
             committed_meta_loads: vec![],
+            dead_exit_masks: vec![],
+            shared_entry: None,
         };
 
         assert!(is_front_back_two_pass_shape(&rl));
@@ -8808,6 +9040,8 @@ mod tests {
             ],
             completed_timeouts: vec![],
             committed_meta_loads: vec![],
+            dead_exit_masks: vec![],
+            shared_entry: None,
         };
 
         let rq = RayQuery::allocate(&mut s, flags);
@@ -8948,6 +9182,8 @@ mod tests {
             }],
             completed_timeouts: vec![],
             committed_meta_loads: vec![],
+            dead_exit_masks: vec![],
+            shared_entry: None,
         };
 
         let rq = RayQuery::allocate(&mut s, flags);
@@ -9079,6 +9315,8 @@ mod tests {
             ],
             completed_timeouts: vec![],
             committed_meta_loads: vec![],
+            dead_exit_masks: vec![],
+            shared_entry: None,
         };
 
         let eligible = make_anyhit(
@@ -9274,6 +9512,8 @@ mod tests {
             outputs: vec![],
             completed_timeouts: vec![],
             committed_meta_loads: meta,
+            dead_exit_masks: vec![],
+            shared_entry: None,
         };
 
         // Two OpaqueOnly loops separated by a pre-loop bypass around L2:

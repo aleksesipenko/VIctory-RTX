@@ -74,123 +74,112 @@ impl Analyzer<'_> {
             if bb.insts.last().is_none_or(|i| i.name() != "s_cbranch_scc1") {
                 continue;
             }
-            // The watchdog mask joins the empty-node mask. The loop then
-            // removes these lanes from its work mask and branches on SCC.
-            // This sequence must terminate the block: SCC selects its real backedge.
+            if let Some((count, limit, strict)) = self.latch_limit(b)
+                && family.contains(&count)
             {
-                let tail = &bb.insts[bb.insts.len().saturating_sub(7)..];
-                let [cmp, empty, flag, join, save, left, branch] = tail else {
-                    continue;
-                };
-                if ![cmp, empty, flag].into_iter().all(address::plain)
-                    || empty.name() != "v_cmp_gt_i32"
-                    || !has_const_operand(empty, 1)
-                    || flag.name() != "v_cndmask_b32"
-                    || join.name() != "s_or_b32"
-                    || save.name() != "s_and_saveexec_b32"
-                    || left.name() != "s_andn2_b32"
-                    || branch.name() != "s_cbranch_scc1"
-                {
-                    continue;
-                }
-                let Some(&(_, mask)) = cmp.writes.first() else {
-                    continue;
-                };
-                let Some(&(_, empty_mask)) = empty.writes.first() else {
-                    continue;
-                };
-                let Some(&(_, union)) = join.writes.first() else {
-                    continue;
-                };
-                let Fields::Valu(f) = &flag.fields else {
-                    continue;
-                };
-                if !matches!(f.src.as_slice(),[z,ones,c] if const_operand(z)==Some(0) && const_operand(ones)==Some(u32::MAX) && operand_val(flag,c)==Some(mask))
-                {
-                    continue;
-                }
-                if !join.reads.iter().any(|&(_, v)| v == mask)
-                    || !join.reads.iter().any(|&(_, v)| v == empty_mask)
-                    || !first_src_operand(save).is_some_and(|a| operand_val(save, a) == Some(union))
-                    || save.write(Reg::S(EXEC)) != left.read(Reg::S(EXEC))
-                    || left.write(Reg::Scc) != branch.read(Reg::Scc)
-                    || !self.watchdog_backedge(b, empty, save, left)
-                {
-                    continue;
-                }
-                if let Some((count, limit, strict)) = self.watchdog_compare(cmp)
-                    && family.contains(&count)
-                {
-                    limits.insert((limit, strict));
-                }
+                limits.insert((limit, strict));
             }
         }
         if limits.is_empty() {
             return None;
         }
 
-        let mut todo = vec![root];
-        let mut seen = HashSet::new();
         let mut compared = false;
         let mut dynamic = Vec::new();
-        while let Some(v) = todo.pop() {
-            if !seen.insert(v) {
-                continue;
-            }
-            if seen.len() > 4096 {
-                return None;
-            }
-            for &(b, j) in &self.uses[v.0 as usize] {
-                if removed.contains(&b) {
-                    continue;
-                }
-                let Some(j) = j else {
-                    todo.extend(
-                        self.p.blocks[b]
-                            .phis
-                            .iter()
-                            .filter(|p| p.args.contains(&v))
-                            .map(|p| p.value),
-                    );
-                    continue;
+        let valid =
+            self.post_uses_match(root, removed, header, &[], &HashSet::new(), |(b, j), v| {
+                let Some((count, limit, strict)) =
+                    self.watchdog_compare(&self.p.blocks[b].insts[j])
+                else {
+                    return false;
                 };
-                let i = &self.p.blocks[b].insts[j];
-                let reads = operand_reads(self.p, i);
-                if !i.reads.iter().any(|&(r, x)| v == x && reads.contains(&r)) {
-                    if self.st.guards[b][j].is_some() {
-                        todo.extend(
-                            i.reads
-                                .iter()
-                                .filter(|x| x.1 == v)
-                                .filter_map(|&(r, _)| i.write(r)),
-                        );
-                    }
-                    continue;
-                }
-                if i.name() == "v_mov_b32" && address::plain(i) && single_reg_src(i) == Some(v) {
-                    todo.push(i.writes[0].1);
-                    continue;
-                }
-                let (count, limit, strict) = self.watchdog_compare(i)?;
-                // The represented completed count is zero. For <= this is
-                // false only if the limit is known nonzero.
                 if count != v || !limits.contains(&(limit, strict)) {
-                    return None;
+                    return false;
                 }
-                if !strict && !matches!(limit,Word::Imm(k) if k!=0) {
-                    // A zero limit makes limit <= 0 true. Only suppress that
-                    // comparator on the lanes of this single, non-reentrant
-                    // query and prove its operand is still this count.
-                    self.post_path.as_ref()?;
-                    if !self.native_count(v, &family, nodes, 0) {
-                        return None;
+                if !strict && !matches!(limit, Word::Imm(k) if k != 0) {
+                    if self.post_path.is_none() || !self.native_count(v, &family, nodes, 0) {
+                        return false;
                     }
-                    dynamic.push((b, j));
+                    if !dynamic.contains(&(b, j)) {
+                        dynamic.push((b, j));
+                    }
                 }
                 compared = true;
-            }
+                true
+            });
+        (valid && compared).then_some(dynamic)
+    }
+
+    pub(super) fn latch_limit(&self, b: usize) -> Option<(Value, Word, bool)> {
+        let insts = &self.p.blocks[b].insts;
+        let [prefix @ .., join, save, left, branch] = insts.as_slice() else {
+            return None;
+        };
+        if join.name() != "s_or_b32"
+            || save.name() != "s_and_saveexec_b32"
+            || left.name() != "s_andn2_b32"
+            || branch.name() != "s_cbranch_scc1"
+            || first_src_operand(save).and_then(|op| operand_val(save, op))
+                != Some(join.writes.first()?.1)
+            || save.write(Reg::S(EXEC)) != left.read(Reg::S(EXEC))
+            || left.write(Reg::Scc) != branch.read(Reg::Scc)
+        {
+            return None;
         }
-        compared.then_some(dynamic)
+        let exec = save.read(Reg::S(EXEC))?;
+        let same = |i: &Inst| address::plain(i) && i.read(Reg::S(EXEC)) == Some(exec);
+        let (cmp, empty, done, limit) = match prefix {
+            [.., cmp, empty, flag] if flag.name() == "v_cndmask_b32" => {
+                let (z, ones, m) = select_operands(flag)?;
+                if !same(flag)
+                    || const_operand(z) != Some(0)
+                    || const_operand(ones) != Some(u32::MAX)
+                    || operand_val(flag, m) != Some(cmp.writes.first()?.1)
+                {
+                    return None;
+                }
+                (
+                    cmp,
+                    empty,
+                    cmp.writes.first()?.1,
+                    self.watchdog_compare(cmp)?,
+                )
+            }
+            [.., cmp, select, empty, exit]
+                if cmp.name() == "v_cmp_gt_u32" && exit.name() == "v_cmp_ne_u32" =>
+            {
+                // status' = count < cap ? status : 0. Only state 3
+                // continues; expiration therefore removes the lane from work.
+                let (cap, count) = two_src_operands(cmp)?;
+                let cap = const_operand(cap)?.checked_sub(1)?;
+                let (z, status, mask) = select_operands(select)?;
+                if !same(select)
+                    || !same(exit)
+                    || const_operand(z) != Some(0)
+                    || operand_val(select, status).is_none()
+                    || operand_val(select, mask) != Some(cmp.writes.first()?.1)
+                    || other_val_from_const_op(exit, 3) != Some(select.writes.first()?.1)
+                {
+                    return None;
+                }
+                (
+                    cmp,
+                    empty,
+                    exit.writes.first()?.1,
+                    (operand_val(cmp, count)?, Word::Imm(cap), true),
+                )
+            }
+            _ => return None,
+        };
+        let empty_mask = empty.writes.first()?.1;
+        let (a, c) = two_src_operands(join)?;
+        let operands = (operand_val(join, a)?, operand_val(join, c)?);
+        (same(cmp)
+            && same(empty)
+            && empty.name() == "v_cmp_gt_i32"
+            && (operands == (empty_mask, done) || operands == (done, empty_mask))
+            && self.watchdog_backedge(b, empty, save, left))
+        .then_some(limit)
     }
 
     fn watchdog_backedge(&self, latch: usize, empty: &Inst, save: &Inst, left: &Inst) -> bool {
@@ -399,11 +388,10 @@ impl Analyzer<'_> {
     /// not have this property.
     pub(super) fn completed_flag(&self, v: Value, nodes: &HashSet<usize>, header: usize) -> bool {
         let h = &self.p.blocks[header];
-        if self.p.wave64
-            || !h
-                .insts
-                .iter()
-                .any(|i| i.name() == "image_bvh64_intersect_ray")
+        if !h
+            .insts
+            .iter()
+            .any(|i| i.name() == "image_bvh64_intersect_ray")
         {
             return false;
         }
@@ -436,7 +424,7 @@ impl Analyzer<'_> {
         {
             return false;
         }
-        let Some((j, flag)) = bb.insts.iter().enumerate().find(|(_, i)| {
+        let Some(flag) = bb.insts.iter().find(|i| {
             i.write(reg).is_some()
                 && select_operands(i).is_some_and(|(a, b, _)| {
                     const_operand(a) == Some(0) && const_operand(b) == Some(u32::MAX)
@@ -493,47 +481,9 @@ impl Analyzer<'_> {
         {
             return false;
         }
-        let Some(gate) = bb.insts.iter().rev().nth(1) else {
+        let Some((gate, status, exec)) = self.traversal_state_gate(d) else {
             return false;
         };
-        let Some((target, state)) = two_src_operands(gate) else {
-            return false;
-        };
-        let Some(state) = operand_val(gate, state) else {
-            return false;
-        };
-        if gate.name() != "v_cmpx_eq_u32"
-            || const_operand(target) != Some(3)
-            || !address::plain(gate)
-        {
-            return false;
-        }
-        let Some(exec) = gate.read(Reg::S(EXEC)) else {
-            return false;
-        };
-        let Some(((sb, _), normalize)) = self.def_inst(state) else {
-            return false;
-        };
-        let Some((status, three, node_mask)) = select_operands(normalize) else {
-            return false;
-        };
-        let (Some(status), Some(node_mask)) = (
-            operand_val(normalize, status),
-            operand_val(normalize, node_mask),
-        ) else {
-            return false;
-        };
-        let Some(((cb, _), node_cmp)) = self.def_inst(node_mask) else {
-            return false;
-        };
-        if sb != d
-            || cb != d
-            || const_operand(three) != Some(3)
-            || node_cmp.name() != "v_cmp_eq_u32"
-            || other_val_from_const_op(node_cmp, 4) != Some(status)
-        {
-            return false;
-        }
         let Some(((b, _), clear)) = self.def_inst(status) else {
             return false;
         };
@@ -550,7 +500,14 @@ impl Analyzer<'_> {
         let Some((on, off)) = two_src_operands(disabled) else {
             return false;
         };
-        if b != d || disabled.name() != "s_cselect_b32" {
+        if b != d
+            || disabled.name()
+                != if self.p.wave64 {
+                    "s_cselect_b64"
+                } else {
+                    "s_cselect_b32"
+                }
+        {
             return false;
         }
         let expires_when =
@@ -661,10 +618,94 @@ impl Analyzer<'_> {
                 } else {
                     (Some(0), Some(1))
                 }
-            && [gate, normalize, node_cmp, clear, flag, eq, and]
+            && [gate, clear, flag, eq, and]
                 .iter()
                 .all(|i| i.read(Reg::S(EXEC)) == Some(exec) && address::plain(i))
-            && self.st.guards[d][j].is_none()
+            && (!self.p.wave64 || {
+                // Both guest mask dwords must reach every consumer unchanged.
+                let high = gate.read(Reg::S(EXEC + 1));
+                high.is_some()
+                    && [clear, flag, eq, and]
+                        .iter()
+                        .all(|i| i.read(Reg::S(EXEC + 1)) == high)
+                    && disabled.read(Reg::S(EXEC + 1)) == high
+                    && Self::mask_pair_feeds(disabled, clear)
+                    && Self::mask_pair_feeds(eq, flag)
+            })
+    }
+
+    fn mask_pair_feeds(def: &Inst, use_i: &Inst) -> bool {
+        let Some(&(Reg::S(reg), lo)) = def.writes.first() else {
+            return false;
+        };
+        use_i.read(Reg::S(reg)) == Some(lo)
+            && reg.checked_add(1).is_some_and(|r| {
+                def.write(Reg::S(r))
+                    .is_some_and(|hi| use_i.read(Reg::S(r)) == Some(hi))
+            })
+    }
+
+    /// Both encodings enter the intersection for states 3 and 4. Clearing
+    /// the state to zero on timeout must close the actual EXEC gate.
+    fn traversal_state_gate(&self, d: usize) -> Option<(&Inst, Value, Value)> {
+        let last = self.p.blocks[d].insts.iter().rev().nth(1)?;
+        let wide = self.p.wave64;
+        let gate = if last.name()
+            == if wide {
+                "s_and_saveexec_b64"
+            } else {
+                "s_and_saveexec_b32"
+            } {
+            let v = operand_val(last, first_src_operand(last)?)?;
+            let ((b, _), cmp) = self.def_inst(v)?;
+            if b != d
+                || cmp.name() != "v_cmp_gt_u32"
+                || (wide && !Self::mask_pair_feeds(cmp, last))
+                || last.read(Reg::S(EXEC)) != cmp.read(Reg::S(EXEC))
+                || (wide && last.read(Reg::S(EXEC + 1)) != cmp.read(Reg::S(EXEC + 1)))
+            {
+                return None;
+            }
+            cmp
+        } else {
+            last
+        };
+        let exec = gate.read(Reg::S(EXEC))?;
+        if !address::plain(gate) {
+            return None;
+        }
+        let (target, op) = two_src_operands(gate)?;
+        let ((b, _), norm) = self.def_inst(operand_val(gate, op)?)?;
+        let same = |i: &Inst| {
+            address::plain(i)
+                && i.read(Reg::S(EXEC)) == Some(exec)
+                && (!wide || i.read(Reg::S(EXEC + 1)) == gate.read(Reg::S(EXEC + 1)))
+        };
+        if b != d || !same(norm) {
+            return None;
+        }
+        let status = match (gate.name(), const_operand(target), norm.name()) {
+            ("v_cmp_gt_u32", Some(2), "v_add_nc_u32") => {
+                other_val_from_const_op(norm, 0u32.wrapping_sub(3))?
+            }
+            ("v_cmpx_eq_u32", Some(3), "v_cndmask_b32") => {
+                let (s, three, mask) = select_operands(norm)?;
+                let s = operand_val(norm, s)?;
+                let ((b, _), cmp) = self.def_inst(operand_val(norm, mask)?)?;
+                if b != d
+                    || !same(cmp)
+                    || cmp.name() != "v_cmp_eq_u32"
+                    || const_operand(three) != Some(3)
+                    || other_val_from_const_op(cmp, 4) != Some(s)
+                    || (wide && !Self::mask_pair_feeds(cmp, norm))
+                {
+                    return None;
+                }
+                s
+            }
+            _ => return None,
+        };
+        Some((gate, status, exec))
     }
 
     fn watchdog_compare(&self, i: &Inst) -> Option<(Value, Word, bool)> {
@@ -703,7 +744,16 @@ mod tests {
     fn only_a_watchdog_that_removes_work_from_the_backedge_can_hide_a_count() {
         let sop2 = |op: u32, d: u32, a: u32, b: u32| 0x8000_0000 | op << 23 | d << 16 | b << 8 | a;
         let vop2 = |op: u32, d: u32, a: u32, b: u32| op << 25 | d << 17 | b << 9 | a;
-        for (initial, left, expected) in [(126u32, 8, true), (126, 126, false), (128, 8, false)] {
+        // Both latches compare the externally observed 1 < count. Changing the
+        // cap to three or preserving state 3 on expiry must keep the guest count.
+        for (initial, left, cap, expired, expected) in [
+            (126u32, 8, None, 128, true),
+            (126, 126, None, 128, false),
+            (128, 8, None, 128, false),
+            (126, 8, Some(2), 128, true),
+            (126, 8, Some(3), 128, false),
+            (126, 8, Some(2), 131, false),
+        ] {
             let mut words = vec![
                 0x7e08_0280,
                 0xbe88_0300 | initial,
@@ -719,14 +769,26 @@ mod tests {
                 0x0908_0706,
                 0x000c_0b0a,
             ]);
+            words.extend([0x7e04_0308, vop2(0x25, 4, 129, 4)]); // next node, ++count
+            if let Some(cap) = cap {
+                words.extend([
+                    0x7c00_0000 | (0xc4 << 17) | (4 << 9) | (128 + cap),
+                    0xd501_0003,
+                    expired | (261 << 9) | (106 << 18), // count < cap ? v5 : expired
+                    0xd484_000b,
+                    129 | (258 << 9), // s11 = 1 > next_node
+                    0x7c00_0000 | (0xc5 << 17) | (3 << 9) | 131, // selected status != 3
+                ]);
+            } else {
+                words.extend([
+                    0x7c00_0000 | (0xc1 << 17) | (4 << 9) | 129, // timeout = 1 < count
+                    0xd484_000b,
+                    129 | (258 << 9),
+                    0xd501_0003,
+                    128 | (193 << 9) | (106 << 18), // flag = timeout ? -1 : 0
+                ]);
+            }
             words.extend([
-                0x7e04_0308,                                 // next node = first intersection result
-                vop2(0x25, 4, 129, 4),                       // ++count
-                0x7c00_0000 | (0xc1 << 17) | (4 << 9) | 129, // timeout = 1 < count
-                0xd484_000b,
-                129 | (258 << 9), // s11 = 1 > next_node
-                0xd501_0003,
-                128 | (193 << 9) | (106 << 18), // flag = timeout ? -1 : 0
                 sop2(0x10, 10, 106, 11),
                 0xbe89_3c0a,              // union, save EXEC
                 sop2(0x14, 8, left, 126), // work & !finished, or the incorrect EXEC & !EXEC

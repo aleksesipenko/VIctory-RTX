@@ -108,12 +108,12 @@ impl Analyzer<'_> {
     /// XDXR's leaf has primitive indices at bytes 52 and 56. Slot one
     /// selects the second dword; every other slot selects the first.
     pub(super) fn primitive_slot_select(&self, v: Value, tags: &HashMap<Value, BvhTag>) -> bool {
-        if self.p.wave64 {
-            return false;
-        }
-        let Some(inst) = self.unguarded_def(v) else {
+        let Some(((block, _), inst)) = self.def_inst(v) else {
             return false;
         };
+        if !plain(inst) || inst.writes.first().is_none_or(|w| w.1 != v) {
+            return false;
+        }
         let Fields::Valu(f) = &inst.fields else {
             return false;
         };
@@ -126,7 +126,15 @@ impl Analyzer<'_> {
         let (Some(offset), Some(mask)) = (operand_val(inst, b), operand_val(inst, m)) else {
             return false;
         };
-        let (Some(add), Some(cmp)) = (self.unguarded_def(offset), self.unguarded_def(mask)) else {
+        let reaching = |v| {
+            let ((b, j), op) = self.def_inst(v)?;
+            (plain(op)
+                && op.writes.first()?.1 == v
+                && (self.st.guards[b][j].is_none()
+                    || b == block && self.mask_covers(op, inst, &[])))
+            .then_some(op)
+        };
+        let (Some(add), Some(cmp)) = (reaching(offset), reaching(mask)) else {
             return false;
         };
         let (Fields::Valu(f), Fields::Valu(c)) = (&add.fields, &cmp.fields) else {
@@ -138,7 +146,16 @@ impl Analyzer<'_> {
         let Some(slot) = operand_val(add, slot) else {
             return false;
         };
-        add.name() == "v_lshl_add_u32"
+        let mask_pair = !self.p.wave64
+            || match *m {
+                Operand::Scalar { code, dwords: 2 } => code.checked_add(1).is_some_and(|hi| {
+                    cmp.write(Reg::S(hi))
+                        .is_some_and(|value| inst.read(Reg::S(hi)) == Some(value))
+                }),
+                _ => false,
+            };
+        mask_pair
+            && add.name() == "v_lshl_add_u32"
             && cmp.name() == "v_cmp_gt_u32"
             && const_operand(shift) == Some(2)
             && const_operand(base) == Some(52)

@@ -13711,7 +13711,11 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
+                let x = if self.lift.dead_exit_masks.contains(&(q, phi.value)) {
+                    self.s.m.bool(false)
+                } else {
+                    self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

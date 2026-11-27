@@ -1965,6 +1965,133 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
     Ok(())
 }
 
+/// A shared TLAS header first tests the root type and one bit of a scalar
+/// work mask per lane. Keep both original paths when any entry condition fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedRayEntry {
+    pub root: u8,
+    pub work: u8,
+    pub require_full_work: bool,
+}
+
+impl SharedRayEntry {
+    fn tests(self) -> [u32; 4] {
+        let root = u32::from(self.root);
+        [
+            0xbf02_8000 | root, // s_cmp_gt_i32 root, 0
+            0xbf0d_8200 | root, // s_bitcmp1_b32 root, 2  (box)
+            0xbf0c_8100 | root, // s_bitcmp0_b32 root, 1  (not an instance)
+            // If the lane index might be stale, work == -1 covers every
+            // possible bit selected by the guest's 32-bit shift.
+            0xbf06_0000
+                | (if self.require_full_work { 193 } else { 126 }) << 8
+                | u32::from(self.work),
+        ]
+    }
+
+    pub fn fast_edges(
+        self,
+        p: &Program,
+        mut pred: usize,
+        mut target: usize,
+    ) -> Option<[(usize, usize); 4]> {
+        let mut edges = [(0, 0); 4];
+        for (slot, word) in edges.iter_mut().zip(self.tests().into_iter().rev()) {
+            let block = &p.blocks[pred];
+            let [test, jump] = block.insts.as_slice() else {
+                return None;
+            };
+            if test.machine.words[0] != word
+                || jump.name() != "s_cbranch_scc0"
+                || !matches!(block.exit, Exit::Branch { taken, not_taken } if not_taken == target && taken != target)
+            {
+                return None;
+            }
+            *slot = (pred, target);
+            let [parent] = block.preds.as_slice() else {
+                return None;
+            };
+            target = pred;
+            pred = *parent;
+        }
+        Some(edges)
+    }
+}
+
+pub(crate) fn version_shared_ray(
+    p: &Program,
+    h: usize,
+    pre: usize,
+    nodes: &HashSet<usize>,
+    guard: SharedRayEntry,
+) -> Option<Program> {
+    let mut blocks = p.blocks.clone();
+    let mut ordered: Vec<_> = nodes.iter().copied().collect();
+    ordered.sort_unstable();
+    let remap: HashMap<_, _> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| (b, blocks.len() + i))
+        .collect();
+    let redirect = |exit: &mut Exit, change: &dyn Fn(usize) -> usize| match exit {
+        Exit::Jump(j) => *j = change(*j),
+        Exit::Branch { taken, not_taken } => {
+            *taken = change(*taken);
+            *not_taken = change(*not_taken);
+        }
+        _ => {}
+    };
+    for b in ordered {
+        let mut slow = p.blocks[b].clone();
+        redirect(&mut slow.exit, &|s| remap.get(&s).copied().unwrap_or(s));
+        blocks.push(slow);
+    }
+    let slow = remap[&h];
+    let offset = blocks[h].offset;
+    let guards = blocks.len();
+    let instruction = |word: u32| -> Option<Inst> {
+        let encoding = if word == 0xbf84_0000 {
+            gfx10::Encoding::Sopp
+        } else {
+            gfx10::Encoding::Sopc
+        };
+        let machine =
+            gfx10::Instruction::new(offset, encoding, ((word >> 16) & 0x7f) as u16, vec![word]);
+        let fields = machine.fields(false);
+        let (r, w) = effects(&machine, &fields, machine.name()?, 1, p.vgprs).ok()??;
+        Some(Inst {
+            machine,
+            fields,
+            reads: r.into_iter().map(|reg| (reg, NONE)).collect(),
+            writes: w.into_iter().map(|reg| (reg, NONE)).collect(),
+        })
+    };
+    let words = guard.tests();
+    for (i, word) in words.into_iter().enumerate() {
+        blocks.push(Block {
+            offset,
+            preds: vec![],
+            phis: vec![],
+            insts: vec![instruction(word)?, instruction(0xbf84_0000)?],
+            exit: Exit::Branch {
+                taken: slow,
+                not_taken: if i + 1 == words.len() {
+                    h
+                } else {
+                    guards + i + 1
+                },
+            },
+        });
+    }
+    redirect(&mut blocks[pre].exit, &|b| if b == h { guards } else { b });
+    for bb in &mut blocks {
+        bb.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, false, p.vgprs))
+}
+
 /// The prefix of a guest traversal that can execute before its first root
 /// intersection, with the feasible successors on the initial incoming edge.
 pub(crate) struct RayPrefix {
@@ -2052,6 +2179,59 @@ mod tests {
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         build(&code, wave64, 256).unwrap()
+    }
+
+    #[test]
+    fn shared_root_version_executes_the_guest_loop_for_skipped_or_sparse_rays() {
+        let p = build_words(&[0xbf82_0000, 0x8000_8100, 0xbf85_fffe, S_ENDPGM], false);
+        for full in [false, true] {
+            let guard = SharedRayEntry {
+                root: 5,
+                work: 8,
+                require_full_work: full,
+            };
+            let q = version_shared_ray(&p, 1, 0, &HashSet::from([1]), guard).unwrap();
+            for (root, work, exec, fast) in [
+                (4, u32::MAX, u32::MAX, true),
+                (5, 9, 9, !full),
+                (0, 9, 9, false),
+                (6, 9, 9, false),
+                (5, 1, 9, false),
+                (0x80000004, 9, 9, false),
+            ] {
+                let Exit::Jump(mut b) = q.blocks[0].exit else {
+                    panic!()
+                };
+                while q.blocks[b].insts.last().unwrap().name() == "s_cbranch_scc0" {
+                    let test = &q.blocks[b].insts[0];
+                    let Fields::Sop { src, .. } = &test.fields else {
+                        panic!()
+                    };
+                    let val = |op: &Operand| match op {
+                        Operand::Scalar { code: 5, .. } => root,
+                        Operand::Scalar { code: 8, .. } => work,
+                        Operand::Scalar { code: EXEC, .. } => exec,
+                        Operand::Const(k) => crate::resource::inline(*k).unwrap(),
+                        _ => panic!(),
+                    };
+                    let (a, c) = (val(&src[0]), val(&src[1]));
+                    let yes = match test.name() {
+                        "s_cmp_gt_i32" => (a as i32) > (c as i32),
+                        "s_bitcmp0_b32" => a & (1 << c) == 0,
+                        "s_bitcmp1_b32" => a & (1 << c) != 0,
+                        "s_cmp_eq_u32" => a == c,
+                        _ => panic!(),
+                    };
+                    let Exit::Branch { taken, not_taken } = q.blocks[b].exit else {
+                        panic!()
+                    };
+                    b = if yes { not_taken } else { taken };
+                }
+                assert_eq!(b == 1, fast);
+                assert_eq!(q.blocks[b].offset, p.blocks[1].offset);
+                assert!(matches!(q.blocks[b].exit,Exit::Branch{taken,..} if taken==b));
+            }
+        }
     }
 
     fn input(p: &Program, reg: Reg) -> Value {

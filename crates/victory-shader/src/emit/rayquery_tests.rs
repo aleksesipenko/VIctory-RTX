@@ -564,6 +564,8 @@ fn emit_front_back_track_cs(two_pass: bool) -> Vec<u8> {
             },
         ],
         completed_timeouts: vec![],
+        dead_exit_masks: vec![],
+        shared_entry: None,
         committed_meta_loads: vec![],
     };
 

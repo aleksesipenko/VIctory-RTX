@@ -3,13 +3,35 @@
 use super::*;
 
 pub(crate) fn peel(p: &Program, st: &Structured, res: &Resources, threads: u32) -> Option<Program> {
-    if p.wave64
-        || !res
-            .bvh
-            .iter()
-            .any(|&((b, i), _)| p.blocks[b].insts[i].name() == "image_bvh64_intersect_ray")
-    {
+    if p.wave64 {
         return None;
+    }
+    if !res
+        .bvh
+        .iter()
+        .any(|&((b, i), _)| p.blocks[b].insts[i].name() == "image_bvh64_intersect_ray")
+    {
+        if threads == 0 || threads > 32 || res.bvh.len() < 2 {
+            return None;
+        }
+        let scalar = res.scalar.iter().copied().collect();
+        let mut selected = None;
+        super::isolated_ray_loops(p, st, res, &scalar, |loops| {
+            let [r] = loops.as_slice() else {
+                return false;
+            };
+            let Some((guard, pre)) = r.shared_entry else {
+                return false;
+            };
+            let mut nodes: HashSet<_> = r.skipped_blocks.iter().copied().collect();
+            nodes.insert(r.entry_block);
+            if let RayLoopKind::AnyHit(ah) = &r.kind {
+                nodes.extend(&ah.body_blocks);
+            }
+            selected = crate::ir::version_shared_ray(p, r.entry_block, pre, &nodes, guard);
+            selected.is_some()
+        });
+        return selected;
     }
     let scalar = res.scalar.iter().copied().collect();
     let a = Analyzer::new(p, st, res, &scalar);
@@ -29,6 +51,147 @@ pub(crate) fn peel(p: &Program, st: &Structured, res: &Resources, threads: u32) 
 }
 
 impl Analyzer<'_> {
+    /// The guard can only specialize this exact first-intersection predicate:
+    /// EXEC & (node_type != 6) & bit(work, lane_id). Reading the loop-carried
+    /// PHIs here is valid for the body; the new scalar checks run on its sole
+    /// external edge, before any header instruction or backedge.
+    pub(super) fn shared_entry(
+        &self,
+        h: usize,
+        nodes: &HashSet<usize>,
+        bvh: Site,
+    ) -> Option<(crate::ir::SharedRayEntry, usize, Value)> {
+        if self.p.wave64 {
+            return None;
+        }
+        let bb = &self.p.blocks[h];
+        let mut preds = bb.preds.iter().copied().filter(|p| !nodes.contains(p));
+        let pre = preds.next()?;
+        let arm = &self.p.blocks[bvh.0];
+        if preds.next().is_some()
+            || arm.preds != [h]
+            || !matches!(bb.exit,Exit::Branch{not_taken,..} if not_taken==bvh.0)
+            || bb.insts.last()?.name() != "s_cbranch_execz"
+        {
+            return None;
+        }
+        // Guard blocks overwrite SCC; the original header must kill it before reading it.
+        let first = bb
+            .insts
+            .iter()
+            .find(|i| i.read(Reg::Scc).is_some() || i.write(Reg::Scc).is_some())?;
+        if first.read(Reg::Scc).is_some() || first.write(Reg::Scc).is_none() {
+            return None;
+        }
+        let save = bb.insts.iter().rev().nth(1)?;
+        let entry = save.read(Reg::S(EXEC))?;
+        if save.name() != "s_and_saveexec_b32"
+            || save.write(Reg::S(EXEC)) != bb.insts.last()?.read(Reg::S(EXEC))
+            || arm.insts[bvh.1].read(Reg::S(EXEC)) != save.write(Reg::S(EXEC))
+            || bb.insts[..bb.insts.len() - 2]
+                .iter()
+                .any(|i| i.write(Reg::S(EXEC)).is_some())
+        {
+            return None;
+        }
+        let local = |v: Value| {
+            let ((b, _), i) = self.def_inst(v)?;
+            (b == h
+                && address::plain(i)
+                && i.writes.first()?.1 == v
+                && (!matches!(i.fields, Fields::Valu(_)) || i.read(Reg::S(EXEC)) == Some(entry)))
+            .then_some(i)
+        };
+        let mask = local(operand_val(save, first_src_operand(save)?)?)?;
+        if mask.name() != "s_and_b32" {
+            return None;
+        }
+        let (m, n) = two_src_operands(mask)?;
+        let (m, n) = (local(operand_val(mask, m)?)?, local(operand_val(mask, n)?)?);
+        let (sel, cmp) = if m.name() == "s_cselect_b32" {
+            (m, n)
+        } else {
+            (n, m)
+        };
+        let (curr, z) = two_src_operands(sel)?;
+        if sel.name() != "s_cselect_b32"
+            || operand_val(sel, curr) != Some(entry)
+            || const_operand(z) != Some(0)
+            || cmp.name() != "v_cmp_ne_u32"
+        {
+            return None;
+        }
+        let test = self.def_inst(sel.read(Reg::Scc)?)?.1;
+        let (kind, six) = two_src_operands(test)?;
+        if test.name() != "s_cmp_lg_u32" || const_operand(six) != Some(6) {
+            return None;
+        }
+        let kind = local(operand_val(test, kind)?)?;
+        if kind.name() != "s_and_b32" {
+            return None;
+        }
+        let node = other_val_from_const_op(kind, 7)?;
+        let bits = local(other_val_from_const_op(cmp, 0)?)?;
+        if bits.name() != "v_and_b32" {
+            return None;
+        }
+        let (l, r) = two_src_operands(bits)?;
+        let work = [l, r].into_iter().find_map(|op| {
+            matches!(op, Operand::Scalar { .. })
+                .then(|| operand_val(bits, op))
+                .flatten()
+        })?;
+        let bit = [l, r].into_iter().find_map(|op| {
+            matches!(op, Operand::Vector { .. })
+                .then(|| operand_val(bits, op))
+                .flatten()
+        })?;
+        let shift = local(bit)?;
+        let (lane, one) = two_src_operands(shift)?;
+        if shift.name() != "v_lshlrev_b32" || const_operand(one) != Some(1) {
+            return None;
+        }
+        let ((b, _), lane) = self.def_inst(operand_val(shift, lane)?)?;
+        let (ones, zero) = two_src_operands(lane)?;
+        if nodes.contains(&b)
+            || !self.dominates(b, h)
+            || lane.name() != "v_mbcnt_lo_u32_b32"
+            || !address::plain(lane)
+            || const_operand(ones) != Some(u32::MAX)
+            || const_operand(zero) != Some(0)
+        {
+            return None;
+        }
+        let initial = match self.defs[entry.0 as usize] {
+            Some(Def::Phi(b, j)) if b == h => {
+                bb.phis[j].args[bb.preds.iter().position(|&p| p == pre)?]
+            }
+            _ => entry,
+        };
+        let lane_is_current = self.mask_covers(lane, shift, &[(h, pre)])
+            || self.mask_source(initial, lane.read(Reg::S(EXEC))?, true, 0);
+        self.shared_root(h, pre, nodes, bvh, node, work)?;
+        let (Some(Reg::S(root)), Some(Reg::S(work))) = (self.value_reg(node), self.value_reg(work))
+        else {
+            return None;
+        };
+        if [root, work]
+            .into_iter()
+            .any(|r| r >= 106 || bb.insts.iter().any(|i| i.write(Reg::S(r)).is_some()))
+        {
+            return None;
+        }
+        Some((
+            crate::ir::SharedRayEntry {
+                root,
+                work,
+                require_full_work: !lane_is_current,
+            },
+            pre,
+            bit,
+        ))
+    }
+
     fn root_dispatch(
         &self,
         h: usize,
