@@ -172,11 +172,18 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     unsafe {
         let record = &*(*info).ExceptionRecord;
         let context = &mut *(*info).ContextRecord;
-        if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
+        if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION
+            || crate::console_insn::in_patching()
+        {
             return false;
         }
-        let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
+        let Some((bytes, n)) = crate::sse4a::read_code::<32>(context.Rip as usize) else {
+            return false;
+        };
+        if n < 3 {
+            return false;
+        }
+        match [bytes[0], bytes[1], bytes[2]] {
             [0x0f, 0x01, 0xfc] => return clzero(context),
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
@@ -189,12 +196,6 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 context.Rdx = cycles >> 32;
             }
             _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
                 if let Some(pass) = clwb_loop(&bytes[..n])
                     && let Some(end) =
                         clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
@@ -212,7 +213,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += len as u64;
                     return true;
                 }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                let Some(len) = sse4a(&bytes[..n], &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
                 context.Rip += len as u64;
@@ -445,29 +446,25 @@ pub(crate) fn cmp_flags(a: u64, b: u64) -> u32 {
 }
 pub(crate) const CMP_FLAGS: u32 = 0x8d5;
 
-/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
+/// SSE4a's `extrq`/`insertq` (immediate and register forms) on the saved XMM
+/// registers; returns the instruction's length or `None` if truncated/other.
+fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
+    let prefix = *code.first()?;
+    let b1 = *code.get(1)?;
+    let (rex, at) = if b1 & 0xf0 == 0x40 { (b1, 2) } else { (0, 1) };
+    let opcode = *code.get(at + 1)?;
+    if !matches!(prefix, 0x66 | 0xf2) || *code.get(at)? != 0x0f || !matches!(opcode, 0x78 | 0x79) {
         return None;
     }
-    let modrm = b(at + 2);
+    let modrm = *code.get(at + 2)?;
     if modrm >> 6 != 3 {
         return None;
     }
     let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
     let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
+    let immediate = opcode == 0x78;
     let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
+        ((*code.get(at + 3)?, *code.get(at + 4)?), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
         let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
@@ -483,9 +480,11 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         }
         let target = if immediate { src } else { dst };
         xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
+        xmm[target].High = 0;
     } else {
         let value = (xmm[src].Low & mask) << at_bit;
         xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
+        xmm[dst].High = 0;
     }
     Some(len)
 }
@@ -493,18 +492,32 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
-    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION
+        && !crate::console_insn::in_patching()
+    {
         // SAFETY: the faulting thread's context, for the exception being dispatched.
         let ctx = unsafe { &mut *(*info).ContextRecord };
+        let at = ctx.Rip as usize;
         let r = unsafe { crate::console_insn::emulate(ctx) };
         if r != 0 {
+            // SAFETY: `at` is the instruction that just faulted; immediate-form
+            // SSE4a `extrq`/`insertq` sites are patched once to SSE2 stubs.
+            unsafe { crate::sse4a::replace(at) };
             return r;
+        }
+        // A sibling thread may fault with `#UD` at `at` right as `sse4a::replace`
+        // writes the `jmp rel32`; retry execution at `at` so it enters the stub.
+        if crate::sse4a::was_patched(at) {
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
         // `console_insn::emulate` owns all `clzero` forms (including
         // `zero_through_fault`); if it refused a `clzero` (e.g. `MEM_FREE`),
         // never fall through to the unchecked legacy `crash::clzero`.
-        let is_clzero = unsafe { (ctx.Rip as *const [u8; 3]).read_unaligned() == [0x0f, 0x01, 0xfc] };
+        let mut head = [0u8; 3];
+        let is_clzero = crate::sse4a::read_code_into(at, &mut head) == 3 && head == [0x0f, 0x01, 0xfc];
         if !is_clzero && unsafe { emulate_amd_only(info) } {
+            // SAFETY: as above.
+            unsafe { crate::sse4a::replace(at) };
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
     }
@@ -536,10 +549,9 @@ pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
 /// `at`'s page is readable.
 unsafe fn instruction_bytes(at: usize) -> String {
     let n = (0x1000 - (at & 0xfff)).min(15);
-    // SAFETY: `n` bytes from `at` stay inside its page, which the caller
-    // says is readable.
-    let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, n) };
-    let hex: Vec<_> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut buf = [0u8; 15];
+    let got = crate::sse4a::read_code_into_reentrant(at, &mut buf[..n]);
+    let hex: Vec<_> = buf[..got].iter().map(|b| format!("{b:02x}")).collect();
     hex.join(" ")
 }
 
@@ -656,14 +668,39 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     }
     #[cfg(feature = "diagnostics")]
     for (address, len, file) in SAVE.get().into_iter().flatten() {
-        // SAFETY: the caller of `save_on_crash` named readable memory.
-        let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
-        let saved = std::fs::write(file, bytes);
+        let saved = save_region(*address, *len, file);
         eprintln!(
             "  saved {address:#x}+{len:#x} to {} ({saved:?})",
             file.display()
         );
     }
+}
+
+/// Copies `[address, address + len)` into `file` via reentrancy-safe
+/// `ReadProcessMemory` chunks without creating any Rust `&[u8]` slice over live
+/// executable/image memory (avoiding data races with concurrent `cmpxchg16b`).
+#[cfg(feature = "diagnostics")]
+fn save_region(address: usize, len: usize, file: &std::path::Path) -> std::io::Result<usize> {
+    use std::io::Write;
+    let mut out = std::fs::File::create(file)?;
+    let mut chunk = [0u8; 4096];
+    let mut done = 0usize;
+    while done < len {
+        let Some(at) = address.checked_add(done) else {
+            break;
+        };
+        let want = (len - done).min(chunk.len());
+        let got = crate::sse4a::read_code_into_reentrant(at, &mut chunk[..want]);
+        if got == 0 {
+            break;
+        }
+        out.write_all(&chunk[..got])?;
+        done += got;
+        if got < want {
+            break;
+        }
+    }
+    Ok(done)
 }
 
 /// Return addresses of the faulting thread's frames, from the faulting
@@ -1478,6 +1515,163 @@ mod tests {
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn nested_illegal_instruction_while_patching_does_not_deadlock() {
+        // Run ALL `lock_patching` / `lock_patching_reentrant` / nested `#UD`
+        // checks inside a 5-second bounded child process so any deadlock
+        // regression is guaranteed to fail cleanly instead of hanging the suite.
+        let exe = std::env::current_exe().expect("test binary path");
+        let stderr_path = std::env::temp_dir().join(format!(
+            "victory_nested_ud_stderr_{}.log",
+            std::process::id()
+        ));
+        let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr log");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "crash::tests::nested_illegal_instruction_child",
+                "--nocapture",
+            ])
+            .env("VICTORY_TEST_NESTED_UD_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_file))
+            .spawn()
+            .expect("spawn nested-#UD child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll child") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let kill_err = child.kill().err();
+                let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                let mut reaped = false;
+                while std::time::Instant::now() < reap_deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let _ = std::fs::remove_file(&stderr_path);
+                panic!(
+                    "child deadlocked handling nested EXCEPTION_ILLEGAL_INSTRUCTION while holding PATCHING (kill_err={kill_err:?}, reaped={reaped})"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&stderr_path);
+        assert!(
+            status.success(),
+            "nested-#UD child exited with failure ({status:?}):\n{stderr}"
+        );
+        // Proves in BOTH default and `--features diagnostics` builds that
+        // `crash::handler` itself ran `report()` and `instruction_bytes()` via
+        // `read_code_into_reentrant` on the nested `#UD` while `PATCHING` was held.
+        assert!(
+            stderr.contains("VIctory: first-chance exception 0xc000001d"),
+            "expected crash::handler first-chance report in stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("(code 0f 0b c3 90"),
+            "expected ud2 instruction bytes in crash::handler stderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn nested_illegal_instruction_child() {
+        if std::env::var_os("VICTORY_TEST_NESTED_UD_CHILD").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        // Verify zero-window `PatchGuard` & reentrant lock checks inside the
+        // bounded child process.
+        assert!(!crate::console_insn::in_patching());
+        {
+            let _guard = crate::console_insn::lock_patching();
+            assert!(crate::console_insn::in_patching());
+            assert!(crate::console_insn::lock_patching_reentrant().is_none());
+        }
+        assert!(!crate::console_insn::in_patching());
+        assert!(crate::console_insn::lock_patching_reentrant().is_some());
+
+        static TARGET_RIP: AtomicUsize = AtomicUsize::new(0);
+        static REACHED_AFTER_CRASH_HANDLER: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "system" fn skip_ud2(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: system-provided exception pointers during VEH dispatch.
+            unsafe {
+                let rec = &*(*info).ExceptionRecord;
+                let ctx = &mut *(*info).ContextRecord;
+                if rec.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION
+                    && ctx.Rip as usize == TARGET_RIP.load(Ordering::Acquire)
+                {
+                    REACHED_AFTER_CRASH_HANDLER.store(true, Ordering::Release);
+                    ctx.Rip += 2; // step past `ud2` (`0f 0b`) onto `ret` (`c3`)
+                    return -1; // EXCEPTION_CONTINUE_EXECUTION
+                }
+            }
+            EXCEPTION_CONTINUE_SEARCH
+        }
+
+        report_crashes();
+        // SAFETY: dedicated RWX test page containing `ud2; ret` and a back-of-chain
+        // VEH that runs strictly AFTER `crash::handler` finishes without deadlocking.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            ) as usize;
+            assert_ne!(page, 0);
+            let bytes = [0x0fu8, 0x0b, 0xc3, 0x90];
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), page as *mut u8, bytes.len());
+            TARGET_RIP.store(page, Ordering::Release);
+
+            #[cfg(feature = "diagnostics")]
+            let dump_path = std::env::temp_dir().join(format!(
+                "victory_nested_ud_save_{}.bin",
+                std::process::id()
+            ));
+            #[cfg(feature = "diagnostics")]
+            save_on_crash(vec![(page, bytes.len(), dump_path.clone())]);
+
+            let tail = AddVectoredExceptionHandler(0, Some(skip_ud2));
+            assert!(!tail.is_null());
+
+            let trigger: extern "system" fn() = std::mem::transmute(page);
+            {
+                let _patching = crate::console_insn::lock_patching();
+                assert!(crate::console_insn::in_patching());
+                trigger();
+                assert!(REACHED_AFTER_CRASH_HANDLER.load(Ordering::Acquire));
+                assert!(crate::console_insn::in_patching());
+            }
+            assert!(!crate::console_insn::in_patching());
+
+            #[cfg(feature = "diagnostics")]
+            {
+                let saved = std::fs::read(&dump_path).expect("diagnostics crash save written");
+                assert_eq!(saved, bytes);
+                let _ = std::fs::remove_file(&dump_path);
+            }
+
+            RemoveVectoredExceptionHandler(tail);
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
         }
     }
 }

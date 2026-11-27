@@ -31,18 +31,34 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
-/// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
-/// title's (zero: no wait). Read once.
+/// `VICTORY_FRAME_INTERVAL_MS` / `VICTORY_FRAME_INTERVAL_US`: the interval
+/// asked for in place of the title's (zero: no wait for MS). Matches
+/// `victory_loader::frame_rate::interval_ms_of` precedence so the host frame
+/// pacer and loader `SimRate` patch always agree. Read once.
 fn asked() -> Option<Duration> {
     static ASKED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *ASKED.get_or_init(|| {
-        let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
-        let ms = parse_ms(&spec);
-        match ms {
-            Some(d) => tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_MS)"),
-            None => tracing::warn!(spec, "VICTORY_FRAME_INTERVAL_MS: expected milliseconds from 0 to 1000; the title's interval kept"),
+        let ms = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok();
+        let us = std::env::var("VICTORY_FRAME_INTERVAL_US").ok();
+        if let Some(spec) = ms.as_deref() {
+            match parse_ms(spec) {
+                Some(d) => {
+                    tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_MS)");
+                    return Some(d);
+                }
+                None => tracing::warn!(spec, "VICTORY_FRAME_INTERVAL_MS: expected milliseconds from 0 to 1000"),
+            }
         }
-        ms
+        if let Some(spec) = us.as_deref() {
+            match parse_us(spec) {
+                Some(d) => {
+                    tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_US)");
+                    return Some(d);
+                }
+                None => tracing::warn!(spec, "VICTORY_FRAME_INTERVAL_US: expected microseconds from 1000 to 1000000; the title's interval kept"),
+            }
+        }
+        None
     })
 }
 
@@ -51,6 +67,18 @@ fn asked() -> Option<Duration> {
 fn parse_ms(spec: &str) -> Option<Duration> {
     let ms = spec.trim().parse::<f64>().ok().filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))?;
     Some(Duration::from_nanos((ms * 1e6).round() as u64))
+}
+
+/// `16667` → 16,667 us; `1_000..=1_000_000` matches `victory_loader::frame_rate`.
+fn parse_us(spec: &str) -> Option<Duration> {
+    let us = spec.trim().parse::<u64>().ok()?;
+    (1_000..=1_000_000).contains(&us).then(|| Duration::from_micros(us))
+}
+
+/// Pure interval resolution matching `victory_loader::frame_rate::interval_ms_of`.
+#[cfg(test)]
+fn parse_interval(ms: Option<&str>, us: Option<&str>) -> Option<Duration> {
+    ms.and_then(parse_ms).or_else(|| us.and_then(parse_us))
 }
 
 struct Clock {
@@ -326,6 +354,23 @@ mod tests {
         assert_eq!(parse_ms("1001"), None);
         assert_eq!(parse_ms("NaN"), None);
         assert_eq!(parse_ms("fast"), None);
+    }
+
+    #[test]
+    fn the_switch_honors_microseconds_and_ms_precedence() {
+        assert_eq!(parse_interval(None, Some("16667")), Some(Duration::from_micros(16_667)));
+        assert_eq!(parse_interval(None, Some(" 8333 ")), Some(Duration::from_micros(8_333)));
+        assert_eq!(parse_interval(None, Some("1000")), Some(Duration::from_micros(1_000)));
+        assert_eq!(parse_interval(None, Some("1000000")), Some(Duration::from_micros(1_000_000)));
+        assert_eq!(parse_interval(None, Some("0")), None);
+        assert_eq!(parse_interval(None, Some("999")), None);
+        assert_eq!(parse_interval(None, Some("1000001")), None);
+        assert_eq!(parse_interval(None, Some("fast")), None);
+        // Well-formed MS takes precedence over US; malformed MS falls back to US.
+        assert_eq!(parse_interval(Some("8.333"), Some("16667")), Some(Duration::from_micros(8_333)));
+        assert_eq!(parse_interval(Some("0"), Some("16667")), Some(Duration::ZERO));
+        assert_eq!(parse_interval(Some("bad"), Some("16667")), Some(Duration::from_micros(16_667)));
+        assert_eq!(parse_interval(Some("bad"), Some("500")), None);
     }
 
     #[test]

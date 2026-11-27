@@ -353,6 +353,120 @@ impl HostList {
     }
 }
 
+/// Whether a fill of upload memory that flights in the air may write, and
+/// that stands behind a copy at its place of the same submission which puts
+/// all of its bytes, takes them from that copy instead (`VICTORY_FILL_FORWARD`;
+/// on by default, `0` disables; `VICTORY_AB` can switch it while the title runs).
+pub(super) fn forwarding() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_FILL_FORWARD") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_FORWARD").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: fills that took their bytes from a copy at its
+/// place ([`forward_fills`]).
+pub(super) static FORWARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`forwards`] looks at of a step.
+#[derive(Clone, Copy, Debug)]
+enum View {
+    /// A copy at its place: where it puts its bytes, how many, and where its
+    /// list holds them if it took them on the CPU at submission.
+    Put { dst: usize, len: usize, from: Option<usize> },
+    /// A write of `[at, at + len)`: a buffer copy, a shader's declared write.
+    Writes { at: usize, len: usize },
+    /// A step of ours: it may write anything.
+    Run,
+    /// A fill of upload memory out of `[src, src + len)`.
+    Fill { src: usize, len: usize },
+    /// Reads alone.
+    Other,
+}
+
+impl View {
+    fn of(step: &Step) -> View {
+        match step {
+            Step::Placed(p) => View::Put { dst: p.dst, len: p.len, from: p.from },
+            &Step::Copy(dst, _, len) => View::Writes { at: dst, len },
+            &Step::GpuWrite(_, at, len) => View::Writes { at, len },
+            Step::Run(_) => View::Run,
+            &Step::Fill(_, src, len, _) => View::Fill { src, len },
+            _ => View::Other,
+        }
+    }
+}
+
+/// Which fills of `runs` (each: whether its list cannot have steps mutated —
+/// named twice in the submission or retained as a reusable DXR recording — and
+/// its steps in order) take their bytes from a copy at its place
+/// ([`forwarding`]); `blocked` says which fills would wait for flights. Each:
+/// (the run's place, the step's place, where its bytes are).
+fn forwards(runs: &[(bool, Vec<View>)], blocked: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize, usize)> {
+    // The copies whose bytes still stand: (where, how many, where held).
+    let mut puts: Vec<(usize, usize, usize)> = Vec::new();
+    let mut moves = Vec::new();
+    // What writes `[at, at + n)` leaves no copy's bytes standing there.
+    let wrote = |puts: &mut Vec<(usize, usize, usize)>, at: usize, n: usize| {
+        puts.retain(|p| !(at < p.0 + p.1 && p.0 < at + n))
+    };
+    for (k, (skip_mutate, steps)) in runs.iter().enumerate() {
+        for (i, step) in steps.iter().enumerate() {
+            match *step {
+                View::Put { dst, len, from } => {
+                    wrote(&mut puts, dst, len);
+                    if let Some(from) = from {
+                        puts.push((dst, len, from));
+                    }
+                }
+                View::Writes { at, len } => wrote(&mut puts, at, len),
+                View::Run => puts.clear(),
+                // Lists named twice in a submission or retained as reusable DXR
+                // recordings must not have their fill source permanently mutated.
+                View::Fill { src, len } if !skip_mutate && len > 0 && blocked(src, len) => {
+                    if let Some(&(dst, _, from)) =
+                        puts.iter().rev().find(|p| p.0 <= src && src + len <= p.0 + p.1)
+                    {
+                        moves.push((k, i, from + (src - dst)));
+                    }
+                }
+                View::Fill { .. } | View::Other => {}
+            }
+        }
+    }
+    moves
+}
+
+/// [`forwarding`]: before anything looks at what the steps of `runs` read,
+/// with flights that write `written` in the air, the fills that can take
+/// their bytes from a copy at its place ahead of them read those instead.
+pub(super) fn forward_fills(runs: &[&HostList], written: &[(usize, usize)]) {
+    if written.is_empty() {
+        return;
+    }
+    let lists: Vec<usize> = runs.iter().map(|l| std::ptr::from_ref::<HostList>(l) as usize).collect();
+    // One list's lock at a time: a submission may name a list twice.
+    let views: Vec<(bool, Vec<View>)> = runs
+        .iter()
+        .enumerate()
+        .map(|(k, list)| {
+            let skip_mutate = list.has_dxr()
+                || list.is_dxr_reusable()
+                || lists.iter().filter(|&&l| l == lists[k]).count() > 1;
+            (skip_mutate, list.deferred().copies.iter().map(View::of).collect())
+        })
+        .collect();
+    let moves = forwards(&views, |src, len| read_blocked(written, src, len));
+    for &(k, i, from) in &moves {
+        if let Some(Step::Fill(_, src, ..)) = runs[k].deferred().copies.get_mut(i) {
+            *src = from;
+        }
+    }
+    FORWARDED.fetch_add(moves.len() as u64, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     /// What copies with two sides cost to make (ignored: a measurement for
@@ -379,5 +493,104 @@ mod tests {
             after.saturating_sub(before)
         );
         drop((card, pc));
+    }
+}
+
+/// [`forwards`]: which fills take the bytes of a copy at its place ahead of
+/// them, and which keep reading title memory.
+#[cfg(test)]
+mod forward_tests {
+    use super::{View, forwards};
+
+    fn put(dst: usize, len: usize, from: usize) -> View {
+        View::Put { dst, len, from: Some(from) }
+    }
+
+    fn fill(src: usize, len: usize) -> View {
+        View::Fill { src, len }
+    }
+
+    #[test]
+    fn a_fill_behind_a_copy_takes_its_bytes() {
+        let runs = vec![(false, vec![put(0x1000, 0xd0, 0x9000), View::Other, fill(0x1020, 0xb0)])];
+        assert_eq!(forwards(&runs, |_, _| true), vec![(0, 2, 0x9020)]);
+        // In a later list too.
+        let runs = vec![
+            (false, vec![put(0x1000, 0xd0, 0x9000)]),
+            (false, vec![View::Other, fill(0x1000, 0xd0)]),
+        ];
+        assert_eq!(forwards(&runs, |_, _| true), vec![(1, 1, 0x9000)]);
+    }
+
+    #[test]
+    fn fills_ahead_of_the_copy_keep_the_old_bytes() {
+        let runs = vec![
+            (false, vec![fill(0x1000, 0x20)]),
+            (false, vec![fill(0x1040, 0x20), put(0x1000, 0xd0, 0x9000)]),
+        ];
+        assert!(forwards(&runs, |_, _| true).is_empty());
+    }
+
+    #[test]
+    fn the_last_copy_ahead_of_the_fill_is_the_one_taken() {
+        let runs = vec![(
+            false,
+            vec![put(0x1000, 0xd0, 0x9000), put(0x1000, 0xd0, 0xa000), fill(0x1010, 0x10)],
+        )];
+        assert_eq!(forwards(&runs, |_, _| true), vec![(0, 2, 0xa010)]);
+        // One that puts only part of the first leaves neither standing there.
+        let runs = vec![(
+            false,
+            vec![put(0x1000, 0xd0, 0x9000), put(0x1080, 0x10, 0xa000), fill(0x1000, 0x10)],
+        )];
+        assert!(forwards(&runs, |_, _| true).is_empty());
+    }
+
+    #[test]
+    fn anything_that_may_change_the_bytes_leaves_the_fill_alone() {
+        let alone = |steps: Vec<View>, skip_mutate: bool, blocked: bool| {
+            forwards(&[(skip_mutate, steps)], |_, _| blocked).is_empty()
+        };
+        assert!(alone(
+            vec![put(0x1000, 0xd0, 0x9000), View::Writes { at: 0x10cc, len: 4 }, fill(0x1000, 0xd0)],
+            false,
+            true
+        ));
+        assert!(alone(
+            vec![put(0x1000, 0xd0, 0x9000), View::Run, fill(0x1000, 0xd0)],
+            false,
+            true
+        ));
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), fill(0x1000, 0xe0)], false, true));
+        assert!(alone(
+            vec![View::Put { dst: 0x1000, len: 0xd0, from: None }, fill(0x1000, 0xd0)],
+            false,
+            true
+        ));
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), fill(0x1000, 0xd0)], true, true));
+        assert!(alone(vec![put(0x1000, 0xd0, 0x9000), fill(0x1000, 0xd0)], false, false));
+        assert!(!alone(
+            vec![put(0x1000, 0xd0, 0x9000), View::Writes { at: 0x10d0, len: 4 }, fill(0x1000, 0xd0)],
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn split_chunks_never_forward_across_cut() {
+        // Two lists: list 0 owns the Placed scratch at 0x9000, list 1 reads
+        // dst 0x1000. Together in a single flight, forwarding applies; when
+        // `cut_for` splits between list 0 and list 1 (cut = 1), running
+        // `forwards` per chunk after the split produces zero cross-chunk
+        // forwards so list 1 can never hold a dangling pointer into list 0's
+        // recycled scratch.
+        let runs = vec![
+            (false, vec![put(0x1000, 0xd0, 0x9000)]),
+            (false, vec![View::Other, fill(0x1000, 0xd0)]),
+        ];
+        assert_eq!(forwards(&runs, |_, _| true), vec![(1, 1, 0x9000)]);
+        let cut = 1;
+        assert!(forwards(&runs[..cut], |_, _| true).is_empty());
+        assert!(forwards(&runs[cut..], |_, _| true).is_empty());
     }
 }

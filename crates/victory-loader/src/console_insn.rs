@@ -36,8 +36,9 @@ thread_local! {
     /// The regions Windows last said are committed and writable (start, end), newest first,
     /// and the answers they gave since they were emptied.
     static WRITABLE: Cell<([(usize, usize); 4], u32)> = const { Cell::new(([(0, 0); 4], 0)) };
-    /// Faulting addresses and the code bytes found readable there, newest first.
-    static CODE: Cell<[(usize, usize); 8]> = const { Cell::new([(0, 0); 8]) };
+    /// Nesting depth of [`PATCHING`] held by the current thread so a crash
+    /// report firing inside a patching critical section never self-deadlocks.
+    static PATCHING_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Instructions emulated, the times Windows was asked about memory for them, and the bytes
@@ -83,12 +84,21 @@ pub(crate) fn jump(at: usize, to: usize) -> Option<[u8; 5]> {
     Some([0xe9, a, b, c, d])
 }
 
+/// Whether `cmp` is a supported `cmp rax, reg` (3 bytes, `reg != rax`) for
+/// [`clzero_stub`].
+fn clzero_cmp_supported(cmp: [u8; 3]) -> bool {
+    matches!(cmp[0], 0x48 | 0x4c)
+        && cmp[1] == 0x39
+        && cmp[2] & 0xc7 == 0xc0
+        && !(cmp[0] == 0x48 && cmp[2] == 0xc0)
+}
+
 /// The `clzero` loop of 12 bytes at `at` with plain stores, as code at `stub`: every register
 /// and the flags come out as the loop leaves them. `cmp` is its `cmp rax, reg` (3 bytes, the
 /// register not `rax`), `None` for another form. (The scratch register is saved on the stack
 /// and back before the compare, whose register it may be.)
 fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
-    if !matches!(cmp[0], 0x48 | 0x4c) || cmp[1] != 0x39 || cmp[2] & 0xc7 != 0xc0 || (cmp[0] == 0x48 && cmp[2] == 0xc0) {
+    if !clzero_cmp_supported(cmp) {
         return None;
     }
     let mut code = vec![
@@ -153,28 +163,51 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
-    if (at & 15) + 5 > 16 {
+    if (at & 15) + 5 > 16 || !clzero_cmp_supported([x, y, z]) {
         return false;
     }
+    // Strict global lock order across `victory-loader`: `PATCHING -> STUBS`.
+    let _one = lock_patching();
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
-    if stubs.is_none() {
-        *stubs = near(at).map(|place| (place, 0));
-    }
+    let fits = |&(place, used): &(usize, usize)| {
+        let stub = place + used;
+        let body = clzero_stub(at, stub, [x, y, z])?;
+        let jmp = jump(at, stub)?;
+        (used + body.len() <= STUBS_LEN).then_some((body, jmp))
+    };
+    let (body, jump) = if let Some(ready) = stubs.as_ref().and_then(fits) {
+        ready
+    } else {
+        let Some(place) = near(at) else {
+            return false;
+        };
+        let candidate = (place, 0);
+        let Some(ready) = fits(&candidate) else {
+            // Free the newly allocated unused block and leave the previous
+            // `STUBS` block intact (never free an already-published block).
+            // SAFETY: `place` was just allocated by `near(at)` and never published.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualFree(
+                    place as *mut _,
+                    0,
+                    windows_sys::Win32::System::Memory::MEM_RELEASE,
+                );
+            }
+            return false;
+        };
+        *stubs = Some(candidate);
+        ready
+    };
     let Some((place, used)) = stubs.as_mut() else {
         return false;
     };
     let stub = *place + *used;
-    let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
-        return false;
-    };
-    if *used + body.len() > STUBS_LEN {
-        return false;
-    }
-    // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
+    // SAFETY: inside the memory made for it, which nothing runs yet; then the
+    // title's code (`PATCHING` is held by `_one`).
     unsafe {
         std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
         *used += body.len().next_multiple_of(16);
-        patch(at, [a, b, c, d, e], jump)
+        patch_locked(at, [a, b, c, d, e], jump)
     }
 }
 
@@ -191,9 +224,55 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
     Some(u128::from_le_bytes(bytes))
 }
 
-/// One thread at a time changes code: a second one would take the first one's loosened
-/// protection for the page's own.
+/// One thread at a time reads or changes self-patched code across both
+/// `console_insn` and `sse4a`: a second thread cannot observe a torn
+/// `VirtualProtect` transition or race a slice/kernel read with `cmpxchg16b`.
+/// Strict lock order: `PATCHING` before any stub-table lock (`STUBS`).
 static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whether the current thread is actively acquiring, holding, or releasing
+/// [`PATCHING`]. Zero-window invariant: [`PATCHING_DEPTH`] is incremented
+/// before acquiring [`PATCHING`] and decremented only after releasing it.
+pub(crate) fn in_patching() -> bool {
+    PATCHING_DEPTH.with(|d| d.get() > 0)
+}
+
+pub(crate) struct PatchGuard {
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for PatchGuard {
+    fn drop(&mut self) {
+        // Release the mutex BEFORE clearing `PATCHING_DEPTH` so a fault on
+        // this thread never observes `in_patching() == false` while `PATCHING`
+        // is still held.
+        drop(self.guard.take());
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        PATCHING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn lock_patching() -> PatchGuard {
+    // Arm the RAII depth guard BEFORE locking `PATCHING` so there is zero
+    // window where `PATCHING` is held with `PATCHING_DEPTH == 0` (and any
+    // unwind while acquiring still decrements via `Drop`).
+    PATCHING_DEPTH.with(|d| d.set(d.get() + 1));
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    let mut guard = PatchGuard { guard: None };
+    guard.guard = Some(PATCHING.lock().unwrap_or_else(|e| e.into_inner()));
+    guard
+}
+
+/// Acquires [`PATCHING`] unless already held on this thread (used by crash-time
+/// `ReadProcessMemory` dumps to avoid self-deadlock if a fault occurs inside a
+/// patching critical section).
+pub(crate) fn lock_patching_reentrant() -> Option<PatchGuard> {
+    if in_patching() {
+        None
+    } else {
+        Some(lock_patching())
+    }
+}
 
 /// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
 /// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
@@ -202,6 +281,13 @@ static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// # Safety
 /// `at` is in code that stays mapped, and `patch` does for it what `was` does.
 unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
+    let _one = lock_patching();
+    // SAFETY: forwarded from caller with `PATCHING` held.
+    unsafe { patch_locked(at, was, patch) }
+}
+
+/// [`patch`] with [`PATCHING`] already held by the caller.
+unsafe fn patch_locked<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
@@ -209,7 +295,6 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
     if (at & 15) + N > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
         return false;
     }
-    let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
     let word = (at & !15) as *mut u128;
     let here = (at & 15)..(at & 15) + N;
     let mut old = 0u32;
@@ -324,16 +409,6 @@ mod sites {
     }
 }
 
-fn readable(va: usize, bytes: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
-    ASKED.fetch_add(1, Relaxed);
-    found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
-}
-
 fn writable(va: usize, bytes: usize) -> bool {
     writable_to(va, va + bytes) == Some(va + bytes)
 }
@@ -409,31 +484,23 @@ unsafe fn zero_through_fault(line: usize) -> bool {
 /// # Safety
 /// `ctx` is the faulting thread's context, from the exception being dispatched.
 pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
+    // A thread inside `PATCHING` is executing loader code, never title console
+    // instructions; bailing immediately prevents self-deadlock if `#UD` fires
+    // while `PATCHING` (or `STUBS`) is already held.
+    if in_patching() {
+        return 0;
+    }
     let rip = ctx.Rip as usize;
-    // The same few instructions fault again and again: their bytes are asked about once.
-    let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
-    let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
-        Some(&(_, n)) => n,
-        None => {
-            if !readable(rip, 1) {
-                return 0;
-            }
-            let n = (1..=16).rev().find(|&n| readable(rip, n)).unwrap_or(0);
-            if remembers() {
-                let mut known = known;
-                known.rotate_right(1);
-                known[0] = (rip, n);
-                CODE.with(|c| c.set(known));
-            }
-            n
-        }
-    };
-    // SAFETY: `n` bytes at `rip` are readable.
-    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
+    let mut buf = [0u8; 16];
+    let got = crate::sse4a::read_code_into(rip, &mut buf);
+    if got == 0 {
+        return 0;
+    }
+    let code = &buf[..got];
     let Some((what, len)) = decode::decode(code) else {
         // Synchronize with any concurrent in-place patch before checking
         // `PATCHED_SITES` so a sibling thread faulting mid-patch never slips through.
-        let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = lock_patching();
         if is_patched(rip) {
             return CONTINUE_EXECUTION;
         }
@@ -458,7 +525,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // nothing to write back on the PC: patched to NOPs, no exception next time
             use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
             let mut old = 0u32;
-            let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+            let _one = lock_patching();
             // SAFETY: the instruction's own bytes, made writable for the patch and restored.
             unsafe {
                 if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
@@ -717,6 +784,14 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+        // Rejected `cmp rax, rax` loop must return false before locking or
+        // allocating/replacing `STUBS`.
+        let before = *STUBS.lock().unwrap_or_else(|e| e.into_inner());
+        let bad_loop = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc0, 0x72, 0xf4];
+        // SAFETY: `patch_clzero` rejects `cmp rax, rax` before touching `at` or `STUBS`.
+        assert!(!unsafe { patch_clzero(0x1000_0000, &bad_loop) });
+        let after = *STUBS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(after, before, "rejected clzero loop must not allocate or replace STUBS");
     }
 
     #[test]
@@ -797,6 +872,9 @@ mod tests {
             RemoveVectoredExceptionHandler(handler);
             VirtualFree(base as _, 0, MEM_RELEASE);
         }
-        assert_eq!(run(&lone, base + 0x40, 0).0, 0);
+        // Use the permanently unmapped Windows low-64 KiB guard (`MEM_FREE`)
+        // rather than the just-released `base` so a parallel test's
+        // `VirtualAlloc` cannot reuse the address before this assertion runs.
+        assert_eq!(run(&lone, 0x1040, 0).0, 0);
     }
 }

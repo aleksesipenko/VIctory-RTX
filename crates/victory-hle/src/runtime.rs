@@ -269,6 +269,7 @@ pub fn use_console_timers() {
         timeBeginPeriod(1);
     }
     ahead_of_other_programs();
+    keep_resident();
 }
 
 /// The title's streaming thread runs below normal priority (on the console
@@ -287,6 +288,140 @@ fn ahead_of_other_programs() {
     // SAFETY: a plain process setting.
     let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
     tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkingSetPlan {
+    target: u64,
+    floor: u64,
+    hard: bool,
+    soft_fallback: u64,
+}
+
+#[cfg(windows)]
+fn working_set_plan(
+    total_phys: u64,
+    hard_env: Option<&str>,
+    min_mb_env: Option<&str>,
+) -> Option<WorkingSetPlan> {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const MIN_EXPLICIT: u64 = 64 * MIB;
+
+    if total_phys < 2 * GIB {
+        return None;
+    }
+    let hard = match hard_env.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => total_phys >= 24 * GIB,
+    };
+    let explicit_mb = min_mb_env.and_then(|v| v.trim().parse::<u64>().ok());
+    match explicit_mb {
+        Some(0) => None,
+        Some(mb) => {
+            let requested = mb.saturating_mul(MIB).max(MIN_EXPLICIT).min(total_phys);
+            Some(WorkingSetPlan {
+                target: requested,
+                floor: MIN_EXPLICIT.min(requested),
+                hard,
+                soft_fallback: (total_phys / 2).min(requested),
+            })
+        }
+        None => {
+            let target = if hard {
+                total_phys.saturating_sub(10 * GIB).max(total_phys / 2)
+            } else {
+                total_phys / 2
+            };
+            Some(WorkingSetPlan {
+                target,
+                floor: GIB,
+                hard,
+                soft_fallback: (total_phys / 2).min(target),
+            })
+        }
+    }
+}
+
+/// Keeps the process working set resident against Windows standby-list
+/// trimming (`VICTORY_HARD_WORKING_SET`, default on with >= 24 GiB RAM,
+/// `=0` for a soft minimum; `VICTORY_MIN_WORKING_SET_MB=0` disables).
+/// Provenance (GPL-3.0): kitty-core/Kitty6 a64da00.
+#[cfg(windows)]
+fn keep_resident() {
+    use windows_sys::Win32::System::Memory::{
+        QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE,
+        QUOTA_LIMITS_HARDWS_MIN_ENABLE, SetProcessWorkingSetSizeEx,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, PERFORMANCE_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const GIB: u64 = 1 << 30;
+    let mut perf = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: valid sized PERFORMANCE_INFORMATION struct.
+    if unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) } == 0 {
+        return;
+    }
+    let total_phys = (perf.PhysicalTotal as u64).saturating_mul(perf.PageSize as u64);
+    let hard_env = std::env::var("VICTORY_HARD_WORKING_SET").ok();
+    let min_mb_env = std::env::var("VICTORY_MIN_WORKING_SET_MB").ok();
+    let Some(plan) = working_set_plan(total_phys, hard_env.as_deref(), min_mb_env.as_deref())
+    else {
+        return;
+    };
+    let max = total_phys;
+    let try_set = |mut want: u64, floor: u64, is_hard: bool| -> Option<u64> {
+        let flags = if is_hard {
+            QUOTA_LIMITS_HARDWS_MIN_ENABLE
+        } else {
+            QUOTA_LIMITS_HARDWS_MIN_DISABLE
+        } | QUOTA_LIMITS_HARDWS_MAX_DISABLE;
+        while want >= floor {
+            // SAFETY: plain process working-set quota setting.
+            let ok = unsafe {
+                SetProcessWorkingSetSizeEx(GetCurrentProcess(), want as usize, max as usize, flags)
+            } != 0;
+            if ok {
+                return Some(want);
+            }
+            if want == floor {
+                break;
+            }
+            let next = if want > 2 * GIB {
+                want.saturating_sub(2 * GIB)
+            } else {
+                (want / 4) * 3
+            };
+            want = if next < floor { floor } else { next };
+        }
+        None
+    };
+    if let Some(min_bytes) = try_set(plan.target, plan.floor, plan.hard) {
+        tracing::info!(
+            min_mb = min_bytes >> 20,
+            hard = plan.hard,
+            "minimum working set configured (VICTORY_HARD_WORKING_SET=0: soft; VICTORY_MIN_WORKING_SET_MB=0: off)"
+        );
+        return;
+    }
+    if plan.hard && let Some(min_bytes) = try_set(plan.soft_fallback, plan.floor, false) {
+        tracing::warn!(
+            min_mb = min_bytes >> 20,
+            "hard minimum working set refused; fell back to soft minimum"
+        );
+        return;
+    }
+    tracing::warn!(
+        floor_mb = plan.floor >> 20,
+        "Windows refused minimum working set down to floor"
+    );
 }
 
 #[cfg(test)]
@@ -327,5 +462,46 @@ mod tests {
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_small_working_set_never_inflates_fallback() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let phys32 = 32 * GIB;
+        // Default on 32 GiB: hard 22 GiB, soft fallback 16 GiB, floor 1 GiB.
+        assert_eq!(
+            working_set_plan(phys32, None, None),
+            Some(WorkingSetPlan {
+                target: 22 * GIB,
+                floor: GIB,
+                hard: true,
+                soft_fallback: 16 * GIB,
+            })
+        );
+        // Explicit sub-1 GiB request (256 MiB): honored directly, floor 64 MiB,
+        // soft fallback capped at 256 MiB (never inflated to 16 GiB).
+        assert_eq!(
+            working_set_plan(phys32, Some("1"), Some("256")),
+            Some(WorkingSetPlan {
+                target: 256 * MIB,
+                floor: 64 * MIB,
+                hard: true,
+                soft_fallback: 256 * MIB,
+            })
+        );
+        // Explicit 4 GiB request on 32 GiB: soft fallback never exceeds 4 GiB.
+        assert_eq!(
+            working_set_plan(phys32, Some("1"), Some("4096")),
+            Some(WorkingSetPlan {
+                target: 4 * GIB,
+                floor: 64 * MIB,
+                hard: true,
+                soft_fallback: 4 * GIB,
+            })
+        );
+        // Explicit 0 disables working-set pinning.
+        assert_eq!(working_set_plan(phys32, Some("1"), Some("0")), None);
     }
 }

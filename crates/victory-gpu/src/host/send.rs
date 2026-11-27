@@ -164,7 +164,13 @@ static SPARE: Mutex<SparePool<Memory>> = Mutex::new(SparePool::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() {
+        256 << 20
+    } else if crate::residency::limited_host_ram() {
+        192 << 20
+    } else {
+        512 << 20
+    }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -217,6 +223,12 @@ pub(super) fn finish_memory(memory: Memory, reusable: bool) {
         spare.finish(memory, true, kept(), |m| m.size)
     };
     drop(evicted);
+}
+
+/// Drops all idle submission upload buffers outside the pool lock (under host RAM pressure).
+pub(super) fn trim() {
+    let dropped = std::mem::take(&mut SPARE.lock().unwrap_or_else(|e| e.into_inner()).items);
+    drop(dropped);
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,

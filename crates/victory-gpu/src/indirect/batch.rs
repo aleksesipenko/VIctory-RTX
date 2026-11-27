@@ -268,6 +268,7 @@ pub(super) fn record(
     budget: u64,
     sources: [u64; SOURCES],
     jobs: u64,
+    wait: bool,
 ) {
     let after = transition(
         dst,
@@ -277,10 +278,13 @@ pub(super) fn record(
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
+        // The wait for earlier shader writes, where the list may have
+        // written since its last ([`super::Waits`]).
+        let first = [
             uav_barrier(),
             transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        ];
+        l.ResourceBarrier(&first[usize::from(!wait)..]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {

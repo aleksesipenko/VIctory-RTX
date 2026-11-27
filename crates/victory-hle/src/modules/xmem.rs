@@ -91,15 +91,27 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let alignment = if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
+        2 * MIB
+    } else {
+        0
+    };
+    virtual_alloc(base, size, kind, flags, protect, alignment)
+}
+
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    alignment: usize,
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
-        },
+        Alignment: alignment,
     };
     let asked = protect;
     let mut protect = match protect & HOST_PROTECTION {
@@ -254,14 +266,20 @@ pub extern "system" fn XMemVirtualQuery(
 // from 2), then the memory type, then bit 33: a 32-bit address.
 const ALIGNMENT_SHIFT: u64 = 24;
 const ALLOC_32BIT: u64 = 1 << 33;
-/// Our block header: the block's size and alignment, just below the
-/// pointer handed out.
+/// Our block header: the block's size and the pointer's offset in it,
+/// just below the pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
+/// The alignment the host heap gives without padding of its own.
+const HEAP_ALIGN: usize = 16;
 
-fn layout(size: usize, attributes: u64) -> Option<Layout> {
-    // An alignment of at least 16 leaves room for the header.
+/// The alignment `attributes` ask for (at least 16, which leaves room for
+/// the header), and the host block for `size` bytes at it: room for the
+/// header and the alignment, at the host heap's own alignment (avoids
+/// double-padding over-aligned allocations; GPL-3.0 provenance: Marvisak/VIctory #2022).
+fn layout(size: usize, attributes: u64) -> Option<(usize, Layout)> {
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
-    Layout::from_size_align(size.checked_add(align)?, align).ok()
+    let layout = Layout::from_size_align(size.checked_add(align)?, HEAP_ALIGN).ok()?;
+    Some((align, layout))
 }
 
 type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -325,15 +343,20 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f);
+        // `MEM_ADDRESS_REQUIREMENTS::Alignment` must be 0 or >= 64 KiB; 0 already
+        // aligns to 64 KiB (GPL-3.0 provenance: Marvisak/VIctory #2184).
+        let alignment = if align > PAGE { align } else { 0 };
+        return virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            alignment,
         );
     }
-    let Some(layout) = layout(size, attributes) else {
+    let Some((align, layout)) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
@@ -346,13 +369,14 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
-    // SAFETY: the block holds the alignment (at least the header) and then
-    // `size` bytes.
+    let offset = (block as usize + HEADER).next_multiple_of(align) - block as usize;
+    // SAFETY: the block holds the header, the step up to `align` (at most
+    // `align` bytes together) and then `size` bytes.
     unsafe {
-        let user = block.add(layout.align());
+        let user = block.add(offset);
         user.sub(HEADER)
             .cast::<[usize; 2]>()
-            .write([layout.size(), layout.align()]);
+            .write([layout.size(), offset]);
         user.cast()
     }
 }
@@ -370,10 +394,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             return;
         }
         let user = address.cast::<u8>();
-        let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let [size, offset] = user.sub(HEADER).cast::<[usize; 2]>().read();
         dealloc(
-            user.sub(align),
-            Layout::from_size_align_unchecked(size, align),
+            user.sub(offset),
+            Layout::from_size_align_unchecked(size, HEAP_ALIGN),
         );
     }
 }
@@ -514,10 +538,31 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Placeholders that are some view's own, left by its unmapping: address
     /// and length. The title may have joined one with others since.
-    holes: HashMap<usize, usize>,
+    holes: BTreeMap<usize, usize>,
 }
 
 impl Physical {
+    /// Removes any tracked hole overlapping `[start, end)` (GPL-3.0 provenance:
+    /// maren-halv/VIctory-DXR 63c4b64).
+    fn clear_holes(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let first = self
+            .holes
+            .range(..=start)
+            .next_back()
+            .filter(|&(&base, &len)| base.saturating_add(len) > start)
+            .map(|(&base, _)| base);
+        let hit: Vec<usize> = first
+            .into_iter()
+            .chain(self.holes.range(start + 1..end).map(|(&base, _)| base))
+            .collect();
+        for base in hit {
+            self.holes.remove(&base);
+        }
+    }
+
     /// What the page at `at` shows.
     fn slice_at(&self, at: usize) -> Option<Slice> {
         self.views
@@ -1524,6 +1569,12 @@ impl Op {
                 )
             });
             if gone == 0 {
+                tracing::warn!(
+                    address = format_args!("{:#x}", self.at),
+                    len = PAGE,
+                    error = %std::io::Error::last_os_error(),
+                    "unmapping physical pages failed"
+                );
                 return false;
             }
         }
@@ -1552,7 +1603,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                     shown_mut().forget(op.at, size, &slice);
                 }
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
-                physical.holes.remove(&op.at);
+                physical.clear_holes(op.at, op.at + PAGE);
                 (op.had, op.own) = (true, lean());
             }
             // Part of a larger view.
@@ -1564,13 +1615,17 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
         if op.had {
             continue;
         }
-        op.own = physical.holes.remove(&op.at) == Some(PAGE) && lean();
-        if op.slice.is_some() && !op.own {
-            // Cut out of a larger placeholder here, not side by side: a
-            // thread that maps a piece while others cut the same one can
-            // fail.
-            split(op.at, PAGE);
-            op.own = true;
+        if op.slice.is_some() {
+            let exact_hole = physical.holes.get(&op.at) == Some(&PAGE);
+            physical.clear_holes(op.at, op.at + PAGE);
+            op.own = exact_hole && lean();
+            if !op.own {
+                // Cut out of a larger placeholder here, not side by side: a
+                // thread that maps a piece while others cut the same one can
+                // fail.
+                split(op.at, PAGE);
+                op.own = true;
+            }
         }
     }
     let done = pool::all(ops);
@@ -1585,6 +1640,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 physical.views.insert(op.at, (PAGE, slice));
             }
             None if op.had && done => {
+                physical.clear_holes(op.at, op.at + PAGE);
                 physical.holes.insert(op.at, PAGE);
             }
             _ => ok &= done,
@@ -1716,7 +1772,9 @@ mod pool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    let own = physical.holes.remove(&base) == Some(len) && lean();
+    let exact_hole = physical.holes.get(&base) == Some(&len);
+    physical.clear_holes(base, base + len);
+    let own = exact_hole && lean();
     if !show(base, len, &slice, own) {
         return false;
     }
@@ -1770,10 +1828,26 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         view = map_view();
     }
     if view.Value as usize != base {
+        let error = std::io::Error::last_os_error();
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying our own address space into an initialized struct.
+        let queried = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                base as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } != 0;
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,
-            error = %std::io::Error::last_os_error(),
+            own,
+            %error,
+            mbi_state = format_args!("{:#x}", if queried { mbi.State } else { 0 }),
+            mbi_type = format_args!("{:#x}", if queried { mbi.Type } else { 0 }),
+            mbi_region = if queried { mbi.RegionSize } else { 0 },
+            mbi_protect = format_args!("{:#x}", if queried { mbi.Protect } else { 0 }),
             "mapping physical pages failed (not a placeholder?)"
         );
         return false;
@@ -1888,6 +1962,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         });
+        physical.clear_holes(at, at + size);
         if gone != 0 && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }

@@ -189,6 +189,19 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Drops pooled backing lists down to `keep` (via `list_release` so refcounted
+/// `Object` and DXR fields clean up properly).
+pub(crate) fn trim_backs(keep: usize) {
+    let gone: Vec<usize> = {
+        let mut backs = held(&BACKS);
+        let n = backs.len().saturating_sub(keep);
+        backs.drain(..n).collect()
+    };
+    for ptr in gone {
+        super::list_release(ptr as This);
+    }
+}
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -466,6 +479,7 @@ fn start() {
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
+            crate::cores::prioritize("victory-list", crate::cores::Role::Translator);
             crate::queue::no_drain_here();
             loop {
                 let recording = {
@@ -759,8 +773,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    if super::barrier_groups_need_uav(count, groups) {
+        front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+    }
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };

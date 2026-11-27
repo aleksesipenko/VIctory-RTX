@@ -26,7 +26,7 @@
 //! it has nothing). `VICTORY_VIEW_GUARD=0`: each address for itself, as
 //! before.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
@@ -56,7 +56,11 @@ fn parts_on() -> bool {
 
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard {
+            written: BTreeMap::new(),
+            max_written: 0,
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -68,7 +72,11 @@ impl Shard {
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
-        self.written.insert(page, before.max(now));
+        let latest = before.max(now);
+        self.written.insert(page, latest);
+        if latest > self.max_written {
+            self.max_written = latest;
+        }
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -133,6 +141,9 @@ struct Notes([RwLock<Shard>; SHARDS]);
 struct Shard {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Largest asking recorded in `written`, for O(1) clean-shard skipping
+    /// (GPL-3.0 provenance: maren-halv/VIctory-DXR 79a92c7).
+    max_written: u64,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -170,22 +181,37 @@ impl Notes {
         self.read(shard_of(page)).parts_since(page, taken)
     }
 
-    /// The notes of pages `[first, last)` in page order, `each` of them
-    /// until it says no: whether it never did. A part at a time.
+    /// The notes of pages `[first, last)`, one shard at a time, until the
+    /// predicate says no. Large ranges visit each shard once without sorting
+    /// (GPL-3.0 provenance: TaynanGT/Vice-Tay #169).
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
         match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+            Some(mut pieces) => pieces.all(|(from, to)| {
                 let s = self.read(shard_of(from));
                 s.written.range(from..to).all(|(&p, &w)| each(p, w))
             }),
-            None => {
-                let mut all: Vec<(usize, u64)> = Vec::new();
-                for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
-                }
-                all.sort_unstable();
-                all.into_iter().all(|(p, w)| each(p, w))
-            }
+            None => (0..SHARDS).all(|shard| {
+                self.read(shard).written.range(first..last).all(|(&p, &w)| each(p, w))
+            }),
+        }
+    }
+
+    /// Order-independent predicate over notes in `[first, last)`, skipping any
+    /// shard whose `max_written <= floor` in O(1) without touching its BTreeMap
+    /// (GPL-3.0 provenance: maren-halv/VIctory-DXR 79a92c7).
+    fn all_below(&self, first: usize, last: usize, floor: u64, mut pred: impl FnMut(usize, u64) -> bool) -> bool {
+        if first >= last {
+            return true;
+        }
+        match pieces(first, last) {
+            Some(mut pieces) => pieces.all(|(from, to)| {
+                let s = self.read(shard_of(from));
+                s.max_written <= floor || s.written.range(from..to).all(|(&p, &w)| w <= floor || pred(p, w))
+            }),
+            None => (0..SHARDS).all(|shard| {
+                let s = self.read(shard);
+                s.max_written <= floor || s.written.range(first..last).all(|(&p, &w)| w <= floor || pred(p, w))
+            }),
         }
     }
 
@@ -196,6 +222,9 @@ impl Notes {
             out.push((p, w));
             true
         });
+        if pieces(first, last).is_none() {
+            out.sort_unstable();
+        }
         out
     }
 
@@ -230,16 +259,20 @@ impl Notes {
 
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
-/// is looked at once).
-fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
-    if first >= last {
-        return Some(Vec::new());
-    }
-    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
-    if b - a >= 4 * SHARDS {
+/// is looked at once). Zero-alloc iterator (GPL-3.0 provenance: TaynanGT/Vice-Tay #169).
+fn pieces(first: usize, last: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+    let (a, end) = if first < last {
+        (first >> SHARD_SHIFT, ((last - 1) >> SHARD_SHIFT) + 1)
+    } else {
+        (0, 0)
+    };
+    if end - a > 4 * SHARDS {
         return None;
     }
-    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+    Some((a..end).map(move |piece| {
+        let step = 1 << SHARD_SHIFT;
+        (first.max(piece * step), last.min((piece + 1).saturating_mul(step)))
+    }))
 }
 
 /// Parts of [`Notes`] held ([`Notes::hold`]).
@@ -272,7 +305,6 @@ impl Held<'_> {
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
         match pieces(first, last) {
             Some(pieces) => pieces
-                .into_iter()
                 .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
                 .collect(),
             None => {
@@ -1381,8 +1413,21 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+    let floor = if ranged != 0 {
+        ranged
+    } else {
+        let mut min_taken = u64::MAX;
+        for &at in taken {
+            if at == 0 {
+                return false;
+            }
+            if at < min_taken {
+                min_taken = at;
+            }
+        }
+        min_taken
+    };
+    j.notes.all_below(first, last, floor, |page, write| write <= taken[page - first].max(ranged))
 }
 
 /// [`nothing_new`] with a per-page effective stamp callback (used when a
@@ -1398,12 +1443,17 @@ pub(crate) fn nothing_new_by(start: usize, end: usize, mut taken_at: impl FnMut(
     if !known && !j.ahead.holds(first, last) {
         return false;
     }
+    let mut floor = u64::MAX;
     for page in first..last {
-        if taken_at(page) == 0 {
+        let at = taken_at(page);
+        if at == 0 {
             return false;
         }
+        if at < floor {
+            floor = at;
+        }
     }
-    j.notes.each(first, last, |page, write| write <= taken_at(page))
+    j.notes.all_below(first, last, floor, |page, write| write <= taken_at(page))
 }
 
 impl Tracked {
@@ -2347,9 +2397,12 @@ struct Guards {
     absent: Blocks,
     /// Of those, the ones in placeholders ([`known_holes`]).
     held: Blocks,
-    /// Blocks that were absent and turned out to be other memory than views
-    /// when something was there again: never guarded, copied every time.
-    foreign: BTreeSet<usize>,
+    /// Blocks of other memory than views in a range asked about as a view:
+    /// what was absent and turned out so when something was there again, and
+    /// what a query found so before a block was first guarded
+    /// ([`protect_here`]). Never guarded, copied every time
+    /// (GPL-3.0 provenance: Belobug/VIctory-Belobug-AMD #478).
+    foreign: Blocks,
     /// Blocks (first, past the last) the kernel writes now
     /// ([`kernel_writing`]), and blocks the runtime has unmapped in a change
     /// not yet done ([`title_memory_unmapping`]). Not in the sets above, and
@@ -2471,7 +2524,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     clean: Blocks::new(),
     absent: Blocks::new(),
     held: Blocks::new(),
-    foreign: BTreeSet::new(),
+    foreign: Blocks::new(),
     kernel: Vec::new(),
     changing: Vec::new(),
     aliased: Blocks::new(),
@@ -2822,7 +2875,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if cover(&g, block, block + 1, None) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             protect(&g, from, to);
@@ -2846,7 +2899,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::time::Duration) -> Vec<usize> {
     if !came.is_empty() {
         // (Changes no block's protection: the sets of what is where.)
-        let mut g = guards_timed();
+        let g = guards_timed();
         for &(block, view) in came {
             if g.absent.remove(block) && !view {
                 g.foreign.insert(block);
@@ -2886,7 +2939,7 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
             if g.protected.contains(block) && !g.clean.contains(block) && cover(&g, block, block + 1, Some(&mut claims)) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             protect_claimed(&g, from, to);
@@ -3079,8 +3132,90 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     false
 }
 
+/// What Windows says is at a block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum There {
+    /// A view: committed, mapped from a section.
+    View,
+    /// Nothing: a reservation (a placeholder), or free.
+    Hole,
+    /// Other memory, committed: the title's own heaps, the runtime's, a
+    /// library's, a thread's stack.
+    Other,
+}
+
+/// What is at `block` ([`There`]), by its first page, and the end (exclusive)
+/// of the whole blocks from `block` on that it holds for (`block` itself if the
+/// region ends within it), with its Windows memory type and protection.
+/// Provenance (GPL-3.0): Belobug/VIctory-Belobug-AMD #478.
+fn there(block: usize) -> (There, usize, u32, u32) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return (There::Other, block, 0, 0);
+    }
+    let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).max(block);
+    let what = match info.State {
+        MEM_COMMIT if info.Type == MEM_MAPPED => There::View,
+        MEM_RESERVE | MEM_FREE => There::Hole,
+        _ => There::Other,
+    };
+    (what, end, info.Type, info.Protect)
+}
+
 /// [`protect`] for one range, without the other views of its pages.
+/// Queries each region with [`there`] first so committed non-`MEM_MAPPED`
+/// memory (private heaps, DLLs, thread stacks adjacent to a 4 MiB loose window)
+/// is never made read-only (GPL-3.0 provenance: Belobug/VIctory-Belobug-AMD #478).
 fn protect_here(g: &Guards, from: usize, to: usize) {
+    let mut block = from;
+    while block < to {
+        let (what, whole, kind, protection) = there(block);
+        let whole = whole.min(to);
+        let until = whole.max(block + 1);
+        match what {
+            There::View => protect_views(g, block, until),
+            There::Hole => {
+                for block in block..whole {
+                    g.absent.insert(block);
+                    if known_holes() && placeholder(block) {
+                        g.held.insert(block);
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                tally(9, 1);
+            }
+            There::Other => {
+                (block..until).for_each(|block| {
+                    g.foreign.insert(block);
+                });
+                not_a_view(block, until, kind, protection);
+            }
+        }
+        block = until;
+    }
+}
+
+fn not_a_view(from: usize, to: usize, kind: u32, protection: u32) {
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        tracing::info!(
+            at = format_args!("{:#x}", from * BLOCK),
+            bytes = (to - from) * BLOCK,
+            kind = format_args!("{kind:#x}"),
+            protection = format_args!("{protection:#x}"),
+            "memory in a range asked about as a view is no view (private memory, an image, a thread's stack): the guards leave it as it is, and it is copied every time"
+        );
+    }
+}
+
+/// [`protect_here`] for blocks Windows just reported as `MEM_MAPPED` views.
+fn protect_views(g: &Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -3773,9 +3908,9 @@ pub fn title_memory_freed(at: usize, len: usize) {
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
         forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
     }
-    let mut g = guards();
+    let g = guards();
     let first = at / BLOCK;
-    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
+    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
     };
@@ -3794,9 +3929,9 @@ pub fn title_memory_freed(at: usize, len: usize) {
             PUBLISHED.clear(block);
         }
     }
-    let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
+    let foreign: Vec<usize> = g.foreign.range(first..end).collect();
     for block in foreign {
-        g.foreign.remove(&block);
+        g.foreign.remove(block);
     }
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
@@ -3844,7 +3979,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+    let g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
@@ -3853,9 +3988,9 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
             PUBLISHED.clear(block);
         }
     }
-    let foreign: Vec<usize> = g.foreign.range(range.clone()).copied().collect();
+    let foreign: Vec<usize> = g.foreign.range(range.clone()).collect();
     for block in foreign {
-        g.foreign.remove(&block);
+        g.foreign.remove(block);
     }
     let aliased: Vec<usize> = g.aliased.range(range).collect();
     for block in aliased {
@@ -5122,7 +5257,7 @@ mod tests {
     /// The set of blocks against another of the same.
     #[test]
     fn blocks_are_a_set() {
-        let (set, mut other) = (Blocks::new(), BTreeSet::new());
+        let (set, mut other) = (Blocks::new(), std::collections::BTreeSet::new());
         let mut seed = 1u64;
         let mut next = |n: usize| {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -5829,8 +5964,16 @@ mod port7_tests {
         assert_eq!(shards_of(P - 1, P + 1), 0b11);
         assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
         assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
-        assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
-        assert_eq!(pieces(0, 1 << 40), None);
+        assert_eq!(
+            pieces(P - 2, 2 * P + 3).unwrap().collect::<Vec<_>>(),
+            [(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]
+        );
+        assert_eq!(pieces(7, 4).unwrap().next(), None);
+        assert_eq!(
+            pieces(usize::MAX - 1, usize::MAX).unwrap().next(),
+            Some((usize::MAX - 1, usize::MAX))
+        );
+        assert!(pieces(0, 1 << 40).is_none());
         let notes = Notes::new();
         let mut want: BTreeMap<usize, u64> = BTreeMap::new();
         let mut seed = 7;
