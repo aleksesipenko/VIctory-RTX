@@ -21,15 +21,30 @@ by the game's developer or publisher.
 | **Phase 0–1: DXIL SM 6.6 `RayQuery` Emitter & Ada Oracle** | Verified on HW | `f64` CPU oracle + SW BVH + Ada DXR 3-way parity on 65,536 rays; **`3.75×` Ada RT-Core speedup** (`32.77 µs` → `8.70 µs`), `0` D3D12 Debug Layer errors |
 | **Phase 2: Hardened DXR 1.1 Sidecar (`XboxBvhBuilder.dll`)** | Verified on HW | Submission-ordered BLAS/TLAS/refit/compaction (`VICTORY_THIN=1` safe), 7-export ABI verification, `12.5 GiB` VRAM ceiling, `0` Debug Layer errors |
 | **Phase 2.5–2.6: Community Optimization & Stability Pack** | Integrated | 4 KiB small-texture placement, 512 MiB scratch reuse, `LOOSE.read()` lock, async texback, `TEXTURE_NO_WAIT=2`, Intel `CLZERO` guard fault, 2K UI `display_size()`, thin LTO |
-| **Phase 3: DXR 1.1 `RayQuery` Lifter & `#854` Paired Wave64** | Merged (`opt-in`) | All 64 corpus RT shaders pass `dxil.dll` + Ada PSO (`0` Debug Layer errors); paired Wave64 hardware-verified on 64/64 & 45/45 lanes; expanding conservative `Bvh64` admission coverage before live DXR default |
+| **Phase 3: DXR 1.1 `RayQuery` Lifter & `#854` Paired Wave64** | Verified live (`opt-in`) | All 64 corpus RT shaders pass `dxil.dll` + Ada PSO (`0` Debug Layer errors); paired Wave64 hardware-verified on 64/64 & 45/45 lanes; live DXR 1.1 runs `10+` min with `0` TDRs |
+| **Phase 4: Freeze Elimination, In-Place TLAS, Wave32 Shader & Ambient Pack** | Verified live (`ad80439`) | `99.98%` in-place TLAS reuse (`0` stale TLASes), `2,542 ms` -> `166.5 ms` steady max frametime (`7.4×` lower worst-case stall), `VSH3` (`TRANSLATOR_VERSION=6`) Wave32 shader pack, `VICTORY_AMBIENT_FLOOR` + `VICTORY_AMBIENT_MAGENTA`, clamped SRV/UAV texture bounds, fail-closed compressed XDXR BLAS indices, opt-in `0x218` compute gate |
 
 ### Reference Hardware & Verified Baseline
 
-- **Test rig:** Intel Core i5-14600K, **NVIDIA GeForce RTX 4070 Ti SUPER 16 GB** (Ada `sm_89`, Wave32, DXR 1.1), 32 GB RAM, Windows 11 x64.
-- **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`, RT-off baseline, pre-Phase 2.5/2.6):**
-  `21.8 avg / 30.3 max FPS` | `10.09 GB VRAM` | `23.81 GB Private RAM` | `0 TDRs` *(fresh Run 24/25 measurements post-Phase 2.5–3 in progress)*.
+- **Test rig:** Intel Core i5-14600K (14C/20T), **NVIDIA GeForce RTX 4070 Ti SUPER 16 GB** (Ada `sm_89`, Wave32, DXR 1.1), 32 GB RAM, Windows 11 x64.
 - **Ada RT-Core microbenchmark (Phase 1, 65,536 rays):**
   `32.768 µs` software BVH → `8.704 µs` hardware DXR 1.1 (**`3.751×` speedup**, 100% 3-way parity, `0` D3D12 Debug Layer errors).
+
+#### Per-Scene Verified FPS (RTX 4070 Ti SUPER, Series X Profile, `release --features dlss`)
+
+| Mode & Resolution | Tested Scene | FPS (Avg / Range) | Frametime | Draws / Frame | VRAM / Priv RAM | Notes |
+|---|---|---|---|---|---|---|
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RT-Off** *(Run 21b)* | Opening credits & character close-up | **`21.8 avg`** (`21.3 p50`, up to `30.3 max`) | `45.9 ms avg` | `1,425–3,162` | `10.09 GB` / `23.81 GB` | Clean faces/skin/hair, `0` TDRs, `0` DLSS fails |
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RT-Off** *(Run 21b)* | Neon bar interior (volumetrics) | **`24.0 FPS`** | `42.3 ms` | `2,846` | `10.09 GB` / `23.81 GB` | Clean neon glow & palm foliage |
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RT-Off** *(Run 21b)* | Heavy night street / vehicle cutscene | **`12.9–21.2 FPS`** | `47.3–77.6 ms` | `2,718–3,738` | `10.09 GB` / `23.81 GB` | Peak `5,307 draws/frame` |
+| **1080p DLSS 4.5 Preset M (`1280×720 → 1920×1080`), RT-Off** *(Run 20b)* | Opening arrest, car interior & credits | **`22.5 avg`** (`23.6 p50`, up to `31.5 max`) | `44.4 ms avg` (`8.4 ms` GPU) | up to `5,896` | `10.58 GB` / `23.93 GB` | `0` refused PSOs, `0` TDRs |
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RTX ON `dxr`** *(Run 26, `ad80439`)* | Early interior / opening cutscene | **`19.7–21.2 FPS`** | `47.1–50.7 ms` | `1,031–3,100` | `9.28 GB` / `23.42 GB` | `ambient.rs` (`floor=0.02`, `magenta=1`), `0` errors |
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RTX ON `dxr`** *(Run 26, `ad80439`)* | Sunset cell window interior (backlit hair) | **`13.5–13.9 FPS`** | `72.2–74.1 ms` | `4,438–4,531` | `9.28 GB` / `23.42 GB` | Readable dark-room detail, `100%` GPU, `61 °C`, `125 W` |
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RTX ON `dxr`** *(Run 26, `ad80439`)* | Multi-character office interior | **`11.5–12.3 FPS`** | `81.4–86.8 ms` | `6,268–6,946` | `9.46 GB` / `23.66 GB` | Crisp interior lighting; known mesh-shader head & XDXR BLAS character darkening* |
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RTX ON `dxr`** *(Run 26, `ad80439`)* | Volumetric corridor & heavy cellblock | **`12.2–14.8 FPS`** *(peaks `6.7–13.1` @ `7k–10.7k` draws)* | `67.4–82.3 ms` *(max `166.5 ms` steady)* | `3,192–10,676` | `9.58 GB` / `24.03 GB` | Zero multi-second freezes (down from `2,542.7 ms` in Run 25e) |
+| **2K DLSS 4.5 Preset M (`1920×1080 → 2560×1440`), RTX ON `dxr`** *(Run 26, `ad80439`)* | Cellblock bars & yard exterior transition | **`12.8–16.2 FPS`** | `61.9–78.3 ms` | `1,908–3,697` | `9.78 GB` / `24.36 GB` | `99.98%` in-place TLAS reuse (`21,100/21,104`), `0` stale TLASes, `0` TDRs |
+
+*\*Run 26 post-warmup aggregate across `53` 5-second intervals (`avg 5,480 / max 10,676 draws/frame`): `11.6 avg / 11.9 p50 / 16.2 max FPS`, `93.4 ms avg / 343.0 ms max` (`88.6 ms avg / 166.5 ms max` steady). Remaining RTX-on visual caveat: `52` mesh shaders (`the mesh group input read per lane is not supported`) cause missing character head geometry in interior scenes and `81.5%` compressed XDXR `R16_TYPELESS` BLASes are currently skipped fail-closed (preventing GPU hangs while leaving some character clothing dark).*
 
 ---
 
@@ -40,17 +55,17 @@ by the game's developer or publisher.
 - **2K / 1080p UI Layout Fix (`dxgi.rs`):** `display_size()` falls back to `VICTORY_OUTPUT` when `VICTORY_DISPLAY_MODE` is unset so Settings menus do not clip at 4K layout (`Rubenpannen/VIctory-RTX5070 9f2fd8c`).
 
 ### Hardware DXR 1.1 Ray Tracing (Opt-In)
-- **Sidecar (`crates/victory-gpu/src/dxr.rs`, `crates/victory-hle/src/modules/bvh_builder.rs`):** Intercepts `XboxBvhBuilder.dll` batched builds, compactions, and rehydrations; maintains host BLAS/TLAS on `DIRECT` with strict VRAM capping (`VICTORY_DXR_VRAM_CAP_MB=12800`), `NaN` active↔inactive refit safety, `missing_blas` and `empty_tlas_fallbacks` telemetry, and `D3D12_OPTIONS19` 1M-heap probing.
-- **Shader Lifter (`crates/victory-shader/src/emit/rayquery_lift.rs`, `rayquery_lower.rs`):** Lifts XDXR GFX10 BVH traversal loops (`Bvh64` & `Bvh32SharedTlas`) into SM 6.6 `RayQuery` with `#854` paired-lane Wave64 isolation (`VICTORY_NATIVE_RT=1`, optional `VICTORY_NATIVE_RT_ANYHIT=1`, `VICTORY_NATIVE_RT_FILTER=<hash>`, `VICTORY_NATIVE_RT_TWO_PASS=1`, `VICTORY_NATIVE_RT_FBT_TWOPASS=1`).
+- **Sidecar (`crates/victory-gpu/src/dxr.rs`, `crates/victory-hle/src/modules/bvh_builder.rs`):** Intercepts `XboxBvhBuilder.dll` batched builds, compactions, and rehydrations; maintains host BLAS/TLAS on `DIRECT` with in-place 4 MiB TLAS reuse (`PinSlot` DAG, `99.98%` hit rate), pooled `inst`/`Table` resources, `ScratchBatcher`, `patch.hlsl` groupshared reduction, fail-closed rejection of compressed XDXR `R16_TYPELESS`/`R32_TYPELESS` index streams, strict VRAM capping (`VICTORY_DXR_VRAM_CAP_MB=12800`), `NaN` active↔inactive refit safety, and `D3D12_OPTIONS19` 1M-heap probing.
+- **Shader Lifter & Wave32 Pack (`crates/victory-shader/`, `VSH3` `TRANSLATOR_VERSION=6`):** Lifts XDXR GFX10 BVH traversal loops (`Bvh64` & `Bvh32SharedTlas`) into SM 6.6 `RayQuery` with `#854` paired-lane Wave64 isolation (`VICTORY_NATIVE_RT=1`, optional `VICTORY_NATIVE_RT_REFIT=1`, `VICTORY_NATIVE_RT_CULL_MASK`, `VICTORY_NATIVE_RT_ANYHIT=1`, `VICTORY_NATIVE_RT_FILTER=<hash>`), plus Wave32/NVIDIA `DX10_CLAMP`, LDS bounds guard, half-wave `ds_bpermute_b32`, `ForceEarlyDepthStencil`, and opt-in `VICTORY_SHADER_FAST_BITS=24`.
 - **RT-Off Fallback:** Defaults to `0` overhead (`VICTORY_NATIVE_RT` unset) with bit-identical RT-off shader output.
 
 ### VRAM, RAM, Frame Pacing & Stability
 | Area | What's Integrated | Provenance (GPL-3.0) |
 |---|---|---|
-| **VRAM & RAM Reduction** | 4 KiB small-texture placement default on non-AMD GPUs (`-3+ GB` VRAM/RAM); idle/pressured shadow snapshot pool trimming (`let_go_idle_snapshots`); `VICTORY_RESIDENCY=1` 32 GB RAM budgets & 8-worker cap | `TaynanGT/Vice-Tay` (`7d62e53`, `#41`), `codec-d/cool_fox` (`8cc31ab`, `f4b48ad`) |
-| **Frame Pacing & CPU Overhead** | `SCRATCH_FIRST` 4 MiB spare reuse + 512 MiB pool cap; `LOOSE.read()` lock in `shadow.rs`; async `VICTORY_TEXBACK_ASYNC=1` writer + pooled readback buffers; `VICTORY_BURY_ASIDE=1` off-thread COM drop; `VICTORY_WIDE_PRIORITY=1` helper priority; `VICTORY_TEXTURE_NO_WAIT=2` anti-stall streaming; cached `HostHeap::gpu` start pointer; `lto = "thin"` release profile | `fxceless/victory-fork` (`#1224`, `#1367`, `#1359`), `Peppacodes/playablegames-peppa` (`#6`), `kitty-core/Kitty6` (`42046f5`), `trustno1-coder` (`#7`), `voidopcode/vilocity` (`6804c16`) |
-| **Visual & D3D12 Correctness** | `ExecuteIndirect` reflection clamp (`CS_TemporalResolve2_Opaque` / `CS_TemporalResolve1_Alpha`, fixes white eyes/glass); SH1 ambient (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_SETTLE`, `VICTORY_AMBIENT_MOST`, `VICTORY_AMBIENT_AIR`, `VICTORY_AMBIENT_RT` band handoff); `VICTORY_NAN_SCRUB=1`; separate `card_compare` submit & strict SRV/UAV depth match (fixes D3D12 errors 538 & 646); HUD `COPY_SOURCE -> COPY_DEST` barrier; `SLOT_TABLE_STRIDES` facial fix; intro video flicker fix | `avatarmanz/VIctory-7900XTX` (`77137b9`), `kitty-core/Kitty6` (`1f95b3a`), `trustno1-coder/VIctory-NVIDIA` (`#1`, `#2`, `77e13a9`, `24a479d`), `Belobug`, `codec-d/cool_fox` (`f4b48ad`) |
-| **NVIDIA 1M Heap & Intel CPU Safety** | `D3D12_OPTIONS19` unconditional cap query; `VICTORY_DYNAMIC_SLOTS` (`null / 2`); monotonic `HostHeap::id` guard; `catch_unwind` pipeline worker; `submit_split` slot return; Intel `CLZERO` `zero_through_fault` guard & VEH `MEM_FREE` safety; strict `VICTORY_WAVE_LOCAL` default | `fxceless/victory-fork` (`#1380`, `#1324`, `#1353`, `#1320`), `trustno1-coder/VIctory-NVIDIA` (`a9632bc`), `Rubenpannen/VIctory-RTX5070` (`b696f73`) |
+| **VRAM & RAM Reduction** | 4 KiB small-texture placement default on non-AMD GPUs (`-3+ GB` VRAM/RAM); idle/pressured shadow snapshot pool trimming (`let_go_idle_snapshots`); `VICTORY_RESIDENCY=1` 32 GB `ram_band()` budgets, `VICTORY_RESIDENT_BATCH`, `VICTORY_MAKE_ASIDE`, `VICTORY_HARD_WORKING_SET` | `TaynanGT/Vice-Tay` (`7d62e53`, `#41`), `codec-d/cool_fox` (`8cc31ab`, `f4b48ad`), `kitty-core/Kitty6` (`a64da00`) |
+| **Frame Pacing & CPU Overhead** | `SCRATCH_FIRST` 4 MiB spare reuse + 512 MiB pool cap; `UPLOAD_POOL` + `Host::uav_buffer`; `VICTORY_PLACED_FILLS`, `VICTORY_CARD_STEPS_LEARN`, DXR-safe `VICTORY_FILL_FORWARD`; AVX2 merge & lock-free `watch.rs`; `LOOSE.read()` lock; async `VICTORY_TEXBACK_ASYNC=1`; `VICTORY_BURY_ASIDE=1`; `VICTORY_THREAD_PRIORITY` / `VICTORY_WIDE_PRIORITY=1`; `VICTORY_TEXTURE_NO_WAIT=2`; global null UAV barrier dedup; `lto = "thin"` | `fxceless/victory-fork` (`#1224`, `#1367`, `#1359`), `Peppacodes/playablegames-peppa` (`#6`), `kitty-core/Kitty6` (`42046f5`), `trustno1-coder` (`#7`), `voidopcode/vilocity` (`6804c16`), `avatarmanz` (`#433`/`#434`/`#436`), `AnyXboxX` (`#474`) |
+| **Visual & D3D12 Correctness** | `ExecuteIndirect` reflection clamp (`CS_TemporalResolve2_Opaque` / `CS_TemporalResolve1_Alpha`); SH1 ambient (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_SETTLE`, `VICTORY_AMBIENT_MOST`, `VICTORY_AMBIENT_AIR`, `VICTORY_AMBIENT_RT`, `VICTORY_AMBIENT_FLOOR`, `VICTORY_AMBIENT_MAGENTA`, `[64,1,1]`/`[32,32,1]` speedup); placed writable texture / UAV mirroring; clamped SRV/UAV texture bounds (`MipLevels`/`ArraySize`/`PlaneSlice`/typeless/MS, `0` WARP Debug Layer errors); opt-in `VICTORY_DESERIALIZE_COMPUTE_X=1` gate (`0x218`); `VICTORY_NAN_SCRUB=1`; separate `card_compare` submit; `SLOT_TABLE_STRIDES` facial fix | `avatarmanz/VIctory-7900XTX` (`77137b9`), `kitty-core/Kitty6` (`1f95b3a`), `trustno1-coder/VIctory-NVIDIA` (`#1`, `#2`, `77e13a9`, `24a479d`), `AnyXboxX` (`#486`), `Belobug`, `codec-d/cool_fox` (`f4b48ad`) |
+| **NVIDIA 1M Heap & Intel CPU Safety** | `D3D12_OPTIONS19` unconditional cap query; `VICTORY_DYNAMIC_SLOTS` (`null / 2`); monotonic `HostHeap::id` guard; `catch_unwind` pipeline worker; `submit_split` slot return; Intel `CLZERO` `zero_through_fault` guard & SSE4a `extrq`/`insertq` JIT; VEH `MEM_FREE` safety; strict `VICTORY_WAVE_LOCAL` default | `fxceless/victory-fork` (`#1380`, `#1324`, `#1353`, `#1320`), `trustno1-coder/VIctory-NVIDIA` (`a9632bc`), `Rubenpannen/VIctory-RTX5070` (`b696f73`) |
 
 For the full catalog of NVIDIA/Wave32/32 GB RAM notes, see [docs/NVIDIA-KNOWN-ISSUES.md](docs/NVIDIA-KNOWN-ISSUES.md).
 
@@ -80,12 +95,13 @@ cargo build --locked --profile diag -p victory --features diagnostics,dlss
 ```
 
 ### Precompile Shaders (Recommended)
-Set the exact shader-affecting switches you will run with so the `VSH2` cache key matches:
+Set the exact shader-affecting switches you will run with so the `VSH3` cache key matches:
 
 ```powershell
-$env:VICTORY_D3D12_ADAPTER = 'NVIDIA'
-$env:VICTORY_NAN_SCRUB     = '1'
-$env:VICTORY_BVH_MISS      = '1'
+$env:VICTORY_D3D12_ADAPTER    = 'NVIDIA'
+$env:VICTORY_NAN_SCRUB        = '1'
+$env:VICTORY_BVH_MISS         = '1'
+$env:VICTORY_SHADER_FAST_BITS = '24'
 target\release\victory.exe shaders <path-to-game>\shaders.rpf
 ```
 
@@ -119,6 +135,9 @@ Opt-in **Hardware DXR 1.1** switches (experimental, requires DXR 1.1 GPU):
 $env:VICTORY_NATIVE_RT           = '1'
 $env:VICTORY_RT_BACKEND          = 'dxr'
 $env:VICTORY_DXR_VRAM_CAP_MB     = '12800'
+$env:VICTORY_AMBIENT_RT          = '0.5,2.0,0.8'
+$env:VICTORY_AMBIENT_FLOOR       = '0.02'
+$env:VICTORY_AMBIENT_MAGENTA     = '1'
 ```
 
 ---
