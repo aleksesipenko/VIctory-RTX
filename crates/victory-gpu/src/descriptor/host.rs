@@ -1039,6 +1039,16 @@ impl LiveState {
     }
 }
 
+/// Strictly monotonic upload-attempt token generator so two uploads of the
+/// same slot even within the exact same frame carry distinct
+/// [`LiveBaseline::Pending`] tokens.
+static UPLOAD_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocates the next non-zero monotonic upload-attempt token.
+pub(crate) fn next_upload_attempt() -> u64 {
+    UPLOAD_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Which fingerprint representation is stored in `Waiting::checked.2`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum LiveBaseline {
@@ -1047,10 +1057,11 @@ pub(crate) enum LiveBaseline {
     Strip,
     /// Dense/whole [`crate::texture::fingerprint_for`] (`dense = true`).
     Dense,
-    /// Post-upload pass had insufficient remaining recheck hash budget, so no
-    /// verified baseline was read yet; the next pass with budget conservatively
+    /// No verified baseline is committed yet (awaiting submit-time
+    /// `commit_baseline` for this monotonic `attempt` token, or deferred when
+    /// pass hash budget was full); the next pass with budget conservatively
     /// forces an upload and captures a verified baseline (`Strip` or `Dense`).
-    Pending,
+    Pending(u64),
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -1346,25 +1357,29 @@ impl TextureQueue {
 
     /// Commits a submit-time baseline fingerprint computed directly from the
     /// exact `tiled` guest bytes uploaded to the GPU (`Staging::on_uploaded`),
-    /// upgrading the record-time `Pending` placeholder only if slot `index` is
-    /// still on `(write, uploaded)` and still `Pending`.
+    /// upgrading the record-time `Pending(attempt)` placeholder ONLY if slot
+    /// `index` is still on `write` and its current baseline matches
+    /// `LiveBaseline::Pending(attempt)` identically.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_baseline(
         &mut self,
         index: u32,
         write: u64,
-        uploaded: u64,
+        attempt: u64,
         due: u64,
         print: u64,
         state: LiveState,
         baseline: LiveBaseline,
     ) {
-        if !self.live.get(&index).is_some_and(|&(_, b, _)| b == LiveBaseline::Pending) {
+        if !self
+            .live
+            .get(&index)
+            .is_some_and(|&(_, b, _)| b == LiveBaseline::Pending(attempt))
+        {
             return;
         }
         if let Some(w) = self.same(index, write)
             && w.checked.2 != 0
-            && w.checked.4 == uploaded
         {
             w.due = due;
             w.checked.2 = print;
@@ -6126,32 +6141,35 @@ mod tests {
         assert_eq!(rr.checked(12).map(|c| c.3), Some(0), "deferred slot keeps looks count");
     }
 
-    /// `TextureQueue::commit_baseline` upgrades a record-time `Pending` slot
-    /// with the exact submit-time fingerprint of uploaded bytes, clears `live`
-    /// for `(Plain, Strip)`, and safely ignores stale callbacks after a newer
-    /// upload, overwrite, or removal.
+    /// `TextureQueue::commit_baseline` upgrades a record-time `Pending(attempt)`
+    /// slot with the exact submit-time fingerprint of uploaded bytes, clears
+    /// `live` for `(Plain, Strip)`, and safely rejects stale callbacks —
+    /// including two uploads of the SAME slot within the EXACT SAME frame.
     #[test]
     fn commit_baseline_updates_pending_and_ignores_stale_callbacks() {
         let mut q = TextureQueue::default();
-        // 1) Live slot: Pending -> Dense with exact uploaded print and due.
+        // 1) Live slot: Pending(a1) -> Dense with exact uploaded print and due.
         q.written(42, 10, 10, false);
         let w42 = q.due(10, 10)[0].1;
-        q.recheck(42, w42, 11, (0x1000, 0x2000), 1, 0, 10, LiveState::Live, LiveBaseline::Pending);
-        q.commit_baseline(42, w42, 10, 11, 0xbeef_cafe, LiveState::Live, LiveBaseline::Dense);
+        let a1 = next_upload_attempt();
+        q.recheck(42, w42, 11, (0x1000, 0x2000), 1, 0, 10, LiveState::Live, LiveBaseline::Pending(a1));
+        q.commit_baseline(42, w42, a1, 11, 0xbeef_cafe, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(
             q.checked(42),
             Some((0x1000, 0x2000, 0xbeef_cafe, 0, 10, LiveState::Live, LiveBaseline::Dense))
         );
         // Repeat/stale callback once already Dense must no-op.
-        q.commit_baseline(42, w42, 10, 99, 0x1111, LiveState::Live, LiveBaseline::Dense);
+        q.commit_baseline(42, w42, a1, 99, 0x1111, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(q.checked(42).map(|c| c.2), Some(0xbeef_cafe));
 
-        // 2) Plain slot: Pending -> Strip commits print, updates due to frame + 4, and clears `live` map.
+        // 2) Plain slot: Pending(a2) -> Strip commits print, updates due to frame + 4, and clears `live` map.
         q.written(43, 10, 10, false);
         let w43 = q.due(10, 10)[0].1;
-        q.recheck(43, w43, 11, (0x2000, 0x1000), 1, 0, 10, LiveState::Plain, LiveBaseline::Pending);
+        let a2 = next_upload_attempt();
+        assert!(a2 > a1);
+        q.recheck(43, w43, 11, (0x2000, 0x1000), 1, 0, 10, LiveState::Plain, LiveBaseline::Pending(a2));
         assert!(q.live.contains_key(&43), "Pending Plain stays tracked until submit commits Strip");
-        q.commit_baseline(43, w43, 10, 14, 0xface_b00c, LiveState::Plain, LiveBaseline::Strip);
+        q.commit_baseline(43, w43, a2, 14, 0xface_b00c, LiveState::Plain, LiveBaseline::Strip);
         assert!(!q.live.contains_key(&43), "Committed Plain Strip leaves `live` map");
         assert_eq!(
             q.checked(43),
@@ -6160,16 +6178,69 @@ mod tests {
         assert!(!q.due(13, 10).iter().any(|&(s, _)| s == 43));
         assert!(q.due(14, 10).iter().any(|&(s, _)| s == 43));
 
-        // 3) Stale callback from older `uploaded` frame or overwritten `write` must be ignored.
-        q.recheck(42, w42, 13, (0x1000, 0x2000), 1, 0, 12, LiveState::Live, LiveBaseline::Pending);
-        q.commit_baseline(42, w42, 10, 11, 0xdead, LiveState::Live, LiveBaseline::Dense);
+        // 3) Two uploads of the SAME slot in the EXACT SAME frame (`10`) with
+        //    the SAME `write` get distinct monotonic tokens; the stale earlier
+        //    callback is rejected while the newer callback commits cleanly.
+        let same_frame_first = next_upload_attempt();
+        let same_frame_second = next_upload_attempt();
+        assert!(same_frame_second > same_frame_first);
+        q.recheck(
+            42,
+            w42,
+            11,
+            (0x1000, 0x2000),
+            1,
+            0,
+            10,
+            LiveState::Live,
+            LiveBaseline::Pending(same_frame_first),
+        );
+        q.recheck(
+            42,
+            w42,
+            11,
+            (0x1000, 0x2000),
+            1,
+            0,
+            10,
+            LiveState::Live,
+            LiveBaseline::Pending(same_frame_second),
+        );
+        q.commit_baseline(42, w42, same_frame_first, 11, 0xdead, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(
             q.checked(42).map(|c| (c.2, c.6)),
-            Some((1, LiveBaseline::Pending)),
-            "stale older uploaded frame must not overwrite newer Pending upload"
+            Some((1, LiveBaseline::Pending(same_frame_second))),
+            "stale same-frame upload callback must not overwrite newer Pending(attempt)"
+        );
+        q.commit_baseline(
+            42,
+            w42,
+            same_frame_second,
+            11,
+            0x2222_3333,
+            LiveState::Live,
+            LiveBaseline::Dense,
+        );
+        assert_eq!(
+            q.checked(42).map(|c| (c.2, c.6)),
+            Some((0x2222_3333, LiveBaseline::Dense))
+        );
+
+        // 4) Stale callback after slot overwrite (`written`) must be ignored.
+        let a_over = next_upload_attempt();
+        q.recheck(
+            42,
+            w42,
+            13,
+            (0x1000, 0x2000),
+            1,
+            0,
+            12,
+            LiveState::Live,
+            LiveBaseline::Pending(a_over),
         );
         q.written(42, 13, 13, false);
-        q.commit_baseline(42, w42, 12, 13, 0xdead, LiveState::Live, LiveBaseline::Dense);
+        q.commit_baseline(42, w42, a_over, 13, 0xdead, LiveState::Live, LiveBaseline::Dense);
         assert_eq!(q.checked(42), None, "stale write must not revive overwritten slot");
     }
 

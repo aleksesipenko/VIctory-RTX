@@ -1255,6 +1255,11 @@ impl Staging {
         self.on_upload.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(f));
     }
 
+    /// Whether any submit-time `on_upload` baseline callbacks are registered.
+    fn has_on_upload(&self) -> bool {
+        !self.on_upload.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// Runs any pending `on_upload` baseline callbacks with the exact `tiled`
     /// byte slice just detiled (or confirmed unchanged) for GPU upload.
     fn notify_uploaded(&self, tiled: &[u8]) {
@@ -1457,8 +1462,13 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        // stays committed while `_mapped` is held. When `on_upload` callbacks
+        // are attached, snapshot once into an owned buffer so `digest`,
+        // `detile`, `on_uploaded`, and `keep_whole` all read the exact same
+        // immutable bytes even if the title mutates guest memory concurrently.
+        let live = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        let mut owned = None;
+        let tiled = snapshot_for_upload(live, self.has_on_upload(), &mut owned);
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1838,49 +1848,79 @@ fn staged_from(resource: This) -> u32 {
         .map_or(u32::MAX, |s| s.first)
 }
 
+/// When `on_upload` callbacks are attached, copies `live` guest memory once
+/// into `owned` so `digest`, `detile`, and `on_uploaded` all read the exact
+/// same immutable byte snapshot; when no callbacks are attached, borrows
+/// `live` directly with zero copy overhead.
+fn snapshot_for_upload<'a>(
+    live: &'a [u8],
+    has_callbacks: bool,
+    owned: &'a mut Option<Vec<u8>>,
+) -> &'a [u8] {
+    if has_callbacks {
+        owned.insert(live.to_vec()).as_slice()
+    } else {
+        live
+    }
+}
+
+/// Verifies `read` against `held` and, if equal, computes the recheck
+/// fingerprint for the `fp_len` prefix from the exact same immutable `read`
+/// snapshot (zero second read of live guest memory).
+fn unchanged_snapshot_fingerprint(
+    read: &[u8],
+    held: Digest,
+    fp_len: usize,
+    dense: bool,
+) -> Option<u64> {
+    if digest(read) != held {
+        return None;
+    }
+    Some(fingerprint_slice(&read[..fp_len.min(read.len())], dense))
+}
+
 /// Whether the levels from `first` on of `resource`'s host copy were filled
 /// from the bytes title memory holds now: an upload would bring nothing new.
 /// (Of 787 repeated uploads of a frame that streams 398 were equal in every
 /// byte, and a texture uploaded again costs a staging buffer, a detiling and
 /// a copy more than this look.) `VICTORY_TEXTURE_SAME=0`: not asked.
+///
 /// Enforces `budget` strictly before reading: if `*hashed_bytes + size > budget`
-/// the whole-buffer read is skipped and `false` is returned.
+/// the whole-buffer read is skipped and `None` is returned. When equal, returns
+/// `Some((address, span_len, fingerprint))` computed from the **exact same**
+/// snapshot slice that proved equality (zero second read of guest memory).
 pub(crate) fn unchanged(
     resource: This,
     first: u32,
+    dense: bool,
     hashed_bytes: &mut u64,
     budget: u64,
-) -> bool {
+) -> Option<(u64, u64, u64)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
-        return false;
+        return None;
     }
-    let Some(copy) = crate::resource::made_copy(resource) else {
-        return false;
-    };
-    let Some((from, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
-        return false;
-    };
-    let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
-        return false;
-    };
-    let Some(layout) = crate::resource::texture_layout(&desc) else {
-        return false;
-    };
+    let copy = crate::resource::made_copy(resource)?;
+    let (from, held) = (*copy.holds.lock().unwrap_or_else(|e| e.into_inner()))?;
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
     let layout = &layout.planes[0].layout;
-    if from > crate::resource::read_from(layout, first).max(copy.base) {
-        return false;
+    let view_first = crate::resource::read_from(layout, first);
+    if from > view_first.max(copy.base) {
+        return None;
     }
     let size = layout.bytes_from(from);
     if hashed_bytes.saturating_add(size) > budget {
-        return false;
+        return None;
     }
     *hashed_bytes = hashed_bytes.saturating_add(size);
+    let fp_len = layout.bytes_from(view_first).min(size);
     with_read(size as usize, |read| {
         if crate::host::read_there(memory, read) == 0 {
-            return false;
+            return None;
         }
-        digest(read) == held
+        unchanged_snapshot_fingerprint(read, held, fp_len as usize, dense)
+            .map(|print| (memory as u64, fp_len, print))
     })
 }
 
@@ -2399,6 +2439,53 @@ mod title_memory_tests {
                 );
             }
         }
+    }
+
+    /// `snapshot_for_upload` clones live guest memory once when `on_upload`
+    /// callbacks are attached (so subsequent mutations to guest memory cannot
+    /// diverge between `detile` and `on_uploaded`), and avoids any allocation
+    /// when no callbacks are attached. `unchanged_snapshot_fingerprint` derives
+    /// the recheck fingerprint strictly from the exact snapshot that matched
+    /// `held`.
+    #[test]
+    fn upload_and_unchanged_snapshots_isolate_from_live_mutations() {
+        // 1) snapshot_for_upload without callbacks borrows directly (no allocation).
+        let live = vec![0x22u8; 64 << 10];
+        let mut owned = None;
+        let borrowed = super::snapshot_for_upload(&live, false, &mut owned);
+        assert!(std::ptr::eq(borrowed.as_ptr(), live.as_ptr()));
+        assert!(owned.is_none());
+
+        // 2) snapshot_for_upload with callbacks owns an immutable copy isolated from live writes.
+        let mut guest = vec![0x22u8; 256 << 10];
+        let mut owned = None;
+        let snap_print_before;
+        {
+            let snap = super::snapshot_for_upload(&guest, true, &mut owned);
+            assert!(!std::ptr::eq(snap.as_ptr(), guest.as_ptr()));
+            snap_print_before = super::fingerprint_slice(snap, true);
+        }
+        // Concurrent guest mutation after snapshot must not alter the snapshot slice.
+        guest[48 << 10] ^= 0xff;
+        let snap = owned.as_deref().unwrap();
+        assert_eq!(super::fingerprint_slice(snap, true), snap_print_before);
+        assert_ne!(
+            super::fingerprint_for(guest.as_ptr() as u64, guest.len() as u64, true),
+            snap_print_before
+        );
+
+        // 3) unchanged_snapshot_fingerprint verifies `held` and hashes the exact same slice
+        //    (including prefix slicing when `fp_len < read.len()`).
+        let mut buf = vec![0x44u8; 256 << 10];
+        let held = super::digest(&buf);
+        let fp_full = super::unchanged_snapshot_fingerprint(&buf, held, buf.len(), true);
+        assert_eq!(fp_full, Some(super::fingerprint_slice(&buf, true)));
+        let prefix = 128 << 10;
+        let fp_prefix = super::unchanged_snapshot_fingerprint(&buf, held, prefix, false);
+        assert_eq!(fp_prefix, Some(super::fingerprint_slice(&buf[..prefix], false)));
+        // Mismatched digest returns None.
+        buf[100] ^= 1;
+        assert_eq!(super::unchanged_snapshot_fingerprint(&buf, held, buf.len(), true), None);
     }
 }
 
