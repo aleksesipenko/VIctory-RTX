@@ -766,24 +766,53 @@ const LIVE_LOOKS: u8 = 120;
 /// overwritten or removed so resumed video wakes back into per-frame `Live`.
 const LIVE_PAUSED_FRAMES: u64 = 60;
 
+/// Hard maximum bytes of `Plain` 3-strip recheck hashing per `heap_textures`
+/// pass (2 MiB). Kept separate from [`LIVE_PASS_BUDGET_BYTES`] so a `Plain`
+/// 48 KiB probe running ahead of a 16 MiB `Live` texture can never reduce live
+/// headroom below 16 MiB.
+const PLAIN_PASS_BUDGET_BYTES: u64 = 2 << 20;
+
 /// Hard maximum bytes of dense/full texture hashing per `heap_textures` pass
-/// (16 MiB, enforced strictly before every dense probe, `unchanged()` whole
-/// read, and post-upload dense rehash).
+/// (16 MiB, enforced strictly before every `ChangedOnce`/`Live`/`Paused` dense
+/// probe, `unchanged()` whole read, and post-upload dense rehash). Total pass
+/// hashing across `Plain` + `Live` stays strictly capped at `<= 18 MiB`.
 const LIVE_PASS_BUDGET_BYTES: u64 = 16 << 20;
 
-/// Reserves `cost` bytes from the pass's hard live-hash budget before reading.
-fn try_charge_live_budget(live_hashed_bytes: &mut u64, cost: u64) -> bool {
-    if live_hashed_bytes.saturating_add(cost) > LIVE_PASS_BUDGET_BYTES {
-        return false;
+/// Per-pass recheck hashing byte counters with separate hard caps for `Plain`
+/// 3-strip probes ([`PLAIN_PASS_BUDGET_BYTES`] = 2 MiB) and dense/live reads
+/// ([`LIVE_PASS_BUDGET_BYTES`] = 16 MiB).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PassHashBudget {
+    plain: u64,
+    live: u64,
+}
+
+impl PassHashBudget {
+    fn can_fit(&self, dense: bool, cost: u64) -> bool {
+        if dense {
+            self.live.saturating_add(cost) <= LIVE_PASS_BUDGET_BYTES
+        } else {
+            self.plain.saturating_add(cost) <= PLAIN_PASS_BUDGET_BYTES
+        }
     }
-    *live_hashed_bytes = live_hashed_bytes.saturating_add(cost);
-    true
+
+    fn try_charge(&mut self, dense: bool, cost: u64) -> bool {
+        if !self.can_fit(dense, cost) {
+            return false;
+        }
+        if dense {
+            self.live = self.live.saturating_add(cost);
+        } else {
+            self.plain = self.plain.saturating_add(cost);
+        }
+        true
+    }
 }
 
 /// Outcome of checking a previously uploaded texture slot in `heap_textures`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecheckAction {
-    /// Deferred to `due` because the per-pass live hash budget is full; slot
+    /// Deferred to `due` because the per-pass recheck hash budget is full; slot
     /// stays in queue with its existing baseline and older poll rank.
     Defer(u64),
     /// Memory unchanged: reschedule recheck with `(due, print, looks, state, baseline)`.
@@ -796,10 +825,15 @@ enum RecheckAction {
     },
     /// Memory unchanged and schedule exhausted: remove from queue.
     Done,
-    /// Memory changed: upload and re-arm with `(again_in, next_state)`.
+    /// Memory changed (or baseline missing/unverified): upload and re-arm with
+    /// `(again_in, next_state)`. When `force` is true (`Pending` or
+    /// `Strip -> Dense` conservative upgrade), bypass `texture::unchanged()`
+    /// so current guest memory is guaranteed to be uploaded before recording
+    /// the new verified baseline.
     Upload {
         again_in: u64,
         next_state: crate::descriptor::host::LiveState,
+        force: bool,
     },
 }
 
@@ -866,14 +900,16 @@ fn unchanged_transition(
 }
 
 /// Evaluates one due recheck slot against the live-texture state machine and
-/// ONE shared hard per-pass byte budget (`LIVE_PASS_BUDGET_BYTES` = 16 MiB),
-/// checked and charged strictly BEFORE every fingerprint read (`Plain`,
-/// `ChangedOnce`, `Live`, `Paused`).
+/// separate hard per-pass byte budgets (`PLAIN_PASS_BUDGET_BYTES` = 2 MiB for
+/// `Plain` 3-strip probes; `LIVE_PASS_BUDGET_BYTES` = 16 MiB for dense
+/// `ChangedOnce`/`Live`/`Paused` checks), checked and charged strictly BEFORE
+/// every fingerprint read.
 ///
 /// Any slot whose stored baseline is `Pending` (or `Strip` for a dense state)
 /// has no verified baseline for the last-uploaded content, so once remaining
-/// budget can fit its post-upload rehash it conservatively triggers an upload
-/// rather than silently adopting potentially changed bytes.
+/// budget can fit its post-upload rehash it conservatively triggers a forced
+/// upload (`force: true`, bypassing `texture::unchanged()`) rather than
+/// silently adopting potentially changed bytes.
 #[allow(clippy::too_many_arguments)]
 fn decide_recheck(
     frame: u64,
@@ -885,7 +921,7 @@ fn decide_recheck(
     was_baseline: crate::descriptor::host::LiveBaseline,
     live_on: bool,
     soon: bool,
-    live_hashed_bytes: &mut u64,
+    budget: &mut PassHashBudget,
     mut fingerprint: impl FnMut(u64, u64, bool) -> u64,
 ) -> RecheckAction {
     use crate::descriptor::host::{LiveBaseline, LiveState};
@@ -893,13 +929,10 @@ fn decide_recheck(
     let missing_verified_baseline = was_baseline == LiveBaseline::Pending
         || (want_dense && was_baseline == LiveBaseline::Strip);
     if missing_verified_baseline {
-        // Conservatively upload and record a verified baseline once budget can
-        // cover the post-upload hash (never silently adopt potentially changed
-        // frames, and never loop while the pass budget is full).
-        let needed = crate::texture::fingerprint_bytes(len, want_dense);
-        if live_hashed_bytes.saturating_add(needed) > LIVE_PASS_BUDGET_BYTES {
-            return RecheckAction::Defer(frame + 1);
-        }
+        // Conservatively force an upload (bypassing `texture::unchanged()`)
+        // and record a verified baseline once budget can cover the post-upload
+        // hash (never silently adopt potentially changed frames, and never
+        // loop while the pass budget is full).
         let again_in = if soon { 1 } else { RECHECK_FRAMES[0] };
         let next_state = if live_on {
             match was_state {
@@ -910,10 +943,15 @@ fn decide_recheck(
         } else {
             LiveState::Plain
         };
-        return RecheckAction::Upload { again_in, next_state };
+        let next_dense = next_state.whole_fingerprint();
+        let needed = crate::texture::fingerprint_bytes(len, next_dense);
+        if !budget.can_fit(next_dense, needed) {
+            return RecheckAction::Defer(frame + 1);
+        }
+        return RecheckAction::Upload { again_in, next_state, force: true };
     }
     let cost = crate::texture::fingerprint_bytes(len, want_dense);
-    if !try_charge_live_budget(live_hashed_bytes, cost) {
+    if !budget.try_charge(want_dense, cost) {
         return RecheckAction::Defer(frame + 1);
     }
     if fingerprint(at, len, want_dense) == print {
@@ -934,30 +972,31 @@ fn decide_recheck(
     } else {
         LiveState::Plain
     };
-    RecheckAction::Upload { again_in, next_state }
+    RecheckAction::Upload { again_in, next_state, force: false }
 }
 
 /// Computes the post-upload recheck fingerprint while strictly enforcing
-/// `LIVE_PASS_BUDGET_BYTES` before EVERY hash read (`Plain` strip or dense).
+/// `PLAIN_PASS_BUDGET_BYTES` (2 MiB) for `Plain` strips and
+/// `LIVE_PASS_BUDGET_BYTES` (16 MiB) for dense reads before EVERY hash read.
 /// If remaining budget cannot fit the required hash, reads zero bytes and
-/// returns `LiveBaseline::Pending` so the next pass conservatively uploads and
-/// records a verified baseline once budget permits.
+/// returns `LiveBaseline::Pending` so the next pass conservatively forces an
+/// upload and records a verified baseline once budget permits.
 fn arm_recheck(
     at: u64,
     len: u64,
     desired_state: crate::descriptor::host::LiveState,
-    live_hashed_bytes: &mut u64,
+    budget: &mut PassHashBudget,
     mut fingerprint: impl FnMut(u64, u64, bool) -> u64,
 ) -> (u64, crate::descriptor::host::LiveState, crate::descriptor::host::LiveBaseline) {
     use crate::descriptor::host::LiveBaseline;
     let dense = desired_state.whole_fingerprint();
     let cost = crate::texture::fingerprint_bytes(len, dense);
-    if try_charge_live_budget(live_hashed_bytes, cost) {
+    if budget.try_charge(dense, cost) {
         let baseline = if dense { LiveBaseline::Dense } else { LiveBaseline::Strip };
         return (fingerprint(at, len, dense), desired_state, baseline);
     }
-    // Over budget: read zero bytes now; next pass conservatively uploads and
-    // records a verified baseline without silently dropping changes.
+    // Over budget: read zero bytes now; next pass conservatively forces an
+    // upload and records a verified baseline without silently dropping changes.
     (1, desired_state, LiveBaseline::Pending)
 }
 
@@ -2686,7 +2725,7 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
-        let mut live_hashed_bytes = 0u64;
+        let mut hash_budget = PassHashBudget::default();
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
@@ -2721,6 +2760,7 @@ impl State {
             // every frame, fingerprinted whole within LIVE_PASS_BUDGET_BYTES)
             // and drops to periodic paused checks after LIVE_LOOKS static frames.
             let mut live_state = crate::descriptor::host::LiveState::Plain;
+            let mut force_upload = false;
             if let Some((at, len, print, looks, uploaded, was_state, was_baseline)) =
                 host.texture_slot_checked(index)
             {
@@ -2734,7 +2774,7 @@ impl State {
                     was_baseline,
                     live_textures(),
                     recheck_soon(),
-                    &mut live_hashed_bytes,
+                    &mut hash_budget,
                     crate::texture::fingerprint_for,
                 ) {
                     RecheckAction::Defer(next) => {
@@ -2753,9 +2793,10 @@ impl State {
                         host.texture_slot_done(index, write, None);
                         continue;
                     }
-                    RecheckAction::Upload { again_in: wait, next_state } => {
+                    RecheckAction::Upload { again_in: wait, next_state, force } => {
                         again_in = wait;
                         live_state = next_state;
+                        force_upload = force;
                     }
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
@@ -2911,21 +2952,29 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
-            // Reserve room for the post-upload recheck hash so `unchanged()`
-            // cannot consume the remaining budget needed to record a verified
-            // baseline for this slot (e.g. a 10–16 MiB live texture).
-            let recheck_reserve = if partly.is_none() && heap_recheck() {
-                crate::texture::title_span(resource, first).map_or(0, |(_, len)| {
-                    crate::texture::fingerprint_bytes(len, live_state.whole_fingerprint())
-                })
+            // Reserve room for the post-upload dense recheck hash so
+            // `unchanged()` cannot consume the remaining live budget needed to
+            // record a verified baseline for this slot (e.g. a 10–16 MiB live
+            // texture). When `force_upload` is true (`Pending` / `Strip ->
+            // Dense` conservative upgrade), bypass `unchanged()` altogether so
+            // current guest memory is guaranteed to be uploaded before
+            // recording the new verified baseline.
+            let recheck_reserve = if !force_upload
+                && partly.is_none()
+                && heap_recheck()
+                && live_state.whole_fingerprint()
+            {
+                crate::texture::title_span(resource, first)
+                    .map_or(0, |(_, len)| crate::texture::fingerprint_bytes(len, true))
             } else {
                 0
             };
             let same = !tabled
+                && !force_upload
                 && crate::texture::unchanged(
                     resource,
                     first,
-                    &mut live_hashed_bytes,
+                    &mut hash_budget.live,
                     LIVE_PASS_BUDGET_BYTES.saturating_sub(recheck_reserve),
                 );
             if same {
@@ -2949,7 +2998,7 @@ impl State {
                             at,
                             len,
                             live_state,
-                            &mut live_hashed_bytes,
+                            &mut hash_budget,
                             crate::texture::fingerprint_for,
                         );
                         let due = if baseline == crate::descriptor::host::LiveBaseline::Pending {
@@ -3095,7 +3144,7 @@ impl State {
                         at,
                         len,
                         live_state,
-                        &mut live_hashed_bytes,
+                        &mut hash_budget,
                         crate::texture::fingerprint_for,
                     );
                     let due = if baseline == crate::descriptor::host::LiveBaseline::Pending {
@@ -5137,15 +5186,15 @@ mod tests {
     #[test]
     fn live_recheck_requires_two_changes_pauses_periodically_and_resumes() {
         use super::{
-            CHANGED_ONCE_FAST_LOOKS, LIVE_LOOKS, LIVE_PAUSED_FRAMES, RecheckAction, arm_recheck,
-            decide_recheck,
+            CHANGED_ONCE_FAST_LOOKS, LIVE_LOOKS, LIVE_PAUSED_FRAMES, PassHashBudget,
+            RecheckAction, arm_recheck, decide_recheck,
         };
         use crate::descriptor::host::{LiveBaseline, LiveState};
 
         let len = 2 << 20; // 2 MiB video plane
         let strip_cost = crate::texture::fingerprint_bytes(len, false);
-        // 1) Plain -> 1st change enters ChangedOnce; Plain probe charges 48 KiB from shared budget.
-        let mut budget = 0u64;
+        // 1) Plain -> 1st change enters ChangedOnce; Plain probe charges separate 2 MiB plain budget.
+        let mut budget = PassHashBudget::default();
         let mut saw_dense = None;
         let act = decide_recheck(
             5,
@@ -5164,8 +5213,12 @@ mod tests {
             },
         );
         assert_eq!(saw_dense, Some(false));
-        assert_eq!(budget, strip_cost, "Plain probe must charge shared 16 MiB recheck budget");
-        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::ChangedOnce });
+        assert_eq!(budget.plain, strip_cost, "Plain probe must charge plain recheck budget");
+        assert_eq!(budget.live, 0, "Plain probe must not touch live 16 MiB budget");
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::ChangedOnce, force: false }
+        );
 
         // 2) One-shot streaming texture (no 2nd change): exits to Done after
         // EXACTLY `CHANGED_ONCE_FAST_LOOKS` (4) unchanged checks.
@@ -5173,7 +5226,7 @@ mod tests {
         let mut looks = 0u8;
         let mut unchanged_checks = 0u8;
         loop {
-            budget = 0;
+            budget = PassHashBudget::default();
             let act = decide_recheck(
                 frame,
                 0x1000,
@@ -5191,7 +5244,8 @@ mod tests {
                 },
             );
             unchanged_checks += 1;
-            assert_eq!(budget, len);
+            assert_eq!(budget.live, len);
+            assert_eq!(budget.plain, 0);
             match act {
                 RecheckAction::Recheck {
                     due,
@@ -5218,16 +5272,16 @@ mod tests {
         let mut plane = vec![0x44u8; 256 << 10];
         let p_at = plane.as_ptr() as u64;
         let p_len = plane.len() as u64;
-        budget = 0;
+        budget = PassHashBudget::default();
         let (p_print, p_state, p_base) =
             arm_recheck(p_at, p_len, LiveState::ChangedOnce, &mut budget, crate::texture::fingerprint_for);
         assert_eq!((p_state, p_base), (LiveState::ChangedOnce, LiveBaseline::Dense));
-        assert_eq!(budget, p_len);
+        assert_eq!(budget.live, p_len);
         // Flip a byte at 48 KiB (strictly between start 0..16 KiB and middle 128..144 KiB strips).
         let strip_before = crate::texture::fingerprint(p_at, p_len);
         plane[48 << 10] ^= 0xff;
         assert_eq!(crate::texture::fingerprint(p_at, p_len), strip_before, "3-strip misses mid-buffer change");
-        budget = 0;
+        budget = PassHashBudget::default();
         let act = decide_recheck(
             8,
             p_at,
@@ -5241,14 +5295,17 @@ mod tests {
             &mut budget,
             crate::texture::fingerprint_for,
         );
-        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::Live });
-        assert_eq!(budget, p_len);
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::Live, force: false }
+        );
+        assert_eq!(budget.live, p_len);
 
         // 4) Live: unchanged for exactly LIVE_LOOKS (120) checks transitions to periodic Paused.
         let mut frame = 10u64;
         let mut looks = 0u8;
         for step in 1..=LIVE_LOOKS {
-            budget = 0;
+            budget = PassHashBudget::default();
             let act = decide_recheck(
                 frame,
                 0x1000,
@@ -5265,7 +5322,7 @@ mod tests {
                     30
                 },
             );
-            assert_eq!(budget, len);
+            assert_eq!(budget.live, len);
             if step < LIVE_LOOKS {
                 assert_eq!(
                     act,
@@ -5296,7 +5353,7 @@ mod tests {
         // 5) Paused: stays in periodic polling across long static pauses (never dropped).
         frame += LIVE_PAUSED_FRAMES;
         for _ in 0..5 {
-            budget = 0;
+            budget = PassHashBudget::default();
             let act = decide_recheck(
                 frame,
                 0x1000,
@@ -5313,7 +5370,7 @@ mod tests {
                     30
                 },
             );
-            assert_eq!(budget, len);
+            assert_eq!(budget.live, len);
             assert_eq!(
                 act,
                 RecheckAction::Recheck {
@@ -5328,7 +5385,7 @@ mod tests {
         }
 
         // 6) Video resumes after long pause: immediately wakes back into per-frame Live.
-        budget = 0;
+        budget = PassHashBudget::default();
         let act = decide_recheck(
             frame,
             0x1000,
@@ -5345,10 +5402,13 @@ mod tests {
                 40
             },
         );
-        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::Live });
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::Live, force: false }
+        );
 
         // 7) VICTORY_LIVE_TEXTURES=0 (`live_on = false`) stays Plain.
-        budget = 0;
+        budget = PassHashBudget::default();
         let act = decide_recheck(
             5,
             0x1000,
@@ -5362,21 +5422,27 @@ mod tests {
             &mut budget,
             |_, _, _| 20,
         );
-        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::Plain });
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::Plain, force: false }
+        );
     }
 
     /// 5 simultaneous 4 MiB promotions in a single pass NEVER exceed the hard
-    /// `LIVE_PASS_BUDGET_BYTES` (16 MiB) ceiling across ALL recheck reads; and
-    /// any `Pending` or `Strip` live slot without a verified dense baseline
-    /// conservatively triggers `Upload` once budget permits rather than
-    /// silently adopting a potentially changed frame.
+    /// `LIVE_PASS_BUDGET_BYTES` (16 MiB) ceiling across dense reads; and any
+    /// `Pending` or `Strip` slot without a verified baseline conservatively
+    /// triggers a FORCED `Upload { force: true }` (bypassing
+    /// `texture::unchanged()`) once budget permits rather than silently
+    /// adopting a potentially changed frame.
     #[test]
     fn live_recheck_five_simultaneous_4mib_promotions_never_exceed_budget() {
-        use super::{LIVE_PASS_BUDGET_BYTES, RecheckAction, arm_recheck, decide_recheck};
+        use super::{
+            LIVE_PASS_BUDGET_BYTES, PassHashBudget, RecheckAction, arm_recheck, decide_recheck,
+        };
         use crate::descriptor::host::{LiveBaseline, LiveState};
 
         let size = 4 << 20; // 4 MiB each -> 5 × 4 MiB = 20 MiB > 16 MiB
-        let mut budget = 0u64;
+        let mut budget = PassHashBudget::default();
         let mut actual_bytes_read = 0u64;
         let mut armed = Vec::new();
         for i in 0..5u64 {
@@ -5393,14 +5459,16 @@ mod tests {
             armed.push((print, state, baseline));
         }
         assert!(
-            budget <= LIVE_PASS_BUDGET_BYTES,
-            "budget {budget} exceeded hard ceiling {LIVE_PASS_BUDGET_BYTES}"
+            budget.live <= LIVE_PASS_BUDGET_BYTES,
+            "live budget {} exceeded hard ceiling {LIVE_PASS_BUDGET_BYTES}",
+            budget.live
         );
         assert!(
             actual_bytes_read <= LIVE_PASS_BUDGET_BYTES,
             "actual bytes read {actual_bytes_read} exceeded hard ceiling {LIVE_PASS_BUDGET_BYTES}"
         );
-        assert_eq!(budget, LIVE_PASS_BUDGET_BYTES);
+        assert_eq!(budget.live, LIVE_PASS_BUDGET_BYTES);
+        assert_eq!(budget.plain, 0);
         assert_eq!(actual_bytes_read, LIVE_PASS_BUDGET_BYTES);
         // First 4 got Dense baselines (4 × 4 MiB = 16 MiB); 5th deferred as Pending with 0 bytes read.
         for (i, &(_, state, base)) in armed.iter().enumerate() {
@@ -5410,7 +5478,7 @@ mod tests {
 
         // Over-budget pass: Pending slot defers cleanly without reading or uploading.
         let (p5, s5, b5) = armed[4];
-        let mut full_budget = LIVE_PASS_BUDGET_BYTES;
+        let mut full_budget = PassHashBudget { plain: 0, live: LIVE_PASS_BUDGET_BYTES };
         assert_eq!(
             decide_recheck(
                 200,
@@ -5427,10 +5495,10 @@ mod tests {
             ),
             RecheckAction::Defer(201)
         );
-        assert_eq!(full_budget, LIVE_PASS_BUDGET_BYTES);
+        assert_eq!(full_budget.live, LIVE_PASS_BUDGET_BYTES);
 
-        // Next frame with fresh budget: Pending triggers conservative Upload (never silently adopts bytes).
-        let mut next_budget = 0u64;
+        // Next frame with fresh budget: Pending triggers conservative FORCED Upload (`force: true`).
+        let mut next_budget = PassHashBudget::default();
         let act = decide_recheck(
             201,
             0x50_0000,
@@ -5442,19 +5510,22 @@ mod tests {
             true,
             true,
             &mut next_budget,
-            |_, _, _| panic!("Pending upgrade triggers conservative Upload directly"),
+            |_, _, _| panic!("Pending upgrade triggers conservative forced Upload directly"),
         );
-        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::Live });
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::Live, force: true }
+        );
         let (p5_new, s5_new, b5_new) = arm_recheck(0x50_0000, size, LiveState::Live, &mut next_budget, |_, _, dense| {
             assert!(dense);
             777
         });
         assert_eq!((p5_new, s5_new, b5_new), (777, LiveState::Live, LiveBaseline::Dense));
-        assert_eq!(next_budget, size);
+        assert_eq!(next_budget.live, size);
 
         // A live/ChangedOnce slot with a Strip baseline (missing verified dense baseline)
-        // also conservatively triggers Upload instead of silently adopting potentially changed pixels.
-        let mut strip_budget = 0u64;
+        // also conservatively triggers FORCED Upload (`force: true`) bypassing `texture::unchanged()`.
+        let mut strip_budget = PassHashBudget::default();
         let act = decide_recheck(
             202,
             0x60_0000,
@@ -5466,34 +5537,151 @@ mod tests {
             true,
             true,
             &mut strip_budget,
-            |_, _, _| panic!("Strip->Dense upgrade triggers conservative Upload directly"),
+            |_, _, _| panic!("Strip->Dense upgrade triggers conservative forced Upload directly"),
         );
-        assert_eq!(act, RecheckAction::Upload { again_in: 1, next_state: LiveState::ChangedOnce });
-        assert_eq!(strip_budget, 0);
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::ChangedOnce, force: true }
+        );
+        assert_eq!(strip_budget.live, 0);
         let (sp, ss, sb) = arm_recheck(0x60_0000, size, LiveState::ChangedOnce, &mut strip_budget, |_, _, dense| {
             assert!(dense);
             888
         });
         assert_eq!((sp, ss, sb), (888, LiveState::ChangedOnce, LiveBaseline::Dense));
-        assert_eq!(strip_budget, size);
+        assert_eq!(strip_budget.live, size);
+
+        // A Plain slot with Pending baseline also triggers FORCED Upload (`force: true`) using plain budget.
+        let mut plain_pending = PassHashBudget { plain: 0, live: LIVE_PASS_BUDGET_BYTES };
+        let act = decide_recheck(
+            203,
+            0x70_0000,
+            size,
+            1,
+            0,
+            LiveState::Plain,
+            LiveBaseline::Pending,
+            true,
+            true,
+            &mut plain_pending,
+            |_, _, _| panic!("Plain Pending triggers conservative forced Upload directly"),
+        );
+        assert_eq!(
+            act,
+            RecheckAction::Upload { again_in: 1, next_state: LiveState::Plain, force: true }
+        );
     }
 
-    /// ALL recheck reads (`Live`, `ChangedOnce`, `Paused`, and `Plain`) share
-    /// the single hard `LIVE_PASS_BUDGET_BYTES` (16 MiB) cap: over-budget
-    /// slots defer cleanly to `frame + 1` so total bytes read never exceed 16 MiB.
+    /// Separate hard budgets (`PLAIN_PASS_BUDGET_BYTES` = 2 MiB for `Plain`,
+    /// `LIVE_PASS_BUDGET_BYTES` = 16 MiB for dense `Live`/`ChangedOnce`/`Paused`):
+    /// - A 48 KiB `Plain` check running ahead of a 16 MiB `Live` texture NEVER
+    ///   starves that 16 MiB `Live` texture in the same pass!
+    /// - Excess `Live` slots defer cleanly at 16 MiB without starving `Plain`!
+    /// - Excess `Plain` slots defer cleanly at 2 MiB (total pass hashing `<= 18 MiB`).
     #[test]
     fn live_recheck_pass_budget_defers_excess_without_starving_plain_slots() {
-        use super::{LIVE_PASS_BUDGET_BYTES, RecheckAction, decide_recheck};
+        use super::{
+            LIVE_PASS_BUDGET_BYTES, PLAIN_PASS_BUDGET_BYTES, PassHashBudget, RecheckAction,
+            decide_recheck,
+        };
         use crate::descriptor::host::{LiveBaseline, LiveState};
 
-        let plane_len = 2 << 20; // 2 MiB -> 7 Live (14 MiB) + Plain (48 KiB) fit; 8th Live fills 16 MiB
+        let plane_len = 2 << 20;
         let strip_cost = crate::texture::fingerprint_bytes(plane_len, false);
-        let mut budget = 0u64;
-        // Interleaved: Plain slot runs first (48 KiB), then Live slots fit up to <= 16 MiB.
-        let mut plain_hashed = false;
+
+        // 1) 16 MiB Live texture STILL runs in the exact same pass after Plain checks ran ahead of it!
+        let mut budget = PassHashBudget::default();
+        for i in 0..10u64 {
+            let mut plain_hashed = false;
+            let act = decide_recheck(
+                100,
+                0x9000 + i * 0x1000,
+                plane_len,
+                9,
+                0,
+                LiveState::Plain,
+                LiveBaseline::Strip,
+                true,
+                true,
+                &mut budget,
+                |_, _, dense| {
+                    assert!(!dense);
+                    plain_hashed = true;
+                    9
+                },
+            );
+            assert!(plain_hashed);
+            assert_eq!(
+                act,
+                RecheckAction::Recheck {
+                    due: 112,
+                    print: 9,
+                    looks: 1,
+                    state: LiveState::Plain,
+                    baseline: LiveBaseline::Strip,
+                }
+            );
+        }
+        assert_eq!(budget.plain, 10 * strip_cost);
+        assert_eq!(budget.live, 0);
+
+        let full_16mib = crate::texture::LIVE_WHOLE_BYTES;
+        assert_eq!(full_16mib, LIVE_PASS_BUDGET_BYTES);
+        let mut live_16mib_hashed = false;
         let act = decide_recheck(
             100,
-            0x9000,
+            0x100_0000,
+            full_16mib,
+            77,
+            0,
+            LiveState::Live,
+            LiveBaseline::Dense,
+            true,
+            true,
+            &mut budget,
+            |_, _, dense| {
+                assert!(dense);
+                live_16mib_hashed = true;
+                77
+            },
+        );
+        assert!(
+            live_16mib_hashed,
+            "16 MiB Live texture must run in the same pass even after Plain checks ran ahead of it"
+        );
+        assert_eq!(budget.live, LIVE_PASS_BUDGET_BYTES);
+        assert_eq!(
+            act,
+            RecheckAction::Recheck {
+                due: 101,
+                print: 77,
+                looks: 1,
+                state: LiveState::Live,
+                baseline: LiveBaseline::Dense,
+            }
+        );
+
+        // 2) With live 16 MiB full, another Live slot defers cleanly while Plain still runs.
+        assert_eq!(
+            decide_recheck(
+                100,
+                0x200_0000,
+                plane_len,
+                7,
+                0,
+                LiveState::Live,
+                LiveBaseline::Dense,
+                true,
+                true,
+                &mut budget,
+                |_, _, _| panic!("over-budget Live slot must defer"),
+            ),
+            RecheckAction::Defer(101)
+        );
+        let mut plain_still_runs = false;
+        let _ = decide_recheck(
+            100,
+            0x300_0000,
             plane_len,
             9,
             0,
@@ -5504,64 +5692,14 @@ mod tests {
             &mut budget,
             |_, _, dense| {
                 assert!(!dense);
-                plain_hashed = true;
+                plain_still_runs = true;
                 9
             },
         );
-        assert!(plain_hashed);
-        assert_eq!(budget, strip_cost);
-        assert_eq!(
-            act,
-            RecheckAction::Recheck {
-                due: 112,
-                print: 9,
-                looks: 1,
-                state: LiveState::Plain,
-                baseline: LiveBaseline::Strip,
-            }
-        );
+        assert!(plain_still_runs, "Plain check must still run when live 16 MiB budget is full");
 
-        let mut live_hashed = 0usize;
-        for _ in 0..10 {
-            let mut hashed = false;
-            let act = decide_recheck(
-                100,
-                0x1000,
-                plane_len,
-                7,
-                0,
-                LiveState::Live,
-                LiveBaseline::Dense,
-                true,
-                true,
-                &mut budget,
-                |_, _, dense| {
-                    assert!(dense);
-                    hashed = true;
-                    7
-                },
-            );
-            if hashed {
-                live_hashed += 1;
-                assert_eq!(
-                    act,
-                    RecheckAction::Recheck {
-                        due: 101,
-                        print: 7,
-                        looks: 1,
-                        state: LiveState::Live,
-                        baseline: LiveBaseline::Dense,
-                    }
-                );
-            } else {
-                assert_eq!(act, RecheckAction::Defer(101));
-            }
-        }
-        assert_eq!(live_hashed, 7, "7 × 2 MiB + 48 KiB fits; 8th 2 MiB would exceed 16 MiB");
-        assert!(budget <= LIVE_PASS_BUDGET_BYTES);
-
-        // Once the shared 16 MiB budget is completely exhausted, even a Plain 48 KiB check defers cleanly.
-        let mut full_budget = LIVE_PASS_BUDGET_BYTES;
+        // 3) Once Plain 2 MiB cap is exhausted, excess Plain checks defer cleanly (total <= 18 MiB).
+        let mut full_plain = PassHashBudget { plain: PLAIN_PASS_BUDGET_BYTES, live: 0 };
         assert_eq!(
             decide_recheck(
                 100,
@@ -5573,12 +5711,12 @@ mod tests {
                 LiveBaseline::Strip,
                 true,
                 true,
-                &mut full_budget,
-                |_, _, _| panic!("Plain read must defer when 16 MiB shared budget is exhausted"),
+                &mut full_plain,
+                |_, _, _| panic!("Plain read must defer when 2 MiB plain budget is exhausted"),
             ),
             RecheckAction::Defer(101)
         );
-        assert_eq!(full_budget, LIVE_PASS_BUDGET_BYTES);
+        assert_eq!(full_plain.plain, PLAIN_PASS_BUDGET_BYTES);
     }
 }
 

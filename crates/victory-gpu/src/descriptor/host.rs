@@ -1047,8 +1047,9 @@ pub(crate) enum LiveBaseline {
     Strip,
     /// Dense/whole [`crate::texture::fingerprint_for`] (`dense = true`).
     Dense,
-    /// Post-upload pass had zero remaining live hash budget, so no baseline
-    /// hash was read yet; the next pass with budget captures a `Dense` baseline.
+    /// Post-upload pass had insufficient remaining recheck hash budget, so no
+    /// verified baseline was read yet; the next pass with budget conservatively
+    /// forces an upload and captures a verified baseline (`Strip` or `Dense`).
     Pending,
 }
 
@@ -1197,31 +1198,38 @@ impl TextureQueue {
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
     ///
-    /// Interleaves non-live (`Plain` recheck, `later`/`partly`, `fresh`) and
-    /// dense/live (`ChangedOnce`/`Live`/`Paused`) slots 1-for-1 starting with
-    /// non-live, so even an early break on time or upload budget guarantees
-    /// forward progress for both `Plain` and `Live` textures.
+    /// Interleaves all 3 buckets (`again` = `Plain` recheck / `later` /
+    /// `partly`, `fresh` = newest/oldest alternating, and `live` =
+    /// `ChangedOnce` / `Live` / `Paused`) 1-for-1-for-1 (`[again, fresh, live,
+    /// ...]`), preserving the upstream rule that an `again` slot leads at
+    /// index 0 while guaranteeing neither 4,096 `again` nor 4,096 `live`
+    /// slots can starve `fresh` (and an early break after 3 slots serves all
+    /// three buckets).
     fn in_order([mut live, mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         live.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
         again.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
         fresh.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
-        let mut non_live: Vec<(u32, u64)> = Vec::with_capacity((again.len() + fresh.len()).min(max));
-        non_live.extend(again.iter().take(max).map(|&(_, index, write)| (index, write)));
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && non_live.len() < max {
-            non_live.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && non_live.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                non_live.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
         }
-        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(live.len() + non_live.len()));
-        let (mut nl, mut lv) = (0, 0);
-        while order.len() < max && (nl < non_live.len() || lv < live.len()) {
-            if nl < non_live.len() {
-                order.push(non_live[nl]);
-                nl += 1;
+        let mut order: Vec<(u32, u64)> =
+            Vec::with_capacity(max.min(again.len() + fresh_order.len() + live.len()));
+        let (mut ag, mut fr, mut lv) = (0, 0, 0);
+        while order.len() < max && (ag < again.len() || fr < fresh_order.len() || lv < live.len()) {
+            if ag < again.len() {
+                order.push((again[ag].1, again[ag].2));
+                ag += 1;
+            }
+            if order.len() < max && fr < fresh_order.len() {
+                order.push(fresh_order[fr]);
+                fr += 1;
             }
             if order.len() < max && lv < live.len() {
                 order.push((live[lv].1, live[lv].2));
@@ -6070,63 +6078,68 @@ mod tests {
         assert_eq!(rr.checked(12).map(|c| c.3), Some(0), "deferred slot keeps looks count");
     }
 
-    /// Even when 5,000 ready `Live` slots exceed the 4,096 per-pass cap,
-    /// `TextureQueue::in_order` interleaves `Plain`/`fresh` and `Live` 1-for-1
-    /// starting with `Plain`, so even taking only the first 4 items makes
-    /// immediate forward progress for both `Plain` and `Live` (zero starvation).
+    /// Even when 5,000 ready `again` (`Plain` recheck) slots AND 5,000 ready
+    /// `Live` slots both exceed the 4,096 per-pass cap, `TextureQueue::in_order`
+    /// interleaves all 3 buckets 1-for-1-for-1 (`[again, fresh, live, ...]`),
+    /// so `batch[..3]` includes all three buckets on the very first pass and
+    /// neither 4,096 `again` nor 4,096 `live` can ever starve `fresh`.
     #[test]
     fn plain_slots_never_starve_behind_thousands_of_live_slots() {
         let mut q = TextureQueue::default();
+        // 5,000 Live slots (0..5_000)
         for slot in 0..5000u32 {
             q.written(slot, 1, 0, false);
         }
         for (slot, write) in q.due(1, 6000) {
             q.recheck(slot, write, 2, (0x1000, 0x2000), 7, 0, 1, LiveState::Live, LiveBaseline::Dense);
         }
-        // Add Plain recheck slots (10_000..10_020) and fresh slots (20_000..20_020).
-        for slot in 10_000..10_020u32 {
+        // 5,000 Plain recheck (`again`) slots (10_000..15_000)
+        for slot in 10_000..15_000u32 {
             q.written(slot, 1, 0, false);
         }
-        for (slot, write) in q.due(1, 100) {
+        for (slot, write) in q.due(1, 6000) {
             q.recheck(slot, write, 2, (0x4000, 0x2000), 9, 0, 1, LiveState::Plain, LiveBaseline::Strip);
         }
+        // 20 fresh newly created slots (20_000..20_020)
         for slot in 20_000..20_020u32 {
             q.written(slot, 2, 2, false);
         }
         let batch = q.due(2, 4096);
         assert_eq!(batch.len(), 4096);
-        // Even breaking after just the first 4 items serves both Plain and Live (1-for-1, Plain first).
-        let first4: Vec<u32> = batch.iter().take(4).map(|&(s, _)| s).collect();
+        // Even breaking after just the first 3 items serves again, fresh, AND live!
+        let first3: Vec<u32> = batch.iter().take(3).map(|&(s, _)| s).collect();
         assert!(
-            (10_000..10_020).contains(&first4[0]),
-            "slot 0 must be a Plain slot, got {}",
-            first4[0]
+            (10_000..15_000).contains(&first3[0]),
+            "slot 0 must be an again/Plain slot, got {}",
+            first3[0]
         );
-        assert!(first4[1] < 5000, "slot 1 must be a Live slot, got {}", first4[1]);
         assert!(
-            (10_000..10_020).contains(&first4[2]),
-            "slot 2 must be a Plain slot, got {}",
-            first4[2]
+            (20_000..20_020).contains(&first3[1]),
+            "slot 1 must be a fresh slot, got {}",
+            first3[1]
         );
-        assert!(first4[3] < 5000, "slot 3 must be a Live slot, got {}", first4[3]);
+        assert!(first3[2] < 5000, "slot 2 must be a Live slot, got {}", first3[2]);
 
         let returned: std::collections::HashSet<u32> = batch.iter().map(|&(s, _)| s).collect();
-        for slot in 10_000..10_020u32 {
-            assert!(returned.contains(&slot), "Plain recheck slot {slot} starved behind Live slots");
-        }
         for slot in 20_000..20_020u32 {
-            assert!(returned.contains(&slot), "Fresh slot {slot} starved behind Live slots");
+            assert!(
+                returned.contains(&slot),
+                "Fresh slot {slot} starved behind 5,000 again + 5,000 Live slots"
+            );
         }
-        // Heavy contention (5,000 Live + 3,000 non-live, cap 4,096): 50/50 interleaved split.
-        for slot in 30_000..32_960u32 {
+
+        // Heavy 3-way contention (5,000 Live + 5,000 again + 5,000 fresh, cap 4,096): fair ~1/3 split.
+        for slot in 20_020..25_000u32 {
             q.written(slot, 2, 2, false);
         }
         let split = q.due(2, 4096);
         assert_eq!(split.len(), 4096);
         let live_count = split.iter().filter(|&&(s, _)| s < 5000).count();
-        let non_live_count = split.len() - live_count;
-        assert_eq!(live_count, 2048);
-        assert_eq!(non_live_count, 2048);
+        let again_count = split.iter().filter(|&&(s, _)| (10_000..15_000).contains(&s)).count();
+        let fresh_count = split.iter().filter(|&&(s, _)| (20_000..25_000).contains(&s)).count();
+        assert_eq!(again_count, 1366);
+        assert_eq!(fresh_count, 1365);
+        assert_eq!(live_count, 1365);
     }
 
     /// The queue of textures picked by index serves the slots looked at
