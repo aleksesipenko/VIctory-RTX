@@ -140,6 +140,32 @@ struct List {
     thin: thin::Front,
 }
 
+impl Drop for List {
+    fn drop(&mut self) {
+        let this = std::ptr::from_ref(self) as usize;
+        {
+            let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+            if !waits.is_empty() {
+                waits.retain(|&(list, _)| list != this);
+            }
+        }
+        #[cfg(windows)]
+        {
+            recycle_dxr_recording(self.dxr_recording.take());
+            if pools()
+                && let Some(host) = self.host.take()
+                && host.is_empty_closed()
+            {
+                let mut freed = Vec::new();
+                park_host_list(host, &mut freed);
+                if !freed.is_empty() {
+                    crate::host::bury_resources(freed);
+                }
+            }
+        }
+    }
+}
+
 /// One part of a title list cut at its waits: the waits the queue stands
 /// at, then the host list that runs once they are met.
 #[cfg(windows)]
@@ -198,7 +224,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) enum Detached {
     Owned(Box<DetachedData>),
-    Shared(std::sync::Arc<DetachedData>),
+    Shared(std::sync::Arc<SharedDetached>),
 }
 
 #[cfg(windows)]
@@ -208,12 +234,76 @@ pub(crate) struct DetachedData {
     _state: crate::draw::State,
 }
 
+/// Shared ownership of a reusable DXR piece across `List::dxr_recording` and
+/// every submitted [`Detached::Shared`] handle.
+///
+/// Linearizable recycling invariant:
+/// - `submitted` is incremented with `AcqRel` before cloning a submission handle.
+/// - `landed` is incremented with `AcqRel` in [`recycle`] when `ran` contains the
+///   piece's index, strictly before consuming the submission's `Arc`.
+/// - Both [`Self::finish_submission`] and [`Self::finish_recording`] consume their
+///   `Arc` via [`std::sync::Arc::into_inner`] (`fetch_sub(1, Release)` + `Acquire`
+///   fence on the 1 -> 0 transition), so even simultaneous drops on `strong == 2`
+///   select exactly one final owner who observes every prior `submitted`/`landed`
+///   update and recycles `data` if and only if `landed > 0 && landed == submitted`.
+#[cfg(windows)]
+pub(crate) struct SharedDetached<T = DetachedData> {
+    data: T,
+    submitted: std::sync::atomic::AtomicUsize,
+    landed: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(windows)]
+impl<T> SharedDetached<T> {
+    fn new(data: T) -> std::sync::Arc<Self> {
+        // Reused on the owning submission queue thread; `Detached` itself is `Send` via `Queue`.
+        #[allow(clippy::arc_with_non_send_sync)]
+        std::sync::Arc::new(Self {
+            data,
+            submitted: std::sync::atomic::AtomicUsize::new(0),
+            landed: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Records one more submitted reference and returns a cloned `Arc` for it.
+    fn clone_submitted(this: &std::sync::Arc<Self>) -> std::sync::Arc<Self> {
+        this.submitted
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        std::sync::Arc::clone(this)
+    }
+
+    /// Consumes a submission's handle after landing (incrementing `landed` iff
+    /// `ran` is true). Returns `Some(data)` iff this was the final `Arc` and
+    /// every submitted clone landed.
+    fn finish_submission(this: std::sync::Arc<Self>, ran: bool) -> Option<T> {
+        if ran {
+            this.landed
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Self::take_if_recyclable(this)
+    }
+
+    /// Consumes the recording's own handle (on `List::reset` or `List::drop`).
+    /// Returns `Some(data)` iff this was the final `Arc` and every submitted
+    /// clone landed.
+    fn finish_recording(this: std::sync::Arc<Self>) -> Option<T> {
+        Self::take_if_recyclable(this)
+    }
+
+    fn take_if_recyclable(this: std::sync::Arc<Self>) -> Option<T> {
+        let inner = std::sync::Arc::into_inner(this)?;
+        let submitted = inner.submitted.into_inner();
+        let landed = inner.landed.into_inner();
+        (landed > 0 && landed == submitted).then_some(inner.data)
+    }
+}
+
 #[cfg(windows)]
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         match self {
             Self::Owned(d) => &d.host,
-            Self::Shared(d) => &d.host,
+            Self::Shared(d) => &d.data.host,
         }
     }
 
@@ -225,7 +315,7 @@ impl Detached {
             Self::Owned(d) => d._state.tables_done(),
             Self::Shared(d) => {
                 if let Some(d) = std::sync::Arc::get_mut(d) {
-                    d._state.tables_done();
+                    d.data._state.tables_done();
                 }
             }
         }
@@ -357,6 +447,17 @@ fn pop_idle() -> Option<crate::host::HostList> {
     Some(taken)
 }
 
+#[cfg(windows)]
+fn new_host_list() -> Option<crate::host::HostList> {
+    crate::host::host().and_then(|h| match h.new_list() {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::warn!(error = %e, "no host command list");
+            None
+        }
+    })
+}
+
 /// A host list open for recording: one that has run (reset once now), or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
@@ -364,7 +465,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
         list.reset();
         return Some(list);
     }
-    crate::host::host().and_then(|h| h.new_list().ok())
+    new_host_list()
 }
 
 /// A closed host list ready for the title's next `Reset()`: reuses a parked
@@ -374,8 +475,8 @@ fn fresh_list_closed() -> Option<crate::host::HostList> {
     if let Some(list) = pop_idle() {
         return Some(list);
     }
-    let fresh = crate::host::host().and_then(|h| h.new_list().ok())?;
-    fresh.close();
+    let fresh = new_host_list()?;
+    fresh.close_empty();
     Some(fresh)
 }
 
@@ -384,6 +485,82 @@ fn fresh_list_closed() -> Option<crate::host::HostList> {
 /// Provenance (GPL-3.0): Marvisak/VIctory#3228.
 #[cfg(windows)]
 const HOT_SPARE: usize = 24;
+
+/// Parks an already-empty, closed [`crate::host::HostList`] into [`IDLE`] if
+/// capacity and memory budget allow, collecting detached buffers in `freed`
+/// and dropping any rejected list outside the `IDLE` lock.
+#[cfg(windows)]
+fn park_host_list(
+    host: crate::host::HostList,
+    freed: &mut Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+) {
+    if IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) >= IDLE_MOST.0 {
+        return;
+    }
+    let (rejected, detached) = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let res = idle.park(host, IDLE_MOST.0, IDLE_MOST.1, |h, hot| {
+            let detached = if hot {
+                h.trim_oversized_buffers()
+            } else {
+                h.release_idle_buffers()
+            };
+            (h.scratch_kept(), detached)
+        });
+        IDLE_LEN.store(idle.len(), std::sync::atomic::Ordering::Relaxed);
+        res
+    };
+    if let Some(detached) = detached {
+        freed.extend(detached);
+    }
+    drop(rejected);
+}
+
+/// Releases a landed piece's descriptor tables and uploads, then resets its
+/// host list closed and parks it into [`IDLE`] if capacity allows.
+#[cfg(windows)]
+fn park_detached(
+    data: DetachedData,
+    freed: &mut Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+) {
+    let DetachedData {
+        host,
+        _uploads,
+        _state,
+    } = data;
+    // The descriptor slots and the upload memory its commands named.
+    drop(_state);
+    drop(_uploads);
+    if IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) >= IDLE_MOST.0 {
+        return;
+    }
+    // Reset allocator & leave an empty closed D3D12 list so recycled lists
+    // never retain stale commands if submitted without Reset(), while the
+    // next Reset() skips the redundant allocator.Reset() via `empty_closed`.
+    host.reset_closed();
+    park_host_list(host, freed);
+}
+
+/// Releases a `List`'s [`DxrRecording`], recycling into [`IDLE`] any piece
+/// whose submissions have all landed and whose final `Arc` just dropped here.
+#[cfg(windows)]
+fn recycle_dxr_recording(recording: Option<DxrRecording>) {
+    let Some(recording) = recording else {
+        return;
+    };
+    if !pools() {
+        return;
+    }
+    let mut freed = Vec::new();
+    for (_, shared) in recording {
+        if let Some(data) = SharedDetached::finish_recording(shared) {
+            park_detached(data, &mut freed);
+        }
+    }
+    if !freed.is_empty() {
+        crate::host::bury_resources(freed);
+    }
+}
 
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
@@ -396,46 +573,24 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
     let mut freed = Vec::new();
     for (i, list) in lists.into_iter().enumerate() {
-        let DetachedData {
-            host,
-            _uploads,
-            _state,
-        } = match list {
-            Detached::Owned(d) => *d,
-            Detached::Shared(d) => match std::sync::Arc::try_unwrap(d) {
-                Ok(d) => d,
-                Err(_) => continue, // another submission or the closed title list still owns it
+        let did_run = ran.contains(&i);
+        let data = match list {
+            Detached::Owned(d) => {
+                if !did_run {
+                    continue;
+                }
+                *d
+            }
+            Detached::Shared(d) => match SharedDetached::finish_submission(d, did_run) {
+                Some(data) => data,
+                None => continue,
             },
         };
-        // The descriptor slots and the upload memory its commands named.
-        drop(_state);
-        drop(_uploads);
-        if !ran.contains(&i) || IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) >= IDLE_MOST.0 {
-            continue;
-        }
-        // Reset allocator & leave an empty closed D3D12 list so recycled lists
-        // never retain stale commands if submitted without Reset(), while the
-        // next Reset() skips the redundant allocator.Reset() via `empty_closed`.
-        host.reset_closed();
-        let (rejected, detached) = {
-            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-            let res = idle.park(host, IDLE_MOST.0, IDLE_MOST.1, |h, hot| {
-                let detached = if hot {
-                    h.trim_oversized_buffers()
-                } else {
-                    h.release_idle_buffers()
-                };
-                (h.scratch_kept(), detached)
-            });
-            IDLE_LEN.store(idle.len(), std::sync::atomic::Ordering::Relaxed);
-            res
-        };
-        if let Some(detached) = detached {
-            freed.extend(detached);
-        }
-        drop(rejected);
+        park_detached(data, &mut freed);
     }
-    crate::host::bury_resources(freed);
+    if !freed.is_empty() {
+        crate::host::bury_resources(freed);
+    }
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -574,7 +729,7 @@ pub(crate) fn gate_dxr_parts(lists: &[This], per_list: bool) {
 }
 
 #[cfg(windows)]
-type DxrRecording = Vec<(Vec<ValueWait>, std::sync::Arc<DetachedData>)>;
+type DxrRecording = Vec<(Vec<ValueWait>, std::sync::Arc<SharedDetached>)>;
 
 #[cfg(windows)]
 fn append_dxr_recording(parts: &mut Parts, recording: &DxrRecording) {
@@ -584,7 +739,7 @@ fn append_dxr_recording(parts: &mut Parts, recording: &DxrRecording) {
         }
         let (_, taken, order) = parts.last_mut().unwrap();
         order.push(taken.len());
-        taken.push(Detached::Shared(data.clone()));
+        taken.push(Detached::Shared(SharedDetached::clone_submitted(data)));
     }
 }
 
@@ -666,10 +821,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 .into_iter()
                 .map(|(waits, d)| {
                     d.host.mark_dxr_reusable();
-                    // Reused on the owning submission queue thread; `Detached` itself is `Send` via `Queue`.
-                    #[allow(clippy::arc_with_non_send_sync)]
-                    let shared = std::sync::Arc::new(d);
-                    (waits, shared)
+                    (waits, SharedDetached::new(d))
                 })
                 .collect();
             append_dxr_recording(&mut parts, &recording);
@@ -816,18 +968,57 @@ fn new_list(
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
 fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+    #[cfg(windows)]
+    {
+        let host = if thin { None } else { fresh_list() };
+        boxed_with_host(kind, pipeline, thin, host)
+    }
     #[cfg(not(windows))]
-    let _ = thin;
-    let list = Box::new(List {
+    {
+        let _ = (thin, pipeline);
+        Box::new(List {
+            object: if crate::device::newer() {
+                Object::new(&NEWER_LIST_FUNCTIONS)
+            } else {
+                Object::new(&LIST_FUNCTIONS)
+            },
+            kind,
+            put: [0; 5],
+            reserved: [0; 64],
+            graphics_root_headers: [0; 128],
+            compute_root_headers: [0; 128],
+            pipeline_shadow: [0; 8],
+            newer: [0; 256],
+            uploads: Default::default(),
+        })
+    }
+}
+
+/// An internal backing list starting with a closed host list (reused from
+/// [`IDLE`] when available), for [`thin::back_list`].
+#[cfg(windows)]
+fn boxed_closed(kind: u32) -> Box<List> {
+    boxed_with_host(kind, std::ptr::null(), false, fresh_list_closed())
+}
+
+#[cfg(all(test, windows))]
+fn boxed_without_host(kind: u32) -> Box<List> {
+    boxed_with_host(kind, std::ptr::null(), false, None)
+}
+
+#[cfg(windows)]
+fn boxed_with_host(
+    kind: u32,
+    pipeline: This,
+    thin: bool,
+    host: Option<crate::host::HostList>,
+) -> Box<List> {
+    Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
             (false, false) => Object::new(&LIST_FUNCTIONS),
-            #[cfg(windows)]
             (true, true) => Object::new(&NEWER_THIN_FUNCTIONS),
-            #[cfg(windows)]
             (false, true) => Object::new(&THIN_FUNCTIONS),
-            #[cfg(not(windows))]
-            _ => Object::new(&LIST_FUNCTIONS),
         },
         kind,
         put: [0; 5],
@@ -837,32 +1028,17 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
-        #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
-        #[cfg(windows)]
+        host,
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
         },
-        #[cfg(windows)]
         earlier: Vec::new(),
-        #[cfg(windows)]
         dxr_recording: None,
-        #[cfg(windows)]
         gate: Vec::new(),
-        #[cfg(windows)]
         thin: Default::default(),
-    });
-    #[cfg(not(windows))]
-    let _ = pipeline;
-    list
+    })
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -917,7 +1093,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
-        list.dxr_recording = None;
+        recycle_dxr_recording(list.dxr_recording.take());
         list.gate.clear();
     }
     #[cfg(windows)]
@@ -2914,5 +3090,168 @@ mod tests {
         assert!(popped[HOT_SPARE..].iter().all(|l| !l.buffers_retained));
         assert_eq!(pool.hot_len, 0);
         assert_eq!(pool.bytes, 0);
+    }
+
+    #[test]
+    fn drop_cleans_value_waits_without_reset() {
+        #[cfg(windows)]
+        let list = boxed_without_host(0);
+        #[cfg(not(windows))]
+        let list = boxed(0, std::ptr::null(), false);
+        let list_addr = std::ptr::from_ref(&*list) as usize;
+        let sentinel_addr = usize::MAX - 7;
+        let wait = ValueWait {
+            address: 0x1000,
+            comparison: 3,
+            reference: 42,
+            wide: false,
+        };
+        {
+            let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+            waits.push((list_addr, wait));
+            waits.push((sentinel_addr, wait));
+        }
+        drop(list);
+        let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !waits.iter().any(|&(ptr, _)| ptr == list_addr),
+            "Drop for List must remove unsubmitted VALUE_WAITS entries"
+        );
+        assert!(
+            waits.iter().any(|&(ptr, _)| ptr == sentinel_addr),
+            "Drop for List must not remove other lists' VALUE_WAITS entries"
+        );
+        waits.retain(|&(ptr, _)| ptr != sentinel_addr);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_detached_recycles_in_both_orders_and_checks_landed_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering::*};
+        use std::sync::{Arc, Barrier};
+
+        #[derive(Debug)]
+        struct Tracked(Arc<AtomicUsize>);
+        impl Tracked {
+            fn new(drops: &Arc<AtomicUsize>) -> Self {
+                Self(Arc::clone(drops))
+            }
+        }
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AcqRel);
+            }
+        }
+
+        // 1. recycle (finish_submission) before recording drop.
+        let rec = SharedDetached::new(10usize);
+        let sub = SharedDetached::clone_submitted(&rec);
+        assert_eq!(SharedDetached::finish_submission(sub, true), None);
+        assert_eq!(SharedDetached::finish_recording(rec), Some(10));
+
+        // 2. recording drop before recycle (finish_submission).
+        let rec = SharedDetached::new(20usize);
+        let sub = SharedDetached::clone_submitted(&rec);
+        assert_eq!(SharedDetached::finish_recording(rec), None);
+        assert_eq!(SharedDetached::finish_submission(sub, true), Some(20));
+
+        // 3a. repeated submissions (submitted == 2, landed == 2): both land, then recording drops.
+        let rec = SharedDetached::new(31usize);
+        let sub1 = SharedDetached::clone_submitted(&rec);
+        let sub2 = SharedDetached::clone_submitted(&rec);
+        assert_eq!(SharedDetached::finish_submission(sub1, true), None);
+        assert_eq!(SharedDetached::finish_submission(sub2, true), None);
+        assert_eq!(SharedDetached::finish_recording(rec), Some(31));
+
+        // 3b. repeated submissions: sub1 lands, recording drops, sub2 lands.
+        let rec = SharedDetached::new(32usize);
+        let sub1 = SharedDetached::clone_submitted(&rec);
+        let sub2 = SharedDetached::clone_submitted(&rec);
+        assert_eq!(SharedDetached::finish_submission(sub1, true), None);
+        assert_eq!(SharedDetached::finish_recording(rec), None);
+        assert_eq!(SharedDetached::finish_submission(sub2, true), Some(32));
+
+        // 3c. repeated submissions: recording drops first, then sub1 and sub2 land.
+        let rec = SharedDetached::new(33usize);
+        let sub1 = SharedDetached::clone_submitted(&rec);
+        let sub2 = SharedDetached::clone_submitted(&rec);
+        assert_eq!(SharedDetached::finish_recording(rec), None);
+        assert_eq!(SharedDetached::finish_submission(sub1, true), None);
+        assert_eq!(SharedDetached::finish_submission(sub2, true), Some(33));
+
+        // 3d. sequential resubmission after first submission already landed.
+        let rec = SharedDetached::new(34usize);
+        let sub1 = SharedDetached::clone_submitted(&rec);
+        assert_eq!(SharedDetached::finish_submission(sub1, true), None);
+        let sub2 = SharedDetached::clone_submitted(&rec);
+        assert_eq!(SharedDetached::finish_recording(rec), None);
+        assert_eq!(SharedDetached::finish_submission(sub2, true), Some(34));
+
+        // 4. unsubmitted (submitted == 0, landed == 0): must drop, not recycle.
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rec = SharedDetached::new(Tracked::new(&drops));
+        assert!(SharedDetached::finish_recording(rec).is_none());
+        assert_eq!(drops.load(Acquire), 1);
+
+        // 5a & 5b. unrun (submitted == 1, ran == false -> landed == 0): must drop, not recycle.
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rec = SharedDetached::new(Tracked::new(&drops));
+        let sub = SharedDetached::clone_submitted(&rec);
+        assert!(SharedDetached::finish_submission(sub, false).is_none());
+        assert_eq!(drops.load(Acquire), 0);
+        assert!(SharedDetached::finish_recording(rec).is_none());
+        assert_eq!(drops.load(Acquire), 1);
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rec = SharedDetached::new(Tracked::new(&drops));
+        let sub = SharedDetached::clone_submitted(&rec);
+        assert!(SharedDetached::finish_recording(rec).is_none());
+        assert_eq!(drops.load(Acquire), 0);
+        assert!(SharedDetached::finish_submission(sub, false).is_none());
+        assert_eq!(drops.load(Acquire), 1);
+
+        // 6a & 6b. dropped-in-flight submission (e.g. Queue dropped while holding Held::Run):
+        // submitted == 2, only 1 landed -> landed < submitted -> must drop, not recycle.
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rec = SharedDetached::new(Tracked::new(&drops));
+        let sub1 = SharedDetached::clone_submitted(&rec);
+        let sub2 = SharedDetached::clone_submitted(&rec);
+        assert!(SharedDetached::finish_submission(sub1, true).is_none());
+        drop(sub2);
+        assert_eq!(drops.load(Acquire), 0);
+        assert!(SharedDetached::finish_recording(rec).is_none());
+        assert_eq!(drops.load(Acquire), 1);
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rec = SharedDetached::new(Tracked::new(&drops));
+        let sub1 = SharedDetached::clone_submitted(&rec);
+        let sub2 = SharedDetached::clone_submitted(&rec);
+        assert!(SharedDetached::finish_recording(rec).is_none());
+        drop(sub2);
+        assert_eq!(drops.load(Acquire), 0);
+        assert!(SharedDetached::finish_submission(sub1, true).is_none());
+        assert_eq!(drops.load(Acquire), 1);
+
+        // 7. Concurrent linearizability stress test: simultaneous finish_submission
+        // and finish_recording on strong_count == 2 must recycle strictly once per item.
+        for iter in 0..512usize {
+            let rec = SharedDetached::new(iter);
+            let sub = SharedDetached::clone_submitted(&rec);
+            let barrier = Arc::new(Barrier::new(2));
+            let b_worker = Arc::clone(&barrier);
+            let worker = std::thread::spawn(move || {
+                b_worker.wait();
+                SharedDetached::finish_submission(sub, true)
+            });
+            barrier.wait();
+            let from_rec = SharedDetached::finish_recording(rec);
+            let from_sub = worker.join().unwrap();
+            let got: Vec<usize> = from_rec.into_iter().chain(from_sub).collect();
+            assert_eq!(
+                got,
+                vec![iter],
+                "iter {iter}: concurrent finish must yield data to exactly one owner"
+            );
+        }
     }
 }

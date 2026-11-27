@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -1377,6 +1377,33 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn fence_wait_classification_and_confirmation_fail_closed() {
+        const WAIT_ABANDONED: u32 = 0x0000_0080;
+        const WAIT_TIMEOUT: u32 = 0x0000_0102;
+        const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+
+        // `u64::MAX` is D3D12's device-removed sentinel and must immediately
+        // classify as `Removed` (never `Complete`, never falling through to `Pending`).
+        assert_eq!(classify_early_fence(u64::MAX, 1), EarlyFence::Removed);
+        assert_eq!(classify_early_fence(u64::MAX, u64::MAX), EarlyFence::Removed);
+        assert_eq!(classify_early_fence(7, 7), EarlyFence::Complete);
+        assert_eq!(classify_early_fence(9, 7), EarlyFence::Complete);
+        assert_eq!(classify_early_fence(6, 7), EarlyFence::Pending);
+        assert_eq!(classify_early_fence(0, 1), EarlyFence::Pending);
+
+        assert!(wait_fence_confirmed(WAIT_OBJECT_0.0, 7, 7));
+        assert!(wait_fence_confirmed(WAIT_OBJECT_0.0, 9, 7));
+
+        // Device-removed sentinel (`u64::MAX`), failed/timed-out/abandoned waits,
+        // and insufficient fence progress must all fail closed.
+        assert!(!wait_fence_confirmed(WAIT_OBJECT_0.0, u64::MAX, 7));
+        assert!(!wait_fence_confirmed(WAIT_OBJECT_0.0, 6, 7));
+        assert!(!wait_fence_confirmed(WAIT_TIMEOUT, 7, 7));
+        assert!(!wait_fence_confirmed(WAIT_FAILED, 7, 7));
+        assert!(!wait_fence_confirmed(WAIT_ABANDONED, 7, 7));
     }
 }
 
@@ -5575,9 +5602,92 @@ impl Host {
             let _ = (from, to);
         }
     }
+}
+
+/// Result of inspecting `fence.GetCompletedValue()` before arming an event wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlyFence {
+    /// GPU has already reached `target` (`completed != u64::MAX && completed >= target`).
+    Complete,
+    /// Fence has not yet reached `target`.
+    Pending,
+    /// D3D12 returned `u64::MAX` (device-removed sentinel): fail immediately
+    /// without calling `SetEventOnCompletion`.
+    Removed,
+}
+
+fn classify_early_fence(completed: u64, target: u64) -> EarlyFence {
+    if completed == u64::MAX {
+        EarlyFence::Removed
+    } else if completed >= target {
+        EarlyFence::Complete
+    } else {
+        EarlyFence::Pending
+    }
+}
+
+/// Whether a completed `WaitForSingleObject` on a fence event strictly proved
+/// that the GPU reached `target`.
+fn wait_fence_confirmed(wait_code: u32, completed: u64, target: u64) -> bool {
+    wait_code == WAIT_OBJECT_0.0 && completed != u64::MAX && completed >= target
+}
+
+impl Host {
+    /// Waits on `self.fence` until GPU completion of `target` is strictly
+    /// proven, or aborts immediately via [`fail`] before any post-wait
+    /// copy-back, resource burial, descriptor release, or allocator reset runs.
+    fn wait_fence_or_fail<'a>(
+        &self,
+        target: u64,
+        started: std::time::Instant,
+        context: &str,
+        runs: impl FnOnce() -> Vec<&'a HostList>,
+    ) {
+        let abort = |reason: std::fmt::Arguments| -> ! {
+            let runs = runs();
+            // SAFETY: a plain query.
+            let removed = unsafe { self.device.GetDeviceRemovedReason() };
+            fail(format_args!(
+                "{context}: {reason} (target={target}, device_removed={removed:?}, lists={}){}{}",
+                runs.len(),
+                self.removal_data(&runs),
+                last_notes(&runs),
+            ))
+        };
+        // SAFETY: `self.fence` and `self.event` are owned by `Host` and
+        // serialized under the caller's `self.submitted` lock.
+        let early = unsafe { self.fence.GetCompletedValue() };
+        match classify_early_fence(early, target) {
+            EarlyFence::Complete => return,
+            EarlyFence::Removed => {
+                abort(format_args!("fence reported u64::MAX (device removed) before wait"))
+            }
+            EarlyFence::Pending => {}
+        }
+        // SAFETY: as above.
+        if let Err(e) = unsafe { self.fence.SetEventOnCompletion(target, self.event) } {
+            abort(format_args!("SetEventOnCompletion failed ({e})"));
+        }
+        working(false);
+        #[cfg(feature = "diagnostics")]
+        let _card = crate::timeline::card_wait(Some(target));
+        // SAFETY: `self.event` is a valid Win32 auto-reset event handle.
+        let wait = unsafe { WaitForSingleObject(self.event, INFINITE) };
+        stood(started);
+        working(true);
+        // SAFETY: a plain query.
+        let after = unsafe { self.fence.GetCompletedValue() };
+        if !wait_fence_confirmed(wait.0, after, target) {
+            abort(format_args!(
+                "fence wait did not confirm GPU completion (wait={:#x}, completed={after})",
+                wait.0,
+            ));
+        }
+    }
 
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
+    /// Aborts via [`fail`] if GPU completion cannot be strictly proven.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
@@ -5768,21 +5878,21 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            #[cfg(feature = "diagnostics")]
-                            let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
-                }
+                self.wait_fence_or_fail(
+                    *submitted,
+                    waiting,
+                    "settling submissions sent ahead (VICTORY_LATE_WAIT=1)",
+                    || {
+                        items
+                            .iter()
+                            .filter_map(|i| match i {
+                                Late::Run(f) => Some(f),
+                                _ => None,
+                            })
+                            .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
+                            .collect()
+                    },
+                );
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -6239,6 +6349,12 @@ impl Host {
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
         }
+        // Any list about to be executed on the GPU is no longer an untouched
+        // never-submitted empty closed list; only `reset_closed()` after proven
+        // GPU completion (+ `bury_lag`) may set `empty_closed` true again.
+        for list in runs {
+            list.mark_submitted();
+        }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
@@ -6314,9 +6430,10 @@ impl Host {
         submitting(2, runs.len());
         for (i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
+            let target = *submitted;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: closed lists; the fence is ours under the submission lock.
+            let signaled = unsafe {
                 execute(group);
                 if check_inline
                     && i + 1 == groups.len()
@@ -6325,24 +6442,22 @@ impl Host {
                     self.queue.ExecuteCommandLists(check);
                 }
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let signaled = self.queue.Signal(&self.fence, target);
                 #[cfg(feature = "diagnostics")]
-                crate::timeline::sent(sending, *submitted, stamp);
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        #[cfg(feature = "diagnostics")]
-                        let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                crate::timeline::sent(sending, target, stamp);
+                signaled
+            };
+            if let Err(e) = signaled {
+                // SAFETY: a plain query.
+                let removed = unsafe { self.device.GetDeviceRemovedReason() };
+                fail(format_args!(
+                    "synchronous host submission: fence Signal failed ({e}, target={target}, device_removed={removed:?}, lists={}){}{}",
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs),
+                ));
             }
+            self.wait_fence_or_fail(target, started, "synchronous host submission", || runs.to_vec());
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
@@ -6378,8 +6493,10 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
+        if !groups.is_empty() {
+            FINISHED.store(this_submission, Ordering::Release);
+            bury(this_submission);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -6915,6 +7032,33 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset for idle ({e})"));
+        }
+        self.empty_closed.store(true, Ordering::Release);
+    }
+
+    /// Whether this host list is already reset, closed, completely empty, and
+    /// never submitted since [`HostList::reset_closed`] or [`HostList::close_empty`],
+    /// and has not been reopened by [`HostList::reset`] since.
+    pub(crate) fn is_empty_closed(&self) -> bool {
+        self.empty_closed.load(Ordering::Acquire)
+    }
+
+    /// Marks that this host list has been handed to GPU execution, clearing
+    /// `empty_closed` so [`crate::list::List::drop`] never parks a submitted
+    /// list back into `IDLE` without proven GPU completion + [`HostList::reset_closed`].
+    fn mark_submitted(&self) {
+        self.empty_closed.store(false, Ordering::Release);
+    }
+
+    /// Closes a newly created, empty host list without running end-of-recording
+    /// hooks (such as GPU timestamp queries) and marks `empty_closed` so the
+    /// next [`HostList::reset`] skips the redundant `allocator.Reset()` and
+    /// `clear_state()`, and [`crate::list::List::drop`] may park it back into
+    /// `IDLE` if never reopened.
+    pub(crate) fn close_empty(&self) {
+        // SAFETY: brand-new open empty command list, never recorded into.
+        if let Err(e) = unsafe { self.list.Close() } {
+            fail(format_args!("a fresh host command list did not close ({e})"));
         }
         self.empty_closed.store(true, Ordering::Release);
     }

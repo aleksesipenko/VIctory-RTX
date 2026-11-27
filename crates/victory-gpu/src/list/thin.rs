@@ -402,24 +402,28 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            if crate::dxr::requested()
-                && (self.abandoned.load(Acquire) || super::cut_list(inner.back as This))
-            {
-                // Earlier DXR pieces may already pin GPU inputs. Release this
-                // unsubmitted backing list now instead of parking it in BACKS.
-                super::list_release(inner.back as This);
-            } else {
-                // Cap pooled backing lists to avoid unbounded memory growth
-                // (GPL-3.0 provenance: maren-halv/VIctory-DXR d5efb36).
-                let mut backs = held(&BACKS);
-                if backs.len() < 64 {
-                    backs.push(inner.back);
-                } else {
-                    drop(backs);
-                    super::list_release(inner.back as This);
-                }
-            }
+            let release_immediately = crate::dxr::requested()
+                && (self.abandoned.load(Acquire) || super::cut_list(inner.back as This));
+            // Earlier DXR pieces may already pin GPU inputs: release those
+            // backing lists immediately instead of parking them in BACKS.
+            // Otherwise cap pooled backing lists at 64 to avoid unbounded
+            // memory growth (GPL-3.0 provenance: maren-halv/VIctory-DXR d5efb36).
+            release_or_park_back(&BACKS, inner.back, release_immediately);
         }
+    }
+}
+
+fn release_or_park_back(pool: &Mutex<Vec<usize>>, back: usize, release_immediately: bool) {
+    if release_immediately {
+        super::list_release(back as This);
+        return;
+    }
+    let mut backs = held(pool);
+    if backs.len() < 64 {
+        backs.push(back);
+    } else {
+        drop(backs);
+        super::list_release(back as This);
     }
 }
 
@@ -433,15 +437,27 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
+/// A list of ours, closed, with `refs == 1` so `list_release` drops `Box<List>`.
 fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
-        // SAFETY: a list of ours nobody uses.
+    back_list_in(&BACKS, kind, super::boxed_closed)
+}
+
+fn back_list_in(
+    pool: &Mutex<Vec<usize>>,
+    kind: u32,
+    make: impl FnOnce(u32) -> Box<List>,
+) -> This {
+    if let Some(back) = held(pool).pop() {
+        // SAFETY: a list of ours nobody uses; its refcount is already 1.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
-    super::close(list);
+    let list: This = Box::into_raw(make(kind)).cast_const().cast();
+    // `Object::new` initializes `refs` to 0 (`hand_out` normally bumps it to 1);
+    // give internal backing lists their single owning reference so
+    // `super::list_release` -> `object::release_boxed::<List>` actually drops
+    // the `Box<List>` instead of returning `0` on `0u32.checked_sub(1)`.
+    object::add_ref(list);
     list
 }
 
@@ -1352,5 +1368,123 @@ mod tests {
         assert!(rec.done());
         // Clear dummy sentinel before `Drop for Recording` runs.
         held(&rec.inner).back = 0;
+    }
+
+    fn dummy_wait() -> ValueWait {
+        ValueWait {
+            address: 0x2000,
+            comparison: 3,
+            reference: 1,
+            wide: false,
+        }
+    }
+
+    fn has_value_wait(addr: usize) -> bool {
+        super::VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(ptr, _)| ptr == addr)
+    }
+
+    fn track_drop_via_value_wait(list: This) -> usize {
+        let addr = list as usize;
+        super::VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((addr, dummy_wait()));
+        addr
+    }
+
+    /// `back_list()` must initialize `refs == 1` so `super::list_release`
+    /// actually drops `Box<List>` instead of leaking with `refs == 0`, and
+    /// reusing a list through the pool must keep `refs == 1` without bumping it.
+    #[test]
+    fn back_list_starts_with_one_ref_and_drops_on_release() {
+        let pool: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+        let list = back_list_in(&pool, 0, super::boxed_without_host);
+        let addr = track_drop_via_value_wait(list);
+        assert!(has_value_wait(addr));
+        assert_eq!(super::list_release(list), 0);
+        assert!(
+            !has_value_wait(addr),
+            "back_list must have refs == 1 so list_release drops Box<List> and runs Drop"
+        );
+
+        // Pool round-trip must preserve refs == 1 (no double add_ref).
+        let pooled = back_list_in(&pool, 0, super::boxed_without_host);
+        let pooled_addr = track_drop_via_value_wait(pooled);
+        release_or_park_back(&pool, pooled_addr, false);
+        assert!(
+            has_value_wait(pooled_addr),
+            "parked backing list must stay alive in pool"
+        );
+        let reused = back_list_in(&pool, 2, super::boxed_without_host);
+        assert_eq!(reused as usize, pooled_addr);
+        assert_eq!(super::list_type(reused), 2);
+        assert_eq!(
+            super::list_release(reused),
+            0,
+            "reused backing list must still have refs == 1"
+        );
+        assert!(
+            !has_value_wait(pooled_addr),
+            "releasing a reused backing list must drop Box<List>"
+        );
+    }
+
+    /// Pooling up to 64 backing lists keeps them alive; evicting beyond 64,
+    /// immediate DXR/abandoned releases, and draining the pool all drop cleanly
+    /// with zero leaks and zero double-frees.
+    #[test]
+    fn backs_pool_reuse_and_eviction_beyond_64_drops_cleanly() {
+        let pool: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let mut lists = Vec::with_capacity(70);
+        let mut addrs = Vec::with_capacity(70);
+        // Allocate all 70 up front so every pointer address is strictly distinct.
+        for _ in 0..70 {
+            let list = back_list_in(&pool, 0, super::boxed_without_host);
+            addrs.push(track_drop_via_value_wait(list));
+            lists.push(list);
+        }
+
+        // Park all 70: first 64 stay pooled, last 6 are evicted and dropped.
+        for &list in &lists {
+            release_or_park_back(&pool, list as usize, false);
+        }
+        assert_eq!(held(&pool).len(), 64);
+        for &addr in &addrs[..64] {
+            assert!(has_value_wait(addr), "pooled backing list {addr:#x} must remain alive");
+        }
+        for &addr in &addrs[64..] {
+            assert!(!has_value_wait(addr), "evicted backing list {addr:#x} must be dropped");
+        }
+
+        // Pop 10, verify kind update, and release immediately (DXR/abandoned path).
+        let mut popped = Vec::with_capacity(10);
+        for k in 0..10u32 {
+            let reused = back_list_in(&pool, k, super::boxed_without_host);
+            assert_eq!(super::list_type(reused), k);
+            assert!(has_value_wait(reused as usize));
+            popped.push(reused as usize);
+        }
+        assert_eq!(held(&pool).len(), 54);
+        for addr in popped {
+            release_or_park_back(&pool, addr, true);
+            assert!(
+                !has_value_wait(addr),
+                "immediate release of reused backing list {addr:#x} must drop Box<List>"
+            );
+        }
+
+        // Drain the remaining 54 pooled lists cleanly.
+        while let Some(addr) = held(&pool).pop() {
+            assert_eq!(super::list_release(addr as This), 0);
+            assert!(!has_value_wait(addr));
+        }
+        for &addr in &addrs {
+            assert!(!has_value_wait(addr), "leaked backing list {addr:#x}");
+        }
     }
 }
