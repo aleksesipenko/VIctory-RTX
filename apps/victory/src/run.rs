@@ -296,6 +296,8 @@ pub fn run(
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let joined = main.join();
     victory_hle::known_pipelines::flush();
+    #[cfg(windows)]
+    victory_gpu::pipeline::save_pipeline_cache();
     victory_hle::modules::gameinput::shutdown();
     let code = joined.map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");

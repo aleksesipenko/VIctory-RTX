@@ -24,6 +24,17 @@ impl CacheKey {
     pub fn to_hex(&self) -> String {
         self.0.to_hex().to_string()
     }
+
+    /// Key for `first ++ second`, without building the combined buffer.
+    pub fn new_chained(converter: &dyn Converter, first: &[u8], second: &[u8]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(converter.id().as_bytes());
+        h.update(&[0]);
+        h.update(&converter.version().to_le_bytes());
+        h.update(first);
+        h.update(second);
+        CacheKey(h.finalize())
+    }
 }
 
 /// Content-addressed store under the user's cache directory.
@@ -48,14 +59,40 @@ impl Cache {
 
     /// Returns the cached output for `input`, converting it first if needed.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
-        let key = CacheKey::new(converter, input);
+        self.get_or_convert_keyed(converter, CacheKey::new(converter, input), || {
+            input.to_vec()
+        })
+    }
+
+    /// Like [`Cache::get_or_convert`], but the cache key is the concatenation
+    /// `first ++ second`. On a cache hit no combined input buffer is built;
+    /// `first ++ second` is materialized only on a miss, for the converter.
+    pub fn get_or_convert_chained(
+        &self,
+        converter: &dyn Converter,
+        first: &[u8],
+        second: &[u8],
+    ) -> Result<PathBuf> {
+        self.get_or_convert_keyed(
+            converter,
+            CacheKey::new_chained(converter, first, second),
+            || [first, second].concat(),
+        )
+    }
+
+    fn get_or_convert_keyed(
+        &self,
+        converter: &dyn Converter,
+        key: CacheKey,
+        input: impl FnOnce() -> Vec<u8>,
+    ) -> Result<PathBuf> {
         let path = self.path_for(&key);
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
         let output = converter
-            .convert(input)
+            .convert(&input())
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;

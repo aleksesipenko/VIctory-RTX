@@ -317,6 +317,34 @@ fn read_back_of(
     }
 }
 
+/// Reads a completed capture while its readback buffer is mapped. A D3D12
+/// footprint can omit the final row's padding from the buffer allocation, so
+/// the slice is bounded by the buffer's actual `Width` and always unmapped on
+/// exit via a scope guard.
+fn with_readback_bytes<R>(buffer: &ID3D12Resource, read: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    struct Mapping<'a>(&'a ID3D12Resource);
+    impl Drop for Mapping<'_> {
+        fn drop(&mut self) {
+            // SAFETY: constructed after a successful Map of subresource zero.
+            unsafe { self.0.Unmap(0, None) };
+        }
+    }
+
+    // SAFETY: capture owns the completed readback buffer, whose width is its byte length.
+    let len = isize::try_from(unsafe { buffer.GetDesc() }.Width).ok()? as usize;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: a readback buffer has one mappable subresource.
+    if unsafe { buffer.Map(0, None, Some(&mut data)) }.is_err() {
+        return None;
+    }
+    let _mapping = Mapping(buffer);
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the mapping remains alive for the callback and spans exactly `len` bytes.
+    Some(read(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }))
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,
@@ -332,18 +360,9 @@ pub(crate) fn save_read_back(
             return;
         }
     };
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
-        let len = f.RowPitch as usize * f.Height as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+    with_readback_bytes(buffer, |rows| {
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
-        buffer.Unmap(0, None);
-    }
+    });
 }
 
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
@@ -434,14 +453,8 @@ fn dump_one(
     }
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
+    with_readback_bytes(&buffer, |rows| {
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -450,7 +463,9 @@ fn dump_one(
             for y in 0..f.Height as usize {
                 for x in 0..f.Width as usize {
                     let at = y * pitch + x * 4;
-                    let w = u32::from_le_bytes(rows[at..at + 4].try_into().unwrap_or([0; 4]));
+                    let w = u32::from_le_bytes(
+                        rows.get(at..at + 4).and_then(|s| s.try_into().ok()).unwrap_or([0; 4]),
+                    );
                     *depths.entry(w & 0xff_ffff).or_default() += 1;
                     *tops.entry(w >> 24).or_default() += 1;
                 }
@@ -471,8 +486,7 @@ fn dump_one(
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
-        buffer.Unmap(0, None);
-    }
+    });
 }
 
 /// Logs which values a stencil plane read back by [`read_back_of`] holds
@@ -486,14 +500,16 @@ fn stencil_values(
 ) {
     let f = footprint.Footprint;
     let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows of
-    // one byte a texel, the last row without its padding.
-    unsafe {
-        if h == 0 || w == 0 || buffer.Map(0, None, Some(&mut data)).is_err() {
+    if h == 0 || w == 0 {
+        return;
+    }
+    let Some(needed) = (h - 1).checked_mul(pitch).and_then(|o| o.checked_add(w)) else {
+        return;
+    };
+    with_readback_bytes(buffer, |rows| {
+        if rows.len() < needed {
             return;
         }
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (h - 1) + w);
         let mut values = [0u32; 256];
         let mut bits = [0u32; 8];
         // Left, top, right, bottom of the texels with bit 3.
@@ -532,8 +548,7 @@ fn stencil_values(
             bit3_box = ?inside,
             "stencil plane values (value, texels)"
         );
-        buffer.Unmap(0, None);
-    }
+    });
 }
 
 fn half(h: u16) -> f32 {
@@ -832,27 +847,25 @@ pub(crate) fn probe(
 
 /// Whether every pixel [`probe`] read is (near) black.
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (every submission is waited for).
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
-        }
-        let bytes =
-            std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
-        let level = bytes
+    let want = (SLOT * u64::from(GRID * GRID)) as usize;
+    let Some(level) = with_readback_bytes(buffer, |bytes| {
+        bytes
+            .get(..want)
+            .unwrap_or(bytes)
             .chunks(SLOT as usize)
-            .flat_map(|pixel| pixel[..3].iter().copied())
+            .filter_map(|pixel| pixel.get(..3))
+            .flat_map(|rgb| rgb.iter().copied())
             .max()
-            .unwrap_or(0);
-        buffer.Unmap(0, None);
-        let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-        if levels.len() == 12 {
-            levels.pop_front();
-        }
-        levels.push_back(level);
-        level < 8
+            .unwrap_or(0)
+    }) else {
+        return false;
+    };
+    let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    if levels.len() == 12 {
+        levels.pop_front();
     }
+    levels.push_back(level);
+    level < 8
 }
 
 /// The brightest probed channel of the last frames, oldest first: a fade

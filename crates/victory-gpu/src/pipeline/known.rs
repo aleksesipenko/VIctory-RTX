@@ -257,6 +257,39 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// A line of `warm-bad.txt`: the key, the [`fingerprint`] the compiler
+/// crashed under, then why (GPL-3.0 provenance: avatarmanz #430).
+pub fn bad_line(key: &str, fingerprint: &str, why: &str) -> String {
+    let why = why.replace(['\r', '\n'], " ");
+    let why = why.trim();
+    if why.is_empty() {
+        format!("{key} {fingerprint} failed")
+    } else {
+        format!("{key} {fingerprint} {why}")
+    }
+}
+
+/// The keys `warm-bad.txt` (its text in `listed`) holds for `fingerprint`,
+/// and how many lines it holds for another fingerprint or legacy 2-token
+/// `key reason` format. Entries from older fingerprints and legacy unversioned
+/// lines are counted in `other` so translator/driver upgrades retry them.
+pub fn bad_keys(listed: &str, fingerprint: &str) -> (HashSet<String>, usize) {
+    let mut keys = HashSet::new();
+    let mut other = 0;
+    for line in listed.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        let mut words = line.split_whitespace();
+        let Some(key) = words.next() else { continue };
+        let second = words.next();
+        let has_reason = words.next().is_some();
+        if second == Some(fingerprint) && has_reason {
+            keys.insert(key.to_owned());
+        } else {
+            other += 1;
+        }
+    }
+    (keys, other)
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {
@@ -467,6 +500,25 @@ impl GraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bad_keys_hold_only_under_their_fingerprint() {
+        let listed = [
+            "# a comment".to_owned(),
+            bad_line("aa", "0123456789abcdef", "exit code: 0xc0000005"),
+            bad_line("bb", "fedcba9876543210", "hung for 180 s"),
+            "cc exit code: 0xc0000005".to_owned(),
+            "dd".to_owned(),
+            String::new(),
+        ]
+        .join("\n");
+        let (keys, other) = bad_keys(&listed, "0123456789abcdef");
+        assert_eq!(keys, HashSet::from(["aa".to_owned()]));
+        assert_eq!(other, 3);
+        let (keys, other) = bad_keys(&listed, "fedcba9876543210");
+        assert_eq!(keys, HashSet::from(["bb".to_owned()]));
+        assert_eq!(other, 3);
+    }
 
     #[test]
     fn failed_open_retries_before_later_records() {

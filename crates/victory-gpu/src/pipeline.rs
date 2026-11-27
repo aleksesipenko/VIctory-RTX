@@ -220,12 +220,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
+    let (stores, stores_by_address) = store_flags(&programs);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
     });
-    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -373,19 +372,37 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
+/// Compute both buffer-write flags from a single GFX10 decode pass per program
+/// (GPL-3.0 provenance: jtrudeau1530 #11).
+#[cfg(windows)]
+fn store_flags(programs: &[victory_shader::NativeProgram]) -> (bool, bool) {
+    if programs.is_empty() {
+        return (true, true);
+    }
+    let mut buffer = false;
+    for program in programs {
+        let Ok(code) = victory_shader::gfx10::decode(&program.code) else {
+            return (true, true);
+        };
+        // A flat or global write also counts as a write to buffer memory.
+        if stores_by_address(&code) {
+            return (true, true);
+        }
+        buffer = buffer || stores(&code);
+    }
+    (buffer, false)
+}
+
 /// Whether a console program can store to buffer memory: it has a buffer,
 /// typed-buffer, scalar-memory, flat or global store or atomic, or code
 /// that is not all known (an instruction of those kinds outside our table,
-/// an indirect jump, code that does not decode). Stores to textures
-/// (image instructions) and to the program's own scratch memory do not
-/// count: neither reaches a buffer's host copy. After upstream #413,
-/// which leaves scalar-memory stores out and counts image stores.
+/// an indirect jump). Stores to textures (image instructions) and to the
+/// program's own scratch memory do not count: neither reaches a buffer's host
+/// copy. After upstream #413, which leaves scalar-memory stores out and counts
+/// image stores.
 #[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
+fn stores(code: &[victory_shader::gfx10::Instruction]) -> bool {
+    use victory_shader::gfx10::Encoding;
     code.iter().any(|i| {
         let name = i.name();
         match i.encoding {
@@ -403,15 +420,11 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
 }
 
 /// Whether a console program can store to memory through raw addresses
-/// (`crate::memory`): a flat or global store or atomic, or code that does
-/// not decode. The programs that only walk ray-tracing structures do not,
-/// whatever they store through views.
+/// (`crate::memory`): a flat or global store or atomic. The programs that only
+/// walk ray-tracing structures do not, whatever they store through views.
 #[cfg(windows)]
-fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
+fn stores_by_address(code: &[victory_shader::gfx10::Instruction]) -> bool {
+    use victory_shader::gfx10::Encoding;
     code.iter().any(|i| {
         matches!(i.encoding, Encoding::Flat | Encoding::Global)
             && i.name()
@@ -662,6 +675,255 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// The parts passed to `DeserializeComputePipelineStateX` (device slot 0x218).
+/// Provenance (GPL-3.0): that-one-guy7 #34.
+#[repr(C)]
+pub(crate) struct DeserializeComputeHead {
+    root: This,
+    kind0: *const u8,
+    kind0_size: usize,
+    kind1: *const u8,
+    kind1_size: usize,
+    kind6: *const u8,
+    kind6_size: usize,
+    kind7: *const u8,
+    kind7_size: usize,
+}
+
+/// Wraps an assembled FSPX blob in a single-part `ACCC` DXBC container.
+fn build_accc_container(accc: &[u8]) -> Option<Vec<u8>> {
+    const HEADER_SIZE: usize = 32;
+    let table = HEADER_SIZE + 4;
+    let total = table.checked_add(8)?.checked_add(accc.len())?;
+    let total_u32 = u32::try_from(total).ok()?;
+    let accc_len = u32::try_from(accc.len()).ok()?;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"DXBC");
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&total_u32.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(table as u32).to_le_bytes());
+    out.extend_from_slice(b"ACCC");
+    out.extend_from_slice(&accc_len.to_le_bytes());
+    out.extend_from_slice(accc);
+    Some(out)
+}
+
+/// Reads `dst.len()` bytes from raw guest memory `src` via `ReadProcessMemory`
+/// on Windows, rejecting null, overflowing, unmapped, or short reads without
+/// faulting.
+#[cfg(windows)]
+fn safe_read_bytes(src: *const u8, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    if src.is_null() || (src as usize).checked_add(dst.len()).is_none() {
+        return false;
+    }
+    let mut read = 0usize;
+    // SAFETY: `ReadProcessMemory` validates the guest address range in kernel
+    // mode and writes at most `dst.len()` bytes into `dst`.
+    let ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            src.cast(),
+            dst.as_mut_ptr().cast(),
+            dst.len(),
+            &mut read,
+        )
+    };
+    ok != 0 && read == dst.len()
+}
+
+#[cfg(not(windows))]
+fn safe_read_bytes(src: *const u8, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    if src.is_null() || (src as usize).checked_add(dst.len()).is_none() {
+        return false;
+    }
+    // SAFETY: non-Windows test fallback with valid caller-owned buffers.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) };
+    true
+}
+
+/// Validates and writes a `This` pointer to guest output `dst` without
+/// faulting on unmapped/read-only addresses and WITHOUT altering page
+/// protection (unlike `WriteProcessMemory`, `ReadProcessMemory` probes `dst`
+/// via `ProbeForWrite` and rejects `PAGE_READONLY` and `PAGE_EXECUTE_READ`).
+#[cfg(windows)]
+fn safe_write_this(dst: *mut This, value: This) -> bool {
+    if dst.is_null()
+        || !(dst as usize).is_multiple_of(align_of::<This>())
+        || (dst as usize).checked_add(size_of::<This>()).is_none()
+    {
+        return false;
+    }
+    let mut written = 0usize;
+    // SAFETY: `ReadProcessMemory` copies from our valid stack local `value`
+    // into `dst` while validating writability of `dst` in kernel mode without
+    // temporarily changing page protection.
+    let ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            std::ptr::from_ref(&value).cast(),
+            dst.cast(),
+            size_of::<This>(),
+            &mut written,
+        )
+    };
+    ok != 0 && written == size_of::<This>()
+}
+
+#[cfg(not(windows))]
+fn safe_write_this(dst: *mut This, value: This) -> bool {
+    if dst.is_null() || !(dst as usize).is_multiple_of(align_of::<This>()) {
+        return false;
+    }
+    // SAFETY: non-null aligned caller pointer.
+    unsafe { *dst = value };
+    true
+}
+
+/// Device method 0x218 (`DeserializeComputePipelineStateX`): validate and copy
+/// guest memory into owned buffers, assemble FSPX sections into an `ACCC`
+/// container, and route through the compute pipeline path.
+pub(crate) extern "system" fn deserialize_compute_x(
+    _: This,
+    desc: *const DeserializeComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !safe_write_this(out, std::ptr::null()) {
+        return E_INVALIDARG;
+    }
+    let mut iid_bytes = [0u8; size_of::<Iid>()];
+    if !safe_read_bytes(iid.cast(), &mut iid_bytes) {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `Iid` is `[u8; 16]` / plain bytes copied from validated guest memory.
+    let local_iid: Iid = unsafe { iid_bytes.as_ptr().cast::<Iid>().read_unaligned() };
+    let mut head_bytes = [0u8; size_of::<DeserializeComputeHead>()];
+    if !safe_read_bytes(desc.cast(), &mut head_bytes) {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `DeserializeComputeHead` is `#[repr(C)]` plain pointers/sizes
+    // copied in full from validated guest memory.
+    let head: DeserializeComputeHead =
+        unsafe { head_bytes.as_ptr().cast::<DeserializeComputeHead>().read_unaligned() };
+    let Some((fspx, threads)) = assemble_fspx(&head) else {
+        tracing::warn!("DeserializeComputePipelineStateX: invalid or incomplete FSPX parts");
+        return E_INVALIDARG;
+    };
+    let Some(container) = build_accc_container(&fspx) else {
+        tracing::warn!("DeserializeComputePipelineStateX: FSPX container size overflow");
+        return E_INVALIDARG;
+    };
+    if let Some([x, y, z, flags]) = threads {
+        tracing::debug!(
+            threads = ?(x, y, z),
+            wave32 = flags & (1 << 4) != 0,
+            code = head.kind6_size,
+            "DeserializeComputePipelineStateX"
+        );
+    }
+    let mut local_out: This = std::ptr::null();
+    let hr = hand_out(
+        vec![shader("compute", &container)],
+        #[cfg(windows)]
+        None,
+        &local_iid,
+        &mut local_out,
+    );
+    if hr != object::S_OK {
+        return hr;
+    }
+    if !safe_write_this(out, local_out) {
+        if !local_out.is_null() {
+            object::release_boxed::<Pipeline>(local_out);
+        }
+        return E_INVALIDARG;
+    }
+    object::S_OK
+}
+
+const FSPX_HEADER_BYTES: usize = 0x10;
+
+/// Safely copies the four FSPX sections from guest memory into owned buffers
+/// and assembles their 16-byte-aligned container form.
+fn assemble_fspx(desc: &DeserializeComputeHead) -> Option<(Vec<u8>, Option<[u16; 4]>)> {
+    const MAX_SECTION: usize = 16 << 20;
+    let part = |ptr: *const u8, size: usize, optional: bool| -> Option<Vec<u8>> {
+        if size == 0 {
+            return optional.then(Vec::new);
+        }
+        if ptr.is_null() || size > MAX_SECTION {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        if !safe_read_bytes(ptr, &mut buf) {
+            return None;
+        }
+        Some(buf)
+    };
+    let k0 = part(desc.kind0, desc.kind0_size, false)?;
+    let k1 = part(desc.kind1, desc.kind1_size, true)?;
+    let k6 = part(desc.kind6, desc.kind6_size, false)?;
+    let k7 = part(desc.kind7, desc.kind7_size, false)?;
+    if k0.len() < 0x1c || k6.is_empty() || !k6.len().is_multiple_of(4) || k7.len() < 0x18 {
+        return None;
+    }
+    let threads = packet_threads_from_bytes(&k0);
+    let blobs: [(u32, &[u8]); 4] = [(0, &k0), (1, &k1), (6, &k6), (7, &k7)];
+    let header = FSPX_HEADER_BYTES.checked_add(16usize.checked_mul(blobs.len())?)?;
+    let mut out = vec![0u8; header];
+    for (i, (kind, blob)) in blobs.iter().enumerate() {
+        let at = out.len().checked_add(15)? & !15;
+        let end = at.checked_add(blob.len())?;
+        if end > u32::MAX as usize {
+            return None;
+        }
+        out.resize(at, 0);
+        let slot = FSPX_HEADER_BYTES + 16 * i;
+        out[slot..slot + 4].copy_from_slice(&kind.to_le_bytes());
+        out[slot + 4..slot + 8].copy_from_slice(&(at as u32).to_le_bytes());
+        out[slot + 8..slot + 12].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(blob);
+    }
+    let total = u32::try_from(out.len()).ok()?;
+    let words = [u32::from_le_bytes(*b"FSPX"), 1, blobs.len() as u32, total];
+    for (i, word) in words.into_iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    Some((out, threads))
+}
+
+/// The thread-group size and flags decoded from owned kind 0 bytes.
+fn packet_threads_from_bytes(packet: &[u8]) -> Option<[u16; 4]> {
+    let at = |offset: usize| {
+        Some(u16::from_le_bytes(
+            packet.get(offset..offset + 2)?.try_into().ok()?,
+        ))
+    };
+    Some([at(0x0c)?, at(0x0e)?, at(0x10)?, at(0x12)?])
+}
+
+/// The thread-group size and flags in kind 0, for diagnostic logging and tests.
+#[cfg(test)]
+fn packet_threads(desc: &DeserializeComputeHead) -> Option<[u16; 4]> {
+    if desc.kind0.is_null() || desc.kind0_size < 0x14 || desc.kind0_size > (16 << 20) {
+        return None;
+    }
+    let mut header = [0u8; 0x14];
+    if !safe_read_bytes(desc.kind0, &mut header) {
+        return None;
+    }
+    packet_threads_from_bytes(&header)
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -921,6 +1183,203 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn store_flags_combine_programs_and_keep_unknown_code_conservative() {
+        let program = |words: &[u32]| victory_shader::NativeProgram {
+            stage: victory_shader::HwStage::Cs,
+            wave64: false,
+            vgprs: 0,
+            layout: vec![],
+            used: vec![],
+            io: Default::default(),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let end = 0xbf81_0000;
+        let read_only = || program(&[end]);
+        // buffer_store_dwordx4 followed by s_endpgm.
+        let buffer_write = || program(&[0xe078_1000, 0x8002_0007, end]);
+        assert_eq!(store_flags(&[]), (true, true));
+        assert_eq!(store_flags(&[read_only()]), (false, false));
+        assert_eq!(store_flags(&[read_only(), buffer_write()]), (true, false));
+        let raw_write = program(&[0xdc70_0000, 0, end]); // flat_store_dword
+        let raw_code = victory_shader::gfx10::decode(&raw_write.code).unwrap();
+        assert_eq!(raw_code[0].name(), Some("flat_store_dword"));
+        assert_eq!(store_flags(&[buffer_write(), raw_write]), (true, true));
+        // A truncated instruction in a later program still makes both flags conservative.
+        assert_eq!(store_flags(&[buffer_write(), program(&[0xe078_1000])]), (true, true));
+    }
+
+    #[test]
+    fn deserialize_compute_x_builds_a_parseable_accc_pipeline() {
+        let mut k0 = [0u8; 0x1c];
+        k0[0x0c..0x0e].copy_from_slice(&8u16.to_le_bytes());
+        k0[0x0e..0x10].copy_from_slice(&16u16.to_le_bytes());
+        k0[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        k0[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        k0[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        k0[0x18..0x1c].copy_from_slice(&0x9cu32.to_le_bytes());
+        let k1 = [0x11u8; 0x14];
+        let code = [0x00u8, 0x00, 0x81, 0xBF];
+        let mut k7 = [0u8; 0x18 + 32];
+        let meta_len = (k7.len() - 0x14) as u32;
+        k7[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        k7[4..8].copy_from_slice(&meta_len.to_le_bytes());
+        k7[8..12].copy_from_slice(&(code.len() as u32 / 4).to_le_bytes());
+        k7[0x14] = 0x40;
+        k7[0x18] = 0x43;
+
+        let desc = DeserializeComputeHead {
+            root: std::ptr::null(),
+            kind0: k0.as_ptr(),
+            kind0_size: k0.len(),
+            kind1: k1.as_ptr(),
+            kind1_size: k1.len(),
+            kind6: code.as_ptr(),
+            kind6_size: code.len(),
+            kind7: k7.as_ptr(),
+            kind7_size: k7.len(),
+        };
+        let mut pipeline_ptr = std::ptr::null();
+        assert_eq!(
+            deserialize_compute_x(
+                std::ptr::null(),
+                &desc,
+                &PIPELINE_IIDS[0],
+                &mut pipeline_ptr
+            ),
+            S_OK
+        );
+        assert!(!pipeline_ptr.is_null());
+        let (stage, container) = &shaders(pipeline_ptr)[0];
+        assert_eq!(*stage, "compute");
+        let parsed = victory_shader::Container::parse(container).unwrap();
+        let accc = parsed.part(victory_shader::FourCC::ACCC).unwrap().data;
+        let programs = victory_shader::native_programs(accc).unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].code, code);
+        assert!(!programs[0].wave64);
+        assert_eq!(packet_threads(&desc), Some([8, 16, 1, 1 << 4]));
+        victory_shader::emit::translate(container)
+            .expect("ACCC compute shader should use the ordinary translator");
+        object::release_boxed::<Pipeline>(pipeline_ptr);
+    }
+
+    #[test]
+    fn deserialize_compute_x_rejects_null_or_incomplete_data() {
+        let mut pipeline_ptr = std::ptr::null();
+        assert_eq!(
+            deserialize_compute_x(
+                std::ptr::null(),
+                std::ptr::null(),
+                &PIPELINE_IIDS[0],
+                &mut pipeline_ptr
+            ),
+            E_INVALIDARG
+        );
+        assert!(pipeline_ptr.is_null());
+
+        let desc = DeserializeComputeHead {
+            root: std::ptr::null(),
+            kind0: std::ptr::null(),
+            kind0_size: 0,
+            kind1: std::ptr::null(),
+            kind1_size: 0,
+            kind6: std::ptr::null(),
+            kind6_size: 0,
+            kind7: std::ptr::null(),
+            kind7_size: 0,
+        };
+        assert_eq!(
+            deserialize_compute_x(
+                std::ptr::null(),
+                &desc,
+                &PIPELINE_IIDS[0],
+                &mut pipeline_ptr
+            ),
+            E_INVALIDARG
+        );
+        assert!(pipeline_ptr.is_null());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deserialize_compute_x_rejects_unmapped_pointers() {
+        let mut pipeline_ptr = std::ptr::null();
+        let unmapped = 0x1000usize;
+        assert_eq!(
+            deserialize_compute_x(
+                std::ptr::null(),
+                unmapped as *const DeserializeComputeHead,
+                &PIPELINE_IIDS[0],
+                &mut pipeline_ptr
+            ),
+            E_INVALIDARG
+        );
+        assert!(pipeline_ptr.is_null());
+        assert_eq!(
+            deserialize_compute_x(
+                std::ptr::null(),
+                std::ptr::null(),
+                &PIPELINE_IIDS[0],
+                unmapped as *mut This
+            ),
+            E_INVALIDARG
+        );
+        let bad_sections = DeserializeComputeHead {
+            root: std::ptr::null(),
+            kind0: unmapped as *const u8,
+            kind0_size: 0x40,
+            kind1: std::ptr::null(),
+            kind1_size: 0,
+            kind6: unmapped as *const u8,
+            kind6_size: 0x10,
+            kind7: unmapped as *const u8,
+            kind7_size: 0x20,
+        };
+        assert_eq!(
+            deserialize_compute_x(
+                std::ptr::null(),
+                &bad_sections,
+                &PIPELINE_IIDS[0],
+                &mut pipeline_ptr
+            ),
+            E_INVALIDARG
+        );
+        assert!(pipeline_ptr.is_null());
+
+        // Verify PAGE_READONLY and PAGE_EXECUTE_READ `out` pages are rejected
+        // without altering their bytes or memory protection.
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+            PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+        };
+        const SENTINEL: usize = 0xDEAD_BEEF_CAFE_BABE;
+        for prot in [PAGE_READONLY, PAGE_EXECUTE_READ] {
+            // SAFETY: test-owned 4 KiB page freed below.
+            let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!page.is_null());
+            unsafe { *page.cast::<usize>() = SENTINEL };
+            let mut old = 0u32;
+            assert_ne!(unsafe { VirtualProtect(page, 4096, prot, &mut old) }, 0);
+            assert_eq!(
+                deserialize_compute_x(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &PIPELINE_IIDS[0],
+                    page.cast::<This>()
+                ),
+                E_INVALIDARG,
+                "out pointer with protection {prot:#x} must be rejected"
+            );
+            assert_eq!(unsafe { *page.cast::<usize>() }, SENTINEL);
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            assert_ne!(unsafe { VirtualQuery(page, &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) }, 0);
+            assert_eq!(mbi.Protect, prot);
+            assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
         }
     }
 }

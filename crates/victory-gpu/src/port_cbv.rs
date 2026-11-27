@@ -48,8 +48,57 @@ pub(crate) fn in_place_on() -> bool {
 
 /// Since the last line: tables' constant buffers given in place, their bytes;
 /// copied as before because not in place, because not on 16 bytes; title
-/// slots' constant buffers whose twin is a raw view.
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// slots' constant buffers whose twin is a raw view; those read in the host
+/// copy of a small shader-written buffer ([`written_on`]), and those copied
+/// all the same (not 16-byte aligned or no raw twin).
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Whether a table's constant buffer inside a small (`<= 64 KiB`) title buffer
+/// written by shaders is read by the card directly in that buffer's host copy
+/// (`VICTORY_PORT_CBV_WRITTEN`: default `0` / disabled; `1` binds the host copy
+/// and still refreshes CPU updates via `shadow.refresh`; `2` is explicit opt-in
+/// and skips `shadow.refresh`, so subsequent CPU updates to that same shadow
+/// buffer will NOT be uploaded). Provenance (GPL-3.0): MAXAWER 8aa43c3.
+pub(crate) fn written_on() -> bool {
+    on() && written_level() > 0
+}
+
+/// `VICTORY_PORT_CBV_WRITTEN`: `0`/`off`/unset (default) disabled; `1` refresh
+/// from title memory at submission; `2` explicit opt-in skipping `shadow.refresh`
+/// (only safe if the title never performs subsequent CPU writes to that buffer).
+pub(crate) fn written_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        let level = parse_written_level(std::env::var("VICTORY_PORT_CBV_WRITTEN").ok().as_deref());
+        if on() && level > 0 {
+            tracing::info!(
+                level,
+                "small shader-written CBVs bound directly in host copy (VICTORY_PORT_CBV_WRITTEN)"
+            );
+        }
+        level
+    })
+}
+
+fn parse_written_level(raw: Option<&str>) -> u8 {
+    match raw.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// A table's constant buffer of `size` bytes is read in the host copy of a
+/// buffer shaders write.
+pub(crate) fn from_written(size: u32) {
+    let _ = size;
+    STATS[5].fetch_add(1, Relaxed);
+}
+
+/// One of a buffer shaders write was copied all the same.
+pub(crate) fn not_from_written() {
+    STATS[6].fetch_add(1, Relaxed);
+}
 
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
@@ -82,12 +131,16 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
     tracing::info!(
         "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
-         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",
+         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin; \
+         {:.0} read in the host copy of a buffer shaders write (VICTORY_PORT_CBV_WRITTEN={}), {:.0} of such buffers copied all the same",
         s[0],
         s[1] / 1024.0,
         s[2],
         s[3],
         s[4],
+        s[5],
+        written_level(),
+        s[6],
     );
 }
 
@@ -101,5 +154,12 @@ mod tests {
         assert!(raw_ok(0x3500_0100));
         assert!(!raw_ok(0x3500_0008));
         assert!(!raw_ok(0x3500_0004));
+        assert_eq!(parse_written_level(None), 0);
+        assert_eq!(parse_written_level(Some("")), 0);
+        assert_eq!(parse_written_level(Some("0")), 0);
+        assert_eq!(parse_written_level(Some("off")), 0);
+        assert_eq!(parse_written_level(Some("garbage")), 0);
+        assert_eq!(parse_written_level(Some("1")), 1);
+        assert_eq!(parse_written_level(Some("2")), 2);
     }
 }
