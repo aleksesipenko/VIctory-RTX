@@ -9643,9 +9643,12 @@ struct UploadBudgetState {
 impl UploadBudgetState {
     const TTL: std::time::Duration = std::time::Duration::from_millis(250);
 
-    fn prune_commits(&mut self, now: std::time::Instant) {
+    /// Prunes commits only once the cached DXGI sample's own timestamp is at
+    /// least `TTL` newer than `committed_at`, so an older sample (e.g. taken at
+    /// `t=249 ms`) can never drop an unreflected commit at `t=250 ms`.
+    fn prune_commits(&mut self, sampled_at: std::time::Instant) {
         while let Some(&(committed_at, bytes)) = self.recent_commits.front() {
-            if now.saturating_duration_since(committed_at) >= Self::TTL {
+            if sampled_at.saturating_duration_since(committed_at) >= Self::TTL {
                 self.recent_commits.pop_front();
                 self.recent_commit_bytes = self.recent_commit_bytes.saturating_sub(bytes);
             } else {
@@ -9678,7 +9681,9 @@ impl UploadBudgetGuard<'_> {
             .recent_commits
             .back()
             .map_or(committed_at, |&(last, _)| committed_at.max(last));
-        st.prune_commits(ts);
+        if let Some((sampled_at, _, _)) = st.sample {
+            st.prune_commits(sampled_at);
+        }
         st.in_flight_bytes = st.in_flight_bytes.saturating_sub(self.bytes);
         st.recent_commits.push_back((ts, self.bytes));
         st.recent_commit_bytes = st.recent_commit_bytes.saturating_add(self.bytes);
@@ -9724,31 +9729,38 @@ impl UploadBudget {
     {
         let before_gen = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.prune_commits(now);
-            let need_refresh = aligned_bytes >= (4 << 20)
-                || st
-                    .sample
-                    .is_none_or(|(at, _, _)| now.saturating_duration_since(at) >= UploadBudgetState::TTL);
-            if !need_refresh
-                && let Some((_, base_used, budget)) = st.sample
-            {
-                let effective_used = st.effective_used(base_used);
-                if upload_vram_fits(
-                    effective_used,
-                    budget,
-                    aligned_bytes,
-                    dxr_active,
-                    dxr_cap_bytes,
-                    dxr_slab_headroom,
-                ) {
-                    st.in_flight_bytes = st.in_flight_bytes.saturating_add(aligned_bytes);
-                    return Some(UploadBudgetGuard {
-                        budget: self,
-                        bytes: aligned_bytes,
-                        committed: false,
-                    });
+            if let Some((sampled_at, base_used, budget)) = st.sample {
+                st.prune_commits(sampled_at);
+                let need_refresh = aligned_bytes >= (4 << 20)
+                    || now.saturating_duration_since(sampled_at) >= UploadBudgetState::TTL;
+                if !need_refresh {
+                    let effective_used = st.effective_used(base_used);
+                    if upload_vram_fits(
+                        effective_used,
+                        budget,
+                        aligned_bytes,
+                        dxr_active,
+                        dxr_cap_bytes,
+                        dxr_slab_headroom,
+                    ) {
+                        st.in_flight_bytes = st.in_flight_bytes.saturating_add(aligned_bytes);
+                        return Some(UploadBudgetGuard {
+                            budget: self,
+                            bytes: aligned_bytes,
+                            committed: false,
+                        });
+                    }
+                    // If an unpruned commit has aged >= TTL by `now` while the cached
+                    // sample is still older than `committed_at + TTL`, refresh DXGI now
+                    // instead of needlessly waiting another 250 ms.
+                    let oldest_expired = st
+                        .recent_commits
+                        .front()
+                        .is_some_and(|&(at, _)| now.saturating_duration_since(at) >= UploadBudgetState::TTL);
+                    if !oldest_expired {
+                        return None;
+                    }
                 }
-                return None;
             }
             st.sample_gen
         };
@@ -9757,7 +9769,6 @@ impl UploadBudget {
         let sampled = sample_local();
 
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.prune_commits(now);
         match sampled {
             Some((dxgi_used, dxgi_budget)) => {
                 if st.sample_gen == before_gen {
@@ -9773,7 +9784,8 @@ impl UploadBudget {
                 return None;
             }
         }
-        let (_, base_used, budget) = st.sample?;
+        let (sampled_at, base_used, budget) = st.sample?;
+        st.prune_commits(sampled_at);
         let effective_used = st.effective_used(base_used);
         if upload_vram_fits(
             effective_used,
@@ -12569,6 +12581,75 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             })
             .expect("320 MiB fits once DXGI recovers");
         drop(ok);
+    }
+
+    #[test]
+    fn upload_budget_does_not_prune_commit_against_older_sample() {
+        use super::{DEFAULT_DXR_VRAM_CAP_BYTES, UploadBudget};
+        use std::time::Duration;
+        const MIB: u64 = 1 << 20;
+
+        let budget_16g = 15_200 * MIB;
+        let base_used = 8_000 * MIB;
+        let slab_headroom = 1_024 * MIB; // ceiling = 8_576 MiB, remaining = 576 MiB
+        let t0 = std::time::Instant::now();
+
+        let setup_full_at_t0_and_stale_refresh_at_249 = || {
+            let ub = UploadBudget::new();
+            // Fill exact remaining ceiling (576 MiB) at t=0.
+            ub.reserve(576 * MIB, t0, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                Some((base_used, budget_16g))
+            })
+            .expect("576 MiB fills exact ceiling at t=0")
+            .commit_at(t0);
+
+            // At t=249 ms, a >= 4 MiB request refreshes DXGI while the t=0 commit is still
+            // unreflected (`base_used` unchanged); sample timestamp advances to t=249 ms.
+            let t249 = t0 + Duration::from_millis(249);
+            assert!(
+                ub.reserve(4 * MIB, t249, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                    Some((base_used, budget_16g))
+                })
+                .is_none()
+            );
+            assert_eq!(ub.state.lock().unwrap().recent_commit_bytes, 576 * MIB);
+            ub
+        };
+
+        // Case 1: At t=250 ms a small (< 4 MiB) allocation arrives. It MUST NOT prune the
+        // t=0 commit against the t=249 ms sample; instead it refreshes DXGI live at t=250 ms,
+        // sees the reflected 8_576 MiB usage, and stays rejected (never slipping past ceiling).
+        let t250 = t0 + Duration::from_millis(250);
+        let ub1 = setup_full_at_t0_and_stale_refresh_at_249();
+        let mut refreshed = false;
+        assert!(
+            ub1.reserve(64 << 10, t250, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                refreshed = true;
+                Some((base_used + 576 * MIB, budget_16g))
+            })
+            .is_none(),
+            "small allocation at t=250 ms must never slip past ceiling against stale t=249 ms sample"
+        );
+        assert!(refreshed, "expired commit at t=250 ms must trigger a live DXGI refresh");
+
+        // Case 2: If that live DXGI refresh at t=250 ms fails, fail closed AND keep the commit unpruned.
+        let ub2 = setup_full_at_t0_and_stale_refresh_at_249();
+        assert!(
+            ub2.reserve(64 << 10, t250, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || None)
+                .is_none()
+        );
+        assert_eq!(ub2.state.lock().unwrap().recent_commit_bytes, 576 * MIB);
+
+        // Case 3: If the live DXGI refresh at t=250 ms genuinely reports freed VRAM, the t=0
+        // commit is pruned against the new t=250 ms sample and the small allocation succeeds immediately.
+        let ub3 = setup_full_at_t0_and_stale_refresh_at_249();
+        let guard = ub3
+            .reserve(64 << 10, t250, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                Some((base_used, budget_16g))
+            })
+            .expect("live refresh at t=250 ms prunes expired t=0 commit without waiting until t=499 ms");
+        assert_eq!(ub3.state.lock().unwrap().recent_commit_bytes, 0);
+        drop(guard);
     }
 }
 
