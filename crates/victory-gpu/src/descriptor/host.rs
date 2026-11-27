@@ -218,7 +218,7 @@ pub(crate) struct HostHeap {
     /// are due: such a texture is uploaded when a draw reads it through a
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
-    textures: Mutex<TextureQueue>,
+    textures: std::sync::Arc<Mutex<TextureQueue>>,
     /// Its slots ([`Queued`]).
     queued: std::sync::Arc<Queued>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
@@ -1344,6 +1344,45 @@ impl TextureQueue {
         }
     }
 
+    /// Commits a submit-time baseline fingerprint computed directly from the
+    /// exact `tiled` guest bytes uploaded to the GPU (`Staging::on_uploaded`),
+    /// upgrading the record-time `Pending` placeholder only if slot `index` is
+    /// still on `(write, uploaded)` and still `Pending`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_baseline(
+        &mut self,
+        index: u32,
+        write: u64,
+        uploaded: u64,
+        due: u64,
+        print: u64,
+        state: LiveState,
+        baseline: LiveBaseline,
+    ) {
+        if !self.live.get(&index).is_some_and(|&(_, b, _)| b == LiveBaseline::Pending) {
+            return;
+        }
+        if let Some(w) = self.same(index, write)
+            && w.checked.2 != 0
+            && w.checked.4 == uploaded
+        {
+            w.due = due;
+            w.checked.2 = print;
+            if state == LiveState::Plain && baseline == LiveBaseline::Strip {
+                self.live.remove(&index);
+            } else {
+                let poll = self.live.get(&index).map_or_else(
+                    || {
+                        self.live_polls += 1;
+                        self.live_polls
+                    },
+                    |&(_, _, poll)| poll,
+                );
+                self.live.insert(index, (state, baseline, poll));
+            }
+        }
+    }
+
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look, plus its [`LiveState`] and [`LiveBaseline`].
     pub(crate) fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, LiveState, LiveBaseline)> {
@@ -2056,7 +2095,10 @@ impl HostHeap {
             stride_shadow,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
-            textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
+            textures: std::sync::Arc::new(Mutex::new(TextureQueue {
+                queued: queued.clone(),
+                ..Default::default()
+            })),
             queued,
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2315,6 +2357,12 @@ impl HostHeap {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .defer_recheck(index, write, due);
+    }
+
+    /// Shared handle to this heap's [`TextureQueue`] for submit-time upload
+    /// baseline commits (`Staging::on_uploaded`).
+    pub(crate) fn texture_queue(&self) -> std::sync::Arc<Mutex<TextureQueue>> {
+        self.textures.clone()
     }
 
     /// See [`TextureQueue::checked`].
@@ -6076,6 +6124,53 @@ mod tests {
         rr.defer_recheck(12, w(12), 3);
         assert_eq!(rr.due(3, 10), [(12, w(12)), (10, w(10)), (11, w(11))]);
         assert_eq!(rr.checked(12).map(|c| c.3), Some(0), "deferred slot keeps looks count");
+    }
+
+    /// `TextureQueue::commit_baseline` upgrades a record-time `Pending` slot
+    /// with the exact submit-time fingerprint of uploaded bytes, clears `live`
+    /// for `(Plain, Strip)`, and safely ignores stale callbacks after a newer
+    /// upload, overwrite, or removal.
+    #[test]
+    fn commit_baseline_updates_pending_and_ignores_stale_callbacks() {
+        let mut q = TextureQueue::default();
+        // 1) Live slot: Pending -> Dense with exact uploaded print and due.
+        q.written(42, 10, 10, false);
+        let w42 = q.due(10, 10)[0].1;
+        q.recheck(42, w42, 11, (0x1000, 0x2000), 1, 0, 10, LiveState::Live, LiveBaseline::Pending);
+        q.commit_baseline(42, w42, 10, 11, 0xbeef_cafe, LiveState::Live, LiveBaseline::Dense);
+        assert_eq!(
+            q.checked(42),
+            Some((0x1000, 0x2000, 0xbeef_cafe, 0, 10, LiveState::Live, LiveBaseline::Dense))
+        );
+        // Repeat/stale callback once already Dense must no-op.
+        q.commit_baseline(42, w42, 10, 99, 0x1111, LiveState::Live, LiveBaseline::Dense);
+        assert_eq!(q.checked(42).map(|c| c.2), Some(0xbeef_cafe));
+
+        // 2) Plain slot: Pending -> Strip commits print, updates due to frame + 4, and clears `live` map.
+        q.written(43, 10, 10, false);
+        let w43 = q.due(10, 10)[0].1;
+        q.recheck(43, w43, 11, (0x2000, 0x1000), 1, 0, 10, LiveState::Plain, LiveBaseline::Pending);
+        assert!(q.live.contains_key(&43), "Pending Plain stays tracked until submit commits Strip");
+        q.commit_baseline(43, w43, 10, 14, 0xface_b00c, LiveState::Plain, LiveBaseline::Strip);
+        assert!(!q.live.contains_key(&43), "Committed Plain Strip leaves `live` map");
+        assert_eq!(
+            q.checked(43),
+            Some((0x2000, 0x1000, 0xface_b00c, 0, 10, LiveState::Plain, LiveBaseline::Strip))
+        );
+        assert!(!q.due(13, 10).iter().any(|&(s, _)| s == 43));
+        assert!(q.due(14, 10).iter().any(|&(s, _)| s == 43));
+
+        // 3) Stale callback from older `uploaded` frame or overwritten `write` must be ignored.
+        q.recheck(42, w42, 13, (0x1000, 0x2000), 1, 0, 12, LiveState::Live, LiveBaseline::Pending);
+        q.commit_baseline(42, w42, 10, 11, 0xdead, LiveState::Live, LiveBaseline::Dense);
+        assert_eq!(
+            q.checked(42).map(|c| (c.2, c.6)),
+            Some((1, LiveBaseline::Pending)),
+            "stale older uploaded frame must not overwrite newer Pending upload"
+        );
+        q.written(42, 13, 13, false);
+        q.commit_baseline(42, w42, 12, 13, 0xdead, LiveState::Live, LiveBaseline::Dense);
+        assert_eq!(q.checked(42), None, "stale write must not revive overwritten slot");
     }
 
     /// Even when 5,000 ready `again` (`Plain` recheck) slots AND 5,000 ready

@@ -97,6 +97,10 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Submit-time baseline callbacks registered by `draw::State::heap_textures`
+    /// so each slot's recheck fingerprint matches the exact `tiled` guest bytes
+    /// detiled into this staging buffer for GPU upload.
+    on_upload: Mutex<Vec<Box<dyn FnOnce(&[u8]) + Send>>>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -753,11 +757,24 @@ pub(crate) fn digest(bytes: &[u8]) -> Digest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Digest(pub(crate) u128);
 
+/// Normalizes `first` the same way [`upload_from`] does for its per-list
+/// deduplication key.
+pub(crate) fn upload_first_key(first: u32) -> u32 {
+    if crate::resource::held_only() { first } else { 0 }
+}
+
+/// Whether `list` has already recorded an upload of `(resource, first)` (or of
+/// `resource` as a whole) since its last reset.
+pub(crate) fn uploaded_in_list(list: &HostList, resource: This, first: u32) -> bool {
+    let first = upload_first_key(first);
+    list.used(1 << 63 | (resource as usize) << 4 | first as usize & 15) || list.used(resource as usize)
+}
+
 /// [`upload`] of the levels from `first` on, the ones a view shows: of a
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = upload_first_key(first);
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1232,6 +1249,27 @@ impl Staging {
         (self.memory as usize, self.read)
     }
 
+    /// Registers a submit-time callback invoked with the exact `tiled` guest
+    /// byte slice uploaded to the GPU when this staging buffer refreshes.
+    pub(crate) fn on_uploaded(&self, f: impl FnOnce(&[u8]) + Send + 'static) {
+        self.on_upload.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(f));
+    }
+
+    /// Runs any pending `on_upload` baseline callbacks with the exact `tiled`
+    /// byte slice just detiled (or confirmed unchanged) for GPU upload.
+    fn notify_uploaded(&self, tiled: &[u8]) {
+        let callbacks = {
+            let mut list = self.on_upload.lock().unwrap_or_else(|e| e.into_inner());
+            if list.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *list)
+        };
+        for cb in callbacks {
+            cb(tiled);
+        }
+    }
+
     /// The title's level and the array slice of the staging buffer's part
     /// `i`.
     fn part(&self, i: usize) -> (u32, u32) {
@@ -1379,6 +1417,9 @@ impl Staging {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = digest(read);
                 if last.hash == Some(hash) {
+                    if !read.iter().all(|&b| b == 0) {
+                        self.notify_uploaded(read);
+                    }
                     return false;
                 }
                 last.hash = Some(hash);
@@ -1403,6 +1444,7 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    self.notify_uploaded(tiled);
                     return size;
                 }
                 last.hash = Some(hash);
@@ -1421,6 +1463,7 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            self.notify_uploaded(tiled);
             return size;
         }
         last.hash = Some(hash);
@@ -1450,6 +1493,8 @@ impl Staging {
                 last.hash = Some(hash);
                 self.detile(read);
                 self.keep_whole(read);
+            } else {
+                self.notify_uploaded(read);
             }
             true
         });
@@ -1582,6 +1627,7 @@ impl Staging {
                 return;
             }
         }
+        self.notify_uploaded(tiled);
     }
 }
 
@@ -1595,11 +1641,10 @@ pub(crate) fn unstage(resource: This) {
     }
 }
 
-/// Where a staged title texture's memory is: address and bytes.
-pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
+/// Current staging buffer handle for `resource`, if one is registered.
+pub(crate) fn staged_handle(resource: This) -> Option<Arc<Staging>> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
-    Some((at as u64, len as u64))
+    map.as_ref()?.get(&(resource as usize)).cloned()
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
@@ -1670,6 +1715,49 @@ fn mix_chunk(acc: u64, chunk: u128, index: usize) -> u64 {
     acc = acc.wrapping_mul(0x94D0_49BB_1331_11EB);
     acc ^= acc >> 27;
     acc
+}
+
+/// Computes the exact same fingerprint as [`fingerprint_for`] directly over an
+/// already-read byte slice `bytes` (e.g. the exact `tiled` slice that
+/// [`Staging::detile`] just detiled into the GPU upload staging buffer).
+pub(crate) fn fingerprint_slice(bytes: &[u8], dense: bool) -> u64 {
+    const WINDOW: usize = 16 << 10;
+    const CHUNK: usize = 64 << 10;
+    let len = bytes.len();
+    if !dense {
+        let mut print = 0u128;
+        let mut take = |from: usize, n: usize| {
+            print = print.rotate_left(37) ^ digest(&bytes[from..from + n]).0;
+        };
+        if len <= 3 * WINDOW {
+            take(0, len);
+        } else {
+            take(0, WINDOW);
+            take((len / 2) & !0xfff, WINDOW);
+            take(len - WINDOW, WINDOW);
+        }
+        let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+        return u64::from_le_bytes(first) | 1;
+    }
+    let len_u64 = len as u64;
+    let mut acc = len_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if len_u64 <= LIVE_WHOLE_BYTES {
+        let mut from = 0;
+        let mut index = 0usize;
+        while from < len {
+            let n = CHUNK.min(len - from);
+            acc = mix_chunk(acc, digest(&bytes[from..from + n]).0, index);
+            from += n;
+            index += 1;
+        }
+    } else {
+        let span = len - LIVE_GRID_SLICE_BYTES;
+        for i in 0..LIVE_GRID_SLICES {
+            let from = (i as u128 * span as u128 / (LIVE_GRID_SLICES - 1) as u128) as usize;
+            acc = mix_chunk(acc, digest(&bytes[from..from + LIVE_GRID_SLICE_BYTES]).0, i);
+        }
+    }
+    acc | 1
 }
 
 /// [`fingerprint`], or for a dense/live slot: all bytes up to
@@ -2104,6 +2192,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        on_upload: Mutex::default(),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -2288,6 +2377,28 @@ mod title_memory_tests {
             after, before,
             "identical flips spaced 4 MiB apart must not collide"
         );
+    }
+
+    /// `fingerprint_slice` (used at submit time directly on the uploaded
+    /// `tiled` bytes) must be bit-for-bit identical to `fingerprint_for` across
+    /// small (<= 48 KiB), medium (256 KiB), full dense (<= 16 MiB), and
+    /// >16 MiB uniform grid buffers.
+    #[test]
+    fn fingerprint_slice_matches_fingerprint_for_all_sizes() {
+        for len in [16usize << 10, 256 << 10, 8 << 20, 17 << 20] {
+            let mut buf = vec![0x3cu8; len];
+            buf[0] = 0x11;
+            buf[len / 3] = 0x77;
+            buf[len - 1] = 0x99;
+            let at = buf.as_ptr() as u64;
+            for dense in [false, true] {
+                assert_eq!(
+                    super::fingerprint_slice(&buf, dense),
+                    super::fingerprint_for(at, len as u64, dense),
+                    "mismatch for len={len}, dense={dense}"
+                );
+            }
+        }
     }
 }
 
