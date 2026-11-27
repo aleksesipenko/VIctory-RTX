@@ -287,43 +287,51 @@ fn nt_query_system_information() -> Option<NtQuerySystemInformationFn> {
     })
 }
 
-/// Per-core `(idle_time, kernel_time + user_time)` counters from Windows.
-fn read_cpu_times() -> Vec<(i64, i64)> {
-    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-    const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
-    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
-    let Some(query) = nt_query_system_information() else {
-        return Vec::new();
-    };
-    let mut sys_info = SYSTEM_INFO::default();
-    // SAFETY: plain system query into our stack structure.
-    unsafe { GetSystemInfo(&mut sys_info) };
-    let mut cap = (sys_info.dwNumberOfProcessors as usize).clamp(1, 256);
-    for _ in 0..2 {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CpuTimes {
+    idle: i64,
+    kernel: i64,
+    user: i64,
+}
+
+const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+const MAX_CPUS: usize = 1024;
+
+/// Loops and grows the performance-information buffer on
+/// `STATUS_INFO_LENGTH_MISMATCH` up to `MAX_CPUS`, handling multi-group systems.
+fn query_cpu_times_with<F>(initial_cap: usize, mut query: F) -> Vec<CpuTimes>
+where
+    F: FnMut(&mut [SystemProcessorPerformanceInformation], &mut u32) -> i32,
+{
+    let entry_size = size_of::<SystemProcessorPerformanceInformation>();
+    let mut cap = initial_cap.clamp(1, MAX_CPUS);
+    for _ in 0..8 {
         let mut buf = vec![SystemProcessorPerformanceInformation::default(); cap];
         let mut returned = 0u32;
-        let bytes = (buf.len() * size_of::<SystemProcessorPerformanceInformation>()) as u32;
-        // SAFETY: `buf` holds `bytes` writable bytes; `returned` is a valid out pointer.
-        let status = unsafe {
-            query(
-                SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
-                buf.as_mut_ptr().cast(),
-                bytes,
-                &mut returned,
-            )
-        };
+        let status = query(&mut buf, &mut returned);
         if status >= 0 {
-            let count = (returned as usize / size_of::<SystemProcessorPerformanceInformation>())
-                .min(buf.len());
+            let count = (returned as usize / entry_size).min(buf.len());
             return buf[..count]
                 .iter()
-                .map(|p| (p.idle_time, p.kernel_time.saturating_add(p.user_time)))
+                .map(|p| CpuTimes {
+                    idle: p.idle_time,
+                    kernel: p.kernel_time,
+                    user: p.user_time,
+                })
                 .collect();
         }
-        if status == STATUS_INFO_LENGTH_MISMATCH && returned > 0 {
-            cap = (returned as usize)
-                .div_ceil(size_of::<SystemProcessorPerformanceInformation>())
-                .clamp(1, 1024);
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            let needed = if returned > 0 {
+                (returned as usize).div_ceil(entry_size)
+            } else {
+                cap.saturating_mul(2)
+            };
+            let next = needed.clamp(1, MAX_CPUS);
+            if next <= cap {
+                break;
+            }
+            cap = next;
         } else {
             break;
         }
@@ -331,23 +339,53 @@ fn read_cpu_times() -> Vec<(i64, i64)> {
     Vec::new()
 }
 
-/// How busy a core was between two reads of its `(idle, kernel + user)`
-/// counters, in percent. A core's counters can step back between two
-/// reads (seen on a Ryzen 7 7700): that reads as idle rather than making
-/// `clamp(0, negative)` panic on the submitting thread.
+/// Per-core `(idle, kernel, user)` counters from Windows across all processor groups.
+fn read_cpu_times() -> Vec<CpuTimes> {
+    use windows_sys::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount};
+    let Some(query) = nt_query_system_information() else {
+        return Vec::new();
+    };
+    // SAFETY: `ALL_PROCESSOR_GROUPS` (0xFFFF) queries active logical processors across all groups.
+    let active = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } as usize;
+    query_cpu_times_with(active, |buf, returned| {
+        let bytes = size_of_val(buf) as u32;
+        // SAFETY: `buf` holds `bytes` writable bytes; `returned` is a valid out pointer.
+        unsafe {
+            query(
+                SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+                buf.as_mut_ptr().cast(),
+                bytes,
+                returned,
+            )
+        }
+    })
+}
+
+/// How busy a core was between two reads of its `(idle, kernel, user)`
+/// counters, in percent. On Windows `kernel` includes `idle`, so total elapsed
+/// time is `kernel + user`. If any counter steps backward between two reads
+/// (seen on a Ryzen 7 7700) or total elapsed time is non-positive, treat the
+/// interval as invalid and read `0.0%` (idle) rather than panicking or
+/// producing a false `100%` spike.
 /// Provenance (GPL-3.0): Belobug/VIctory-Belobug-AMD#325.
-fn busy_pct((pi, pt): (i64, i64), (ni, nt): (i64, i64)) -> f32 {
-    let span = nt.saturating_sub(pt);
+fn busy_pct(prev: CpuTimes, cur: CpuTimes) -> f32 {
+    if cur.idle < prev.idle || cur.kernel < prev.kernel || cur.user < prev.user {
+        return 0.0;
+    }
+    let di = cur.idle.saturating_sub(prev.idle);
+    let dk = cur.kernel.saturating_sub(prev.kernel);
+    let du = cur.user.saturating_sub(prev.user);
+    let span = dk.saturating_add(du);
     if span <= 0 {
         return 0.0;
     }
-    let di = ni.saturating_sub(pi).clamp(0, span) as f32;
+    let di = di.min(span) as f32;
     ((1.0 - di / span as f32) * 100.0).clamp(0.0, 100.0)
 }
 
 #[derive(Default)]
 struct CpuMeter {
-    prev: Vec<(i64, i64)>,
+    prev: Vec<CpuTimes>,
     total_pct: Option<f32>,
     peak_core_pct: Option<f32>,
 }
@@ -363,7 +401,7 @@ impl CpuMeter {
         self.update(read_cpu_times());
     }
 
-    fn update(&mut self, now: Vec<(i64, i64)>) {
+    fn update(&mut self, now: Vec<CpuTimes>) {
         if now.is_empty() {
             self.reset();
             return;
@@ -718,38 +756,91 @@ mod tests {
 
 #[cfg(test)]
 mod busy_tests {
-    use super::{COLUMNS, CpuMeter, busy_pct, cpu_line, glyph};
+    use super::{
+        COLUMNS, CpuMeter, CpuTimes, MAX_CPUS, STATUS_INFO_LENGTH_MISMATCH,
+        SystemProcessorPerformanceInformation, busy_pct, cpu_line, glyph, query_cpu_times_with,
+    };
+
+    const fn ct(idle: i64, kernel: i64, user: i64) -> CpuTimes {
+        CpuTimes { idle, kernel, user }
+    }
 
     #[test]
     fn busy_is_the_share_of_time_not_idle() {
-        assert_eq!(busy_pct((0, 0), (25, 100)), 75.0);
-        assert_eq!(busy_pct((0, 0), (100, 100)), 0.0);
-        assert_eq!(busy_pct((0, 0), (0, 100)), 100.0);
+        assert_eq!(busy_pct(ct(0, 0, 0), ct(25, 60, 40)), 75.0);
+        assert_eq!(busy_pct(ct(0, 0, 0), ct(100, 100, 0)), 0.0);
+        assert_eq!(busy_pct(ct(0, 0, 0), ct(0, 50, 50)), 100.0);
     }
 
     #[test]
     fn counters_that_step_back_do_not_panic() {
-        assert_eq!(busy_pct((10, 156_250), (10, 0)), 0.0);
-        assert_eq!(busy_pct((500, 1_000), (400, 900)), 0.0);
-        assert_eq!(busy_pct((500, 1_000), (400, 1_100)), 100.0);
-        assert_eq!(busy_pct((0, 100), (200, 150)), 0.0);
+        // Kernel counter steps back.
+        assert_eq!(busy_pct(ct(10, 156_250, 0), ct(10, 0, 0)), 0.0);
+        // Both idle and kernel step back.
+        assert_eq!(busy_pct(ct(500, 1_000, 0), ct(400, 900, 0)), 0.0);
+        // Idle steps back while kernel advances: invalid interval reads as 0% idle, not 100%.
+        assert_eq!(busy_pct(ct(500, 1_000, 0), ct(400, 1_100, 0)), 0.0);
+        // User counter steps back even when kernel + user advances.
+        assert_eq!(busy_pct(ct(10, 500, 500), ct(10, 700, 400)), 0.0);
+        // Zero total delta reads as 0%.
+        assert_eq!(busy_pct(ct(10, 100, 50), ct(10, 100, 50)), 0.0);
+        // Idle delta larger than total delta clamps cleanly to 0%.
+        assert_eq!(busy_pct(ct(0, 100, 0), ct(200, 150, 0)), 0.0);
         // Extreme i64 values must saturate without overflow panics.
-        let extreme = busy_pct((i64::MAX, i64::MIN), (i64::MIN, i64::MAX));
-        assert!((0.0..=100.0).contains(&extreme));
+        assert_eq!(
+            busy_pct(ct(i64::MAX, i64::MIN, 0), ct(i64::MIN, i64::MAX, 0)),
+            0.0
+        );
+        let wide = busy_pct(ct(i64::MIN, i64::MIN, 0), ct(i64::MAX, i64::MAX, 0));
+        assert!((0.0..=100.0).contains(&wide));
     }
 
     #[test]
     fn cpu_meter_handles_core_step_back_and_formats_line() {
         let mut meter = CpuMeter::default();
         assert_eq!(cpu_line(meter.total_pct, meter.peak_core_pct), "CPU N/A");
-        meter.update(vec![(10, 156_250), (0, 100)]);
+        meter.update(vec![ct(10, 156_250, 0), ct(0, 100, 0)]);
         assert_eq!(meter.total_pct, None);
-        meter.update(vec![(10, 0), (20, 200)]);
+        meter.update(vec![ct(10, 0, 0), ct(20, 160, 40)]);
         assert_eq!(meter.total_pct, Some(40.0));
         assert_eq!(meter.peak_core_pct, Some(80.0));
         let line = cpu_line(meter.total_pct, meter.peak_core_pct);
         assert_eq!(line, "CPU 40%  PEAK CORE 80%");
         assert!(line.len() <= COLUMNS as usize);
         assert!(line.bytes().all(|b| glyph(b.to_ascii_uppercase()) != glyph(b'#')));
+    }
+
+    #[test]
+    fn cpu_query_grows_across_processor_groups_and_caps_cleanly() {
+        let entry_size = size_of::<SystemProcessorPerformanceInformation>();
+        let total_cpus = 128usize; // Spans two 64-core processor groups.
+        let mut attempts = 0usize;
+        let samples = query_cpu_times_with(64, |buf, returned| {
+            attempts += 1;
+            let needed = (total_cpus * entry_size) as u32;
+            *returned = needed;
+            if buf.len() < total_cpus {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            for (i, slot) in buf[..total_cpus].iter_mut().enumerate() {
+                slot.idle_time = i as i64;
+                slot.kernel_time = (i * 2) as i64;
+                slot.user_time = (i * 3) as i64;
+            }
+            0
+        });
+        assert_eq!(attempts, 2);
+        assert_eq!(samples.len(), total_cpus);
+        assert_eq!(samples[127], ct(127, 254, 381));
+
+        // Requests larger than MAX_CPUS terminate cleanly without looping forever.
+        let mut cap_attempts = 0usize;
+        let overflow = query_cpu_times_with(64, |_buf, returned| {
+            cap_attempts += 1;
+            *returned = ((MAX_CPUS + 64) * entry_size) as u32;
+            STATUS_INFO_LENGTH_MISMATCH
+        });
+        assert!(overflow.is_empty());
+        assert!(cap_attempts <= 3);
     }
 }

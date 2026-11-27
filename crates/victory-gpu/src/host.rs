@@ -40,9 +40,9 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     /// Whether `D3D12_HEAP_TYPE_GPU_UPLOAD` (Resizable BAR VRAM) is supported.
     pub(crate) gpu_upload_supported: bool,
-    /// Cached local VRAM sample `(at, used_bytes, budget_bytes)` for
+    /// Atomic pre-allocation local VRAM reservation tracker for
     /// `D3D12_HEAP_TYPE_GPU_UPLOAD` admission checks.
-    upload_vram_headroom: Mutex<Option<(std::time::Instant, u64, u64)>>,
+    upload_budget: UploadBudget,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -630,37 +630,16 @@ fn bury_lag() -> u64 {
     })
 }
 
-/// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
-/// numbers come in order, but for threads that overtake each other: one of
-/// those is dropped a little later than it could be.
-///
-/// With `VICTORY_BURY_ASIDE=1` (off by default; provenance: fxceless #1224 &
-/// Peppacodes/playablegames-peppa #6, GPL-3.0), drained objects are dropped on
-/// a dedicated `victory-bury` thread so COM releases never stall landing or
-/// submission threads.
-fn bury(finished: u64) {
+fn bury_aside_enabled() -> bool {
     static ASIDE: OnceLock<bool> = OnceLock::new();
-    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
     let aside = *ASIDE.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1"));
     #[cfg(feature = "diagnostics")]
     let aside = crate::ab::pick("VICTORY_BURY_ASIDE").unwrap_or(aside);
-    let finished = finished.saturating_sub(bury_lag());
-    let mut deferred = Vec::new();
-    for part in &RETIRED {
-        let done: Vec<(u64, Retired)> = {
-            let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
-            let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-            if n == 0 {
-                continue;
-            }
-            retired.drain(..n).collect()
-        };
-        if aside {
-            deferred.extend(done);
-        } else {
-            drop(done);
-        }
-    }
+    aside
+}
+
+fn send_to_bury_thread(deferred: Vec<(u64, Retired)>) {
+    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
     if deferred.is_empty() {
         return;
     }
@@ -684,6 +663,53 @@ fn bury(finished: u64) {
         }
         None => drop(deferred),
     }
+}
+
+/// Drops COM resources on the dedicated `victory-bury` thread when
+/// `VICTORY_BURY_ASIDE` is enabled, or synchronously otherwise.
+pub(crate) fn bury_resources(resources: Vec<ID3D12Resource>) {
+    if resources.is_empty() {
+        return;
+    }
+    if bury_aside_enabled() {
+        let deferred = resources
+            .into_iter()
+            .map(|r| (0, Retired::Resource(r)))
+            .collect();
+        send_to_bury_thread(deferred);
+    } else {
+        drop(resources);
+    }
+}
+
+/// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
+/// numbers come in order, but for threads that overtake each other: one of
+/// those is dropped a little later than it could be.
+///
+/// With `VICTORY_BURY_ASIDE=1` (off by default; provenance: fxceless #1224 &
+/// Peppacodes/playablegames-peppa #6, GPL-3.0), drained objects are dropped on
+/// a dedicated `victory-bury` thread so COM releases never stall landing or
+/// submission threads.
+fn bury(finished: u64) {
+    let aside = bury_aside_enabled();
+    let finished = finished.saturating_sub(bury_lag());
+    let mut deferred = Vec::new();
+    for part in &RETIRED {
+        let done: Vec<(u64, Retired)> = {
+            let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
+            let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+            if n == 0 {
+                continue;
+            }
+            retired.drain(..n).collect()
+        };
+        if aside {
+            deferred.extend(done);
+        } else {
+            drop(done);
+        }
+    }
+    send_to_bury_thread(deferred);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -1168,7 +1194,7 @@ fn create() -> windows::core::Result<Host> {
             dxr,
             device,
             gpu_upload_supported,
-            upload_vram_headroom: Mutex::new(None),
+            upload_budget: UploadBudget::new(),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -6876,33 +6902,31 @@ impl HostList {
         self.empty_closed.store(true, Ordering::Release);
     }
 
-    /// Releases oversized buffers when a list stays in the hot spare pool
+    /// Detaches oversized buffers when a list stays in the hot spare pool
     /// (`list::HOT_SPARE`), keeping normal indirect argument and scratch
-    /// buffers warm across frames.
+    /// buffers warm across frames. Returns the detached COM resources for
+    /// out-of-lock / `VICTORY_BURY_ASIDE` release.
     /// Provenance (GPL-3.0): Marvisak/VIctory#3228.
-    pub(crate) fn trim_oversized_buffers(&self) {
+    pub(crate) fn trim_oversized_buffers(&self) -> Vec<ID3D12Resource> {
         const MAX_WARM_INDIRECT_ARGS: u64 = 256 << 10;
         const MAX_WARM_BATCH_BUFFERS: usize = 2;
         const HOT_SCRATCH_CHUNKS: usize = 2;
-        let drop_indirect = {
+        let mut freed = Vec::new();
+        {
             let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.as_ref().is_some_and(|(_, cap)| *cap > MAX_WARM_INDIRECT_ARGS) {
-                slot.take()
-            } else {
-                None
+            if slot.as_ref().is_some_and(|(_, cap)| *cap > MAX_WARM_INDIRECT_ARGS)
+                && let Some((buf, _)) = slot.take()
+            {
+                freed.push(buf);
             }
-        };
-        drop(drop_indirect);
-        let drop_batches = {
+        }
+        {
             let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
             args.1 = 0;
             if args.0.len() > MAX_WARM_BATCH_BUFFERS {
-                args.0.split_off(MAX_WARM_BATCH_BUFFERS)
-            } else {
-                Vec::new()
+                freed.extend(args.0.split_off(MAX_WARM_BATCH_BUFFERS));
             }
-        };
-        drop(drop_batches);
+        }
         if !scratch_pool() {
             let drop_chunks = {
                 let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
@@ -6914,23 +6938,30 @@ impl HostList {
                     Vec::new()
                 }
             };
-            give_chunks(drop_chunks);
+            for (chunk, size) in drop_chunks {
+                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+                freed.push(chunk.buffer);
+            }
         }
+        freed
     }
 
-    /// Releases indirect argument buffers and trims scratch chunks when a list
-    /// is parked in the cold idle pool beyond `list::HOT_SPARE`.
+    /// Detaches indirect argument buffers and trims scratch chunks when a list
+    /// is parked in the cold idle pool beyond `list::HOT_SPARE`. Returns the
+    /// detached COM resources for out-of-lock / `VICTORY_BURY_ASIDE` release.
     /// Provenance (GPL-3.0): Marvisak/VIctory#3228.
-    pub(crate) fn release_idle_buffers(&self) {
+    pub(crate) fn release_idle_buffers(&self) -> Vec<ID3D12Resource> {
         const IDLE_SCRATCH_SPARE: usize = 1;
-        let drop_indirect = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).take();
-        drop(drop_indirect);
-        let drop_batches = {
+        let mut freed = Vec::new();
+        if let Some((buf, _)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            freed.push(buf);
+        }
+        {
             let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
             args.1 = 0;
-            std::mem::take(&mut args.0)
-        };
-        drop(drop_batches);
+            freed.extend(std::mem::take(&mut args.0));
+        }
         if !scratch_pool() {
             let drop_chunks = {
                 let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
@@ -6951,8 +6982,13 @@ impl HostList {
                     Vec::new()
                 }
             };
-            give_chunks(drop_chunks);
+            for (chunk, size) in drop_chunks {
+                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+                freed.push(chunk.buffer);
+            }
         }
+        freed
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -9440,18 +9476,33 @@ impl Host {
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let bytes = size.max(1);
         // D3D12 committed buffers occupy at least 64 KiB of physical VRAM;
-        // charge the aligned footprint against the cached local budget window
-        // so bursts of small buffers cannot overshoot the 75% ceiling.
+        // atomically reserve the aligned footprint BEFORE CreateCommittedResource
+        // so concurrent threads (e.g. VICTORY_THIN=1) cannot overshoot the 75% /
+        // DXR ceiling.
         let physical = bytes.checked_next_multiple_of(64 << 10).unwrap_or(u64::MAX);
-        if self.gpu_upload_supported
-            && upload_vram_enabled()
-            && self.upload_vram_has_headroom(physical)
-            && let Some(made) = self.upload_vram_buffer(bytes)
-        {
-            self.note_upload_vram(physical);
-            #[cfg(feature = "diagnostics")]
-            UPLOAD_VRAM_BYTES.fetch_add(bytes, Ordering::Relaxed);
-            return Some(made);
+        if self.gpu_upload_supported && upload_vram_enabled() {
+            let dxr_active = self.dxr.is_some() || crate::dxr::requested();
+            let dxr_cap = if dxr_active { upload_vram_dxr_cap_bytes() } else { u64::MAX };
+            let dxr_headroom = if dxr_active { crate::dxr::slab_headroom() } else { 0 };
+            if let Some(guard) = self.upload_budget.reserve(
+                physical,
+                std::time::Instant::now(),
+                dxr_active,
+                dxr_cap,
+                dxr_headroom,
+                || {
+                    let [local, _] = self.sample_video_memory();
+                    local.map(|l| (l.CurrentUsage, l.Budget))
+                },
+            ) {
+                if let Some(made) = self.upload_vram_buffer(bytes) {
+                    guard.commit();
+                    #[cfg(feature = "diagnostics")]
+                    UPLOAD_VRAM_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                    return Some(made);
+                }
+                guard.fail_and_invalidate();
+            }
         }
         let made = self.upload_ram_buffer(bytes)?;
         #[cfg(feature = "diagnostics")]
@@ -9459,52 +9510,10 @@ impl Host {
         Some(made)
     }
 
-    fn upload_vram_has_headroom(&self, size: u64) -> bool {
-        let now = std::time::Instant::now();
-        let cached = {
-            let cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
-            if size < (4 << 20)
-                && let Some((at, used, budget)) = *cache
-                && now.duration_since(at) < std::time::Duration::from_millis(250)
-            {
-                Some((used, budget))
-            } else {
-                None
-            }
-        };
-        let (used, budget) = match cached {
-            Some(pair) => pair,
-            None => {
-                let [local, _] = self.sample_video_memory();
-                let Some(local) = local else {
-                    *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    return false;
-                };
-                let pair = (local.CurrentUsage, local.Budget);
-                *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((now, pair.0, pair.1));
-                pair
-            }
-        };
-        let dxr_active = self.dxr.is_some() || crate::dxr::requested();
-        let dxr_cap = if dxr_active { upload_vram_dxr_cap_bytes() } else { u64::MAX };
-        let dxr_headroom = if dxr_active { crate::dxr::slab_headroom() } else { 0 };
-        upload_vram_fits(used, budget, size, dxr_active, dxr_cap, dxr_headroom)
-    }
-
-    fn note_upload_vram(&self, size: u64) {
-        let mut cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, used, _)) = cache.as_mut() {
-            *used = used.saturating_add(size);
-        }
-    }
-
-    fn invalidate_upload_vram(&self) {
-        *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
-
     /// A persistently mapped buffer in `D3D12_HEAP_TYPE_GPU_UPLOAD` (ReBAR VRAM)
-    /// starting in `D3D12_RESOURCE_STATE_COMMON`.
+    /// created resident by default (`D3D12_HEAP_FLAG_NONE`) in
+    /// `D3D12_RESOURCE_STATE_COMMON` so allocation never stalls on a separate
+    /// `MakeResident` / COPY-queue fence.
     /// Provenance (GPL-3.0): Marvisak/VIctory#3228.
     fn upload_vram_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9526,12 +9535,12 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: GPU_UPLOAD buffers start in COMMON and are persistently mapped.
+        // SAFETY: GPU_UPLOAD buffers start resident in COMMON and are persistently mapped.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -9539,8 +9548,6 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9553,7 +9560,6 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                self.invalidate_upload_vram();
                 tracing::debug!(error = %e, size, "GPU_UPLOAD buffer fell back to UPLOAD");
                 None
             }
@@ -9610,6 +9616,175 @@ impl Host {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
+        }
+    }
+}
+
+/// Atomic pre-allocation VRAM reservation gate for `GPU_UPLOAD` buffers so
+/// concurrent callers (e.g. `VICTORY_THIN=1` workers) check headroom and
+/// reserve `in_flight_bytes` atomically before `CreateCommittedResource`, and
+/// concurrent DXGI refreshes never overwrite in-flight or concurrent commits.
+struct UploadBudget {
+    state: Mutex<UploadBudgetState>,
+}
+
+#[derive(Default)]
+struct UploadBudgetState {
+    sample: Option<(std::time::Instant, u64, u64)>,
+    /// Start of the current 250 ms lag-protection window for `reserved_since_sample`.
+    window_started: Option<std::time::Instant>,
+    sample_gen: u64,
+    in_flight_bytes: u64,
+    reserved_since_sample: u64,
+    committed_total: u64,
+}
+
+struct UploadBudgetGuard<'a> {
+    budget: &'a UploadBudget,
+    bytes: u64,
+    committed: bool,
+}
+
+impl UploadBudgetGuard<'_> {
+    fn commit(mut self) {
+        let mut st = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.in_flight_bytes = st.in_flight_bytes.saturating_sub(self.bytes);
+        st.reserved_since_sample = st.reserved_since_sample.saturating_add(self.bytes);
+        st.committed_total = st.committed_total.saturating_add(self.bytes);
+        self.committed = true;
+    }
+
+    fn fail_and_invalidate(mut self) {
+        let mut st = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.in_flight_bytes = st.in_flight_bytes.saturating_sub(self.bytes);
+        st.sample = None;
+        st.window_started = None;
+        st.sample_gen = st.sample_gen.wrapping_add(1);
+        st.reserved_since_sample = 0;
+        self.committed = true;
+    }
+}
+
+impl Drop for UploadBudgetGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut st = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.in_flight_bytes = st.in_flight_bytes.saturating_sub(self.bytes);
+        }
+    }
+}
+
+impl UploadBudget {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(UploadBudgetState::default()),
+        }
+    }
+
+    fn reserve<F>(
+        &self,
+        aligned_bytes: u64,
+        now: std::time::Instant,
+        dxr_active: bool,
+        dxr_cap_bytes: u64,
+        dxr_slab_headroom: u64,
+        mut sample_local: F,
+    ) -> Option<UploadBudgetGuard<'_>>
+    where
+        F: FnMut() -> Option<(u64, u64)>,
+    {
+        const TTL: std::time::Duration = std::time::Duration::from_millis(250);
+        let refresh_ctx = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let need_refresh = aligned_bytes >= (4 << 20)
+                || st
+                    .sample
+                    .is_none_or(|(at, _, _)| now.saturating_duration_since(at) >= TTL);
+            if !need_refresh
+                && let Some((_, base_used, budget)) = st.sample
+            {
+                let effective_used = base_used
+                    .saturating_add(st.reserved_since_sample)
+                    .saturating_add(st.in_flight_bytes);
+                if upload_vram_fits(
+                    effective_used,
+                    budget,
+                    aligned_bytes,
+                    dxr_active,
+                    dxr_cap_bytes,
+                    dxr_slab_headroom,
+                ) {
+                    st.in_flight_bytes = st.in_flight_bytes.saturating_add(aligned_bytes);
+                    return Some(UploadBudgetGuard {
+                        budget: self,
+                        bytes: aligned_bytes,
+                        committed: false,
+                    });
+                }
+                return None;
+            }
+            (st.sample_gen, st.committed_total)
+        };
+
+        // Query DXGI outside the mutex; preserve in-flight and unreflected commits.
+        let sampled = sample_local();
+
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (before_gen, before_committed) = refresh_ctx;
+        match sampled {
+            Some((dxgi_used, dxgi_budget)) => {
+                if st.sample_gen == before_gen {
+                    let committed_during_sample =
+                        st.committed_total.saturating_sub(before_committed);
+                    let carry = match (st.sample, st.window_started) {
+                        (Some((_, prev_used, _)), Some(started))
+                            if now.saturating_duration_since(started) < TTL =>
+                        {
+                            let dxgi_increase = dxgi_used.saturating_sub(prev_used);
+                            st.reserved_since_sample
+                                .saturating_sub(committed_during_sample)
+                                .saturating_sub(dxgi_increase)
+                        }
+                        _ => 0,
+                    };
+                    if carry == 0 {
+                        st.window_started = Some(now);
+                    }
+                    st.sample = Some((now, dxgi_used, dxgi_budget));
+                    st.sample_gen = st.sample_gen.wrapping_add(1);
+                    st.reserved_since_sample = carry.saturating_add(committed_during_sample);
+                }
+            }
+            None => {
+                if st.sample_gen == before_gen {
+                    st.sample = None;
+                    st.window_started = None;
+                    st.sample_gen = st.sample_gen.wrapping_add(1);
+                    st.reserved_since_sample = 0;
+                }
+                return None;
+            }
+        }
+        let (_, base_used, budget) = st.sample?;
+        let effective_used = base_used
+            .saturating_add(st.reserved_since_sample)
+            .saturating_add(st.in_flight_bytes);
+        if upload_vram_fits(
+            effective_used,
+            budget,
+            aligned_bytes,
+            dxr_active,
+            dxr_cap_bytes,
+            dxr_slab_headroom,
+        ) {
+            st.in_flight_bytes = st.in_flight_bytes.saturating_add(aligned_bytes);
+            Some(UploadBudgetGuard {
+                budget: self,
+                bytes: aligned_bytes,
+                committed: false,
+            })
+        } else {
+            None
         }
     }
 }
@@ -12021,6 +12196,143 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         for off in ["0", " 0 ", "false", "FALSE", "off", "Off", "no", "NO"] {
             assert!(!parse_upload_vram_enabled(Some(off)), "{off}");
         }
+    }
+
+    #[test]
+    fn upload_budget_concurrent_reservations_respect_ceiling_and_roll_back() {
+        use super::{DEFAULT_DXR_VRAM_CAP_BYTES, UploadBudget, upload_vram_ceiling};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        const MIB: u64 = 1 << 20;
+
+        let budget_16g = 15_200 * MIB;
+        let base_used = 8_000 * MIB;
+        let slab_headroom = 1_024 * MIB;
+        let ceiling = upload_vram_ceiling(budget_16g, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom);
+        assert_eq!(ceiling, 8_576 * MIB);
+
+        // 576 MiB remaining below ceiling -> at most 9 reservations of 64 MiB.
+        let chunk = 64 * MIB;
+        let upload_budget = Arc::new(UploadBudget::new());
+        let now = std::time::Instant::now();
+        let threads = 16usize;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let active_plus_committed = Arc::new(AtomicU64::new(base_used));
+        let peak_seen = Arc::new(AtomicU64::new(base_used));
+        let committed_count = Arc::new(AtomicUsize::new(0));
+
+        // Phase 1: 16 threads race concurrently (every call >= 4 MiB triggers DXGI refresh
+        // while peers hold in-flight reservations); none may overshoot ceiling.
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let b = Arc::clone(&upload_budget);
+                let bar = Arc::clone(&barrier);
+                let live = Arc::clone(&active_plus_committed);
+                let peak = Arc::clone(&peak_seen);
+                let committed = Arc::clone(&committed_count);
+                scope.spawn(move || {
+                    bar.wait();
+                    if let Some(guard) = b.reserve(
+                        chunk,
+                        now,
+                        true,
+                        DEFAULT_DXR_VRAM_CAP_BYTES,
+                        slab_headroom,
+                        || Some((base_used, budget_16g)),
+                    ) {
+                        let cur = live.fetch_add(chunk, Ordering::SeqCst) + chunk;
+                        peak.fetch_max(cur, Ordering::SeqCst);
+                        // Simulate some work inside CreateCommittedResource while peers refresh.
+                        std::thread::yield_now();
+                        if t % 4 == 0 {
+                            // Simulate D3D12 allocation failure -> RAII rollback releases headroom.
+                            live.fetch_sub(chunk, Ordering::SeqCst);
+                            drop(guard);
+                        } else {
+                            guard.commit();
+                            committed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+
+        assert!(
+            peak_seen.load(Ordering::SeqCst) <= ceiling,
+            "peak {} MiB exceeded ceiling {} MiB",
+            peak_seen.load(Ordering::SeqCst) >> 20,
+            ceiling >> 20,
+        );
+        assert!(committed_count.load(Ordering::SeqCst) <= 9);
+        assert_eq!(upload_budget.state.lock().unwrap().in_flight_bytes, 0);
+
+        // Phase 2: Deterministic verification of in-flight preservation across DXGI
+        // refreshes, RAII Drop rollback, fail_and_invalidate rollback, exact ceiling
+        // enforcement, and 250 ms TTL recovery.
+        let phase2 = UploadBudget::new();
+        let mut guards = Vec::new();
+        while let Some(g) = phase2.reserve(
+            chunk,
+            now,
+            true,
+            DEFAULT_DXR_VRAM_CAP_BYTES,
+            slab_headroom,
+            || Some((base_used, budget_16g)),
+        ) {
+            guards.push(g);
+        }
+        assert_eq!(guards.len(), 9, "exactly 9 x 64 MiB chunks fit in 576 MiB headroom");
+        assert_eq!(phase2.state.lock().unwrap().in_flight_bytes, 9 * chunk);
+
+        // Roll back slot 9 via fail_and_invalidate and slot 8 via RAII Drop.
+        guards.pop().unwrap().fail_and_invalidate();
+        drop(guards.pop().unwrap());
+        assert_eq!(phase2.state.lock().unwrap().in_flight_bytes, 7 * chunk);
+
+        // Commit the remaining 7 reservations.
+        for g in guards {
+            g.commit();
+        }
+        assert_eq!(phase2.state.lock().unwrap().in_flight_bytes, 0);
+
+        // Re-reserve slots 8 and 9; slot 10 must be rejected at exact ceiling.
+        let g8 = phase2
+            .reserve(chunk, now, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                Some((base_used + 7 * chunk, budget_16g))
+            })
+            .expect("8th chunk fits after rollbacks");
+        let g9 = phase2
+            .reserve(chunk, now, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                Some((base_used + 7 * chunk, budget_16g))
+            })
+            .expect("9th chunk fits while 8th is in flight");
+        assert!(
+            phase2
+                .reserve(chunk, now, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                    Some((base_used + 7 * chunk, budget_16g))
+                })
+                .is_none(),
+            "10th chunk must be rejected while 8th & 9th are in flight"
+        );
+        g8.commit();
+        g9.commit();
+        assert!(
+            phase2
+                .reserve(chunk, now, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                    Some((base_used + 9 * chunk, budget_16g))
+                })
+                .is_none(),
+            "10th chunk must be rejected at exact ceiling"
+        );
+
+        // Once the 250 ms lag window expires and DXGI reports freed VRAM, reservations resume.
+        let later = now + std::time::Duration::from_millis(300);
+        let recovered = phase2
+            .reserve(chunk, later, true, DEFAULT_DXR_VRAM_CAP_BYTES, slab_headroom, || {
+                Some((base_used, budget_16g))
+            })
+            .expect("freed VRAM becomes reservable after the 250 ms window");
+        drop(recovered);
+        assert_eq!(phase2.state.lock().unwrap().in_flight_bytes, 0);
     }
 }
 
