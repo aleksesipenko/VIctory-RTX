@@ -246,6 +246,58 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// `VICTORY_THREAD_PRIORITY`: 0: all helper threads stay at Normal priority;
+/// 1 (default): critical-path helpers (`Role::Helper`) run at
+/// `THREAD_PRIORITY_ABOVE_NORMAL`; 2: background list translators
+/// (`Role::Translator`) also drop to `THREAD_PRIORITY_BELOW_NORMAL`.
+/// Provenance (GPL-3.0): zivyn/codec-d--cool_fox 9168039.
+fn priority_stage() -> u32 {
+    static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| {
+        std::env::var("VICTORY_THREAD_PRIORITY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    })
+}
+
+/// What a thread's priority is set to at `stage` for `role` (`None`: unchanged).
+fn priority_for(stage: u32, role: Role) -> Option<i32> {
+    use windows_sys::Win32::System::Threading::{
+        THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    match role {
+        Role::Helper if stage >= 1 => Some(THREAD_PRIORITY_ABOVE_NORMAL),
+        Role::Translator if stage >= 2 => Some(THREAD_PRIORITY_BELOW_NORMAL),
+        _ => None,
+    }
+}
+
+/// What a thread of ours does for the frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Role {
+    /// Work that the thread preparing submissions or landing flights waits for.
+    Helper,
+    /// Work ahead of the frame's critical path (background list translation).
+    Translator,
+}
+
+/// Sets the calling thread's priority for its `role` (`VICTORY_THREAD_PRIORITY`).
+pub(crate) fn prioritize(what: &str, role: Role) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    let Some(level) = priority_for(priority_stage(), role) else {
+        return;
+    };
+    // SAFETY: sets only the calling thread's own priority.
+    if unsafe { SetThreadPriority(GetCurrentThread(), level) } == 0 {
+        tracing::warn!(
+            what,
+            error = %std::io::Error::last_os_error(),
+            "the thread's priority could not be set"
+        );
+    }
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThreadId, OpenThread, THREAD_SET_LIMITED_INFORMATION,

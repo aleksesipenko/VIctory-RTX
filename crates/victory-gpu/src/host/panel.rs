@@ -30,10 +30,6 @@ const COLUMNS: u32 = 40;
 const LINES: u32 = 11;
 const RIM: u32 = 3;
 
-/// The texts are put into one of these in turn: the card reads the others,
-/// at most half a second old.
-const UPLOADS: usize = 4;
-
 fn asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_PANEL"))
@@ -465,23 +461,20 @@ fn text(
     ]
 }
 
-/// The buffers of a box that size and format.
+/// The buffers of a box that size and format (GPL-3.0 provenance:
+/// Belobug/VIctory-Belobug-AMD #359 — stages through `list.scratch_at` and
+/// pins `card` via `list.keep` instead of a 4-slot ring + `mem::forget`).
 struct Buffers {
     format: DXGI_FORMAT,
     scale: u32,
     pitch: u32,
-    uploads: Vec<(ID3D12Resource, *mut u8)>,
     card: ID3D12Resource,
-    /// The upload written last.
-    turn: usize,
-    /// It is not in the card's buffer yet.
-    fresh: bool,
     /// `card` has already been copied into once and now sits in `COPY_SOURCE`.
     /// Provenance (GPL-3.0): Belobug 5d6bd84.
     uploaded: bool,
 }
 
-// SAFETY: free-threaded resources, and memory only written under the presenter's lock.
+// SAFETY: free-threaded resources, only mutated under the presenter's lock.
 unsafe impl Send for Buffers {}
 
 impl Buffers {
@@ -489,7 +482,6 @@ impl Buffers {
         let (width, height) = size(scale);
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
-        let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -511,16 +503,33 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, uploaded: false })
+        Some(Buffers { format, scale, pitch, card: card?, uploaded: false })
     }
 
-    fn write(&mut self, lines: &[String]) {
+    fn write(&mut self, list: &HostList, lines: &[String]) {
         let Some(colours) = colours(self.format) else { return };
+        let bytes = u64::from(self.pitch) * u64::from(size(self.scale).1);
+        let Some((stage, offset, mapped)) = list.scratch_at(bytes) else { return };
         let picture = painted(lines, self.scale, colours, self.pitch as usize);
-        self.turn = (self.turn + 1) % UPLOADS;
-        // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
-        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
-        self.fresh = true;
+        // SAFETY: a fresh mapped range of `bytes` held by the present's list
+        // until its submission lands and the list resets.
+        unsafe {
+            std::ptr::copy_nonoverlapping(picture.as_ptr(), mapped, picture.len());
+            if self.uploaded {
+                list.list.ResourceBarrier(&[transition(
+                    &self.card,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            list.list.CopyBufferRegion(&self.card, 0, &stage, offset, bytes);
+            list.list.ResourceBarrier(&[transition(
+                &self.card,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        self.uploaded = true;
     }
 }
 
@@ -616,36 +625,23 @@ impl Panel {
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
             self.buffers = Buffers::new(host, format, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
         let Some(buffers) = &mut self.buffers else { return };
         if std::mem::take(&mut self.changed) {
-            buffers.write(&self.lines);
+            buffers.write(list, &self.lines);
         }
+        if !buffers.uploaded {
+            return;
+        }
+        // Keep `card` alive until this submission lands even if format/scale changes next frame.
+        list.keep(&buffers.card);
         let (w, h) = size(scale);
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
-            if std::mem::take(&mut buffers.fresh) {
-                if buffers.uploaded {
-                    list.ResourceBarrier(&[transition(
-                        &buffers.card,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
-                }
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(
-                    &buffers.card,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                buffers.uploaded = true;
-            }
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffers.card),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,

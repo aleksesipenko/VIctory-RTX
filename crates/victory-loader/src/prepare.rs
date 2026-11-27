@@ -98,12 +98,11 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
-        for (entry, target) in dir64_relocations(&bytes, &info) {
-            if target == field_rva {
-                write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
-            }
-        }
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflows"))?;
+        clear_dir64_relocations(&mut bytes, &info, field_rva)?;
     }
 
     Ok(PreparedImage {
@@ -116,44 +115,59 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
-/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
-/// RVA it patches). Empty if the image has no readable relocation table.
-fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+/// Clears every `IMAGE_REL_BASED_DIR64` base relocation targeting `target_rva`
+/// (turning it into `IMAGE_REL_BASED_ABSOLUTE`).
+///
+/// Each PE base-relocation block covers only `[page, page + 0xFFF]`, so blocks
+/// outside `target_rva`'s page are skipped without decoding their entries or
+/// allocating a `Vec` of every relocation in the image (GPL-3.0 provenance:
+/// Marvisak/VIctory #2982).
+fn clear_dir64_relocations(
+    bytes: &mut [u8],
+    info: &ImageInfo,
+    target_rva: u32,
+) -> Result<(), PrepareError> {
     const DIR64: u16 = 10;
-    let mut out = Vec::new();
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
-        return out;
+        return Ok(());
     };
     let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
     else {
-        return out;
+        return Ok(());
     };
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
-        return out;
+        return Ok(());
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
+    let start = start as usize;
+    let end = start.saturating_add(size as usize).min(bytes.len());
+    let mut at = start;
+    while at.saturating_add(8) <= end {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(next) = at.checked_add(block) else {
+            break;
+        };
+        if block < 8 || next > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
-            let Some(e) = bytes.get(entry..entry + 2) else {
-                break;
-            };
-            let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+        if let Some(wanted_off) = target_rva.checked_sub(page).filter(|&d| d < 0x1000) {
+            let wanted_entry = (DIR64 << 12) | (wanted_off as u16);
+            let mut entry = at + 8;
+            while entry + 2 <= next {
+                let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+                if e == wanted_entry {
+                    write_u16(bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+                }
+                entry += 2;
             }
         }
-        at += block;
+        at = next;
     }
-    out
+    Ok(())
 }
 
 fn write_u16(bytes: &mut [u8], at: usize, v: u16) -> Result<(), PrepareError> {
@@ -279,5 +293,52 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    /// Reference full-table scan kept in tests to verify `clear_dir64_relocations`
+    /// clears every matching entry and leaves every other entry untouched.
+    fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+        const DIR64: u16 = 10;
+        let mut out = Vec::new();
+        let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
+            return out;
+        };
+        let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
+        else {
+            return out;
+        };
+        let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
+            return out;
+        };
+        let (mut at, end) = (
+            start as usize,
+            (start as usize).saturating_add(size as usize).min(bytes.len()),
+        );
+        while at.saturating_add(8) <= end {
+            let (Some(page), Some(block)) =
+                (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
+            else {
+                break;
+            };
+            let block = block as usize;
+            let Some(next) = at.checked_add(block) else {
+                break;
+            };
+            if block < 8 || next > end {
+                break;
+            }
+            let mut entry = at + 8;
+            while entry + 2 <= next {
+                let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+                if e >> 12 == DIR64
+                    && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+                {
+                    out.push((entry, target));
+                }
+                entry += 2;
+            }
+            at = next;
+        }
+        out
     }
 }

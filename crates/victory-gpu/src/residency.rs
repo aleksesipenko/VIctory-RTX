@@ -1,13 +1,14 @@
 //! Host-memory admission for speculative texture work and reusable upload storage.
 //!
 //! From codec-d/cool_fox (641835a4, fabb872a, c64fc9b4, 08e4574d, e94d277a; the
-//! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
-//! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
-//! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
-//! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
-//! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
-//! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
-//! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
+//! values of the last, tuned for 32 GiB hosts). Only with `VICTORY_RESIDENCY=1`
+//! ([`on`]): the memory of the system is then asked once a second; below 1.5 GiB
+//! of free RAM or 3 GiB of commit (out again above 3 / 5) texture prefetch is
+//! limited to 64 MiB a frame and idle scratch and staging blocks are let go;
+//! below 1.5 GiB of commit to 16 MiB; the texture pass stops below 512 MiB of
+//! commit, new staging blocks for textures picked by index below 1 GiB. With
+//! 32 GiB of RAM or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a
+//! smaller PC.
 //! Off, nothing here changes anything, except that for 500 ms after the card
 //! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
 use std::sync::OnceLock;
@@ -122,10 +123,16 @@ pub(crate) fn limited_host_ram() -> bool {
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    // On 32 GiB Windows systems, healthy FreeRAM routinely sits in 2.0-2.9 GiB
+    // while commit headroom remains ample; entering pressure at 3 GiB physical
+    // throttled texture prefetch to 64 MiB/frame and caused slow LOD pop-in.
+    // Keep commit protection strict (<= 3 GiB enter, >= 5 GiB recover;
+    // `critical_commit()` stays 1.5 GiB) and enter on physical scarcity only
+    // at <= 1.5 GiB (recover >= 3 GiB).
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < 3 * GIB || commit < 5 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= 1536 * MIB || commit <= 3 * GIB
     }
 }
 
@@ -211,12 +218,13 @@ mod tests {
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(next_pressure(false, 12 * GIB, 3 * GIB));
+        assert!(next_pressure(false, 1536 * MIB, 16 * GIB));
+        assert!(!next_pressure(false, 2200 * MIB, 12 * GIB));
+        assert!(next_pressure(true, 2 * GIB, 7 * GIB));
+        assert!(next_pressure(true, 4 * GIB, 4 * GIB));
+        assert!(!next_pressure(true, 3 * GIB, 5 * GIB));
+        assert!(!next_pressure(false, 3 * GIB, 4 * GIB));
     }
 
     #[test]
