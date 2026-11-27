@@ -1017,9 +1017,16 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
+}
+
+/// Per-`Present` fast-path sweep of completed `upq` unconfirmed slots on the
+/// existing host device without lazily initializing D3D12.
+pub(crate) fn sweep_upq() {
+    if let Some(host) = made_host() {
+        host.sweep_upq();
+    }
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -2470,6 +2477,9 @@ struct CardPlan {
     sends: Option<send::Memory>,
     /// With [`upq`]: the copy list and buffer what went up came through.
     up: Option<upq::Slot>,
+    /// True if `upq::send` submitted on the copy queue but completion was not
+    /// confirmed: `sends` must be detached from `send::SPARE` at `card_done`.
+    up_unconfirmed: bool,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4652,6 +4662,9 @@ impl Host {
     /// (`crate::picked`).
     fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
         use std::sync::Arc;
+        // Fast-pathed atomic check: reclaim any completed signaled `upq`
+        // unconfirmed entries independent of `upq::on()` / batch eligibility.
+        upq::sweep(&self.device);
         if !crate::shadow::cards() {
             return None;
         }
@@ -4697,6 +4710,7 @@ impl Host {
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         let mut up = None;
+        let mut up_unconfirmed = false;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
@@ -4723,31 +4737,26 @@ impl Host {
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
                     if let Some(own) = &own {
-                        // With `upq`: the submission's own memory (the PC's)
-                        // comes whole into a buffer of ours in the card's on
-                        // the copy queue; the sends come from there.
-                        if looks.is_none() && upq::on() {
+                        // With `upq`: only owned immutable `send::Memory`
+                        // snapshots go up on the copy queue; shared
+                        // `Card::staging` fallbacks stay on the drawing queue.
+                        if upq::on()
+                            && upq::batch_eligible(
+                                send::own(),
+                                looks.is_none(),
+                                &[upq::SourceKind::OwnedSendMemory],
+                            )
+                            && upq::usable(&self.device)
+                        {
                             let (memory, used) = own.source();
-                            up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {});
+                            match upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {}) {
+                                upq::Outcome::Sent(slot) => up = Some(slot),
+                                upq::Outcome::NotSubmitted => {}
+                                upq::Outcome::SubmittedUnconfirmed => up_unconfirmed = true,
+                            }
                         }
                         let from = up.as_ref().and_then(upq::Slot::bounce);
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)), from);
-                    }
-                    // With `upq`: the PC's bytes come into a buffer of ours
-                    // on the copy queue, and this list copies them from
-                    // there (the card's memory), after a wait for that.
-                    if own.is_none() && looks.is_none() && upq::on() {
-                        let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
-                        let mut ranges: Vec<upq::Range<'_>> = Vec::new();
-                        for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
-                                ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
-                            }
-                        }
-                        up = upq::send(self, &self.queue, &ranges, |i, bounce, at| {
-                            let (card, offset, _, bytes) = ranges[i];
-                            list.CopyBufferRegion(card, offset, bounce, at, bytes);
-                        });
                     }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, _)) = shadow.card_sides() else {
@@ -4838,6 +4847,7 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
             up,
+            up_unconfirmed,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -4958,12 +4968,19 @@ impl Host {
         if let Some(looks) = plan.looks {
             looks.read();
         }
-        if let Some(memory) = plan.sends {
-            send::give_back(memory);
+        let sends = plan.sends;
+        let up_confirmed = match plan.up {
+            Some(slot) => upq::give_back(slot, || {
+                sends.as_ref().map(|memory| memory.resource().clone()).into_iter().collect()
+            }),
+            None => !plan.up_unconfirmed,
+        };
+        if let Some(memory) = sends {
+            send::finish_memory(memory, up_confirmed);
         }
-        if let Some(slot) = plan.up {
-            upq::give_back(slot);
-        }
+        // Unconditional fast-path sweep (including `plan.up == None` /
+        // `up_unconfirmed` paths) independent of `upq::on()`.
+        upq::sweep(&self.device);
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -10352,6 +10369,12 @@ impl Host {
         self.present_planes(texture, state, None, frame)
     }
 
+    /// Fast-path sweep of completed `upq` unconfirmed copy-queue slots
+    /// (1 relaxed atomic load when empty).
+    pub(crate) fn sweep_upq(&self) {
+        upq::sweep(&self.device);
+    }
+
     /// Shows `texture`, optionally alpha-compositing a second `overlay` plane
     /// over it (Series S two-plane presentation), and returns them to their states.
     pub(crate) fn present_planes(
@@ -10361,6 +10384,9 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        // Per-frame fast-path sweep so even frames with zero card batches
+        // reclaim completed signaled `upq` unconfirmed entries.
+        self.sweep_upq();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {

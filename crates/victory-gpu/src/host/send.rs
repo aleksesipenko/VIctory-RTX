@@ -115,8 +115,52 @@ pub(super) struct Memory {
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
 unsafe impl Send for Memory {}
 
+impl Memory {
+    pub(super) fn resource(&self) -> &ID3D12Resource {
+        &self.buffer
+    }
+}
+
+/// Pool of spare submission upload buffers, bounded by total retained bytes.
+struct SparePool<T> {
+    items: Vec<T>,
+}
+
+impl<T> SparePool<T> {
+    const fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    fn take(&mut self, min_size: u64, size_of: impl Fn(&T) -> u64) -> Option<T> {
+        let fit = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| size_of(m) >= min_size)
+            .min_by_key(|(_, m)| size_of(m))
+            .map(|(i, _)| i);
+        fit.map(|i| self.items.swap_remove(i))
+    }
+
+    /// Returns `item` to the pool only when `reusable` is true; evicted items
+    /// over `cap` (or an unconfirmed detached `item`) are returned to drop
+    /// outside the pool lock.
+    fn finish(&mut self, item: T, reusable: bool, cap: u64, size_of: impl Fn(&T) -> u64) -> Vec<T> {
+        if !reusable {
+            return vec![item];
+        }
+        self.items.push(item);
+        self.items.sort_by_key(|m| std::cmp::Reverse(size_of(m)));
+        let mut evicted = Vec::new();
+        while self.items.iter().map(&size_of).sum::<u64>() > cap {
+            evicted.push(self.items.remove(0));
+        }
+        evicted
+    }
+}
+
 /// What submissions that have run gave back.
-static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
+static SPARE: Mutex<SparePool<Memory>> = Mutex::new(SparePool::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
@@ -138,9 +182,8 @@ fn on_card() -> bool {
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
-        if let Some(i) = fit {
-            return Some(spare.swap_remove(i));
+        if let Some(m) = spare.take(size, |m| m.size) {
+            return Some(m);
         }
     }
     // By doubles, so that the next of about this size finds it: what
@@ -159,14 +202,21 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     })
 }
 
-/// The submission has run.
-pub(super) fn give_back(memory: Memory) {
-    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    spare.push(memory);
-    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
+/// The submission has run. Returns `memory` to [`SPARE`] only when `reusable`
+/// is true; when `reusable` is false (an unconfirmed copy-queue submission may
+/// still be reading `memory`), detaches it from [`SPARE`] so no subsequent CPU
+/// write can overwrite it (`upq` holds the COM resource alive until the
+/// copy-queue fence confirms or leaks it if `Signal` failed).
+pub(super) fn finish_memory(memory: Memory, reusable: bool) {
+    if !reusable {
+        drop(memory);
+        return;
     }
+    let evicted = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.finish(memory, true, kept(), |m| m.size)
+    };
+    drop(evicted);
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
@@ -335,5 +385,50 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn unconfirmed_copy_detaches_memory_from_spare_pool_without_reuse() {
+        struct FakeMem {
+            res: Arc<()>,
+            size: u64,
+        }
+
+        let mut pool: SparePool<FakeMem> = SparePool::new();
+        let cap = 64 << 20;
+
+        // Confirmed submission returns memory to the spare pool for reuse.
+        let ok_res = Arc::new(());
+        let dropped = pool.finish(FakeMem { res: Arc::clone(&ok_res), size: 8 << 20 }, true, cap, |m| m.size);
+        assert!(dropped.is_empty());
+        let reused = pool.take(4 << 20, |m| m.size).expect("confirmed memory is reused");
+        assert!(Arc::ptr_eq(&reused.res, &ok_res));
+
+        // Unconfirmed copy-queue submission detaches memory from SPARE so future
+        // CPU writes allocate fresh memory instead of overwriting it, while an
+        // external copy-queue pin keeps the underlying resource alive until
+        // copy fence confirmation (or permanently if unsignaled).
+        let unconfirmed_res = Arc::new(());
+        let copy_queue_pin = Arc::clone(&unconfirmed_res);
+        let detached = pool.finish(
+            FakeMem { res: Arc::clone(&unconfirmed_res), size: 8 << 20 },
+            false,
+            cap,
+            |m| m.size,
+        );
+        assert_eq!(detached.len(), 1);
+        assert!(pool.take(1, |m| m.size).is_none(), "unconfirmed memory must never re-enter SPARE");
+        drop(detached);
+        // Underlying resource remains alive while copy-queue pin is held.
+        assert_eq!(Arc::strong_count(&unconfirmed_res), 2);
+        drop(copy_queue_pin);
+        // Released cleanly once copy-queue fence confirms and drops its pin.
+        assert_eq!(Arc::strong_count(&unconfirmed_res), 1);
     }
 }

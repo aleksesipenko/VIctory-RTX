@@ -663,23 +663,40 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
-                if let Some((texture, state)) = texture {
-                    // (Where its lists were not translated when the title
-                    // presented: the state they left it in.)
-                    let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
-                    let over = overlay.as_ref().map(|(ov, ov_state)| {
-                        let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
-                        (&ov.texture, st)
-                    });
-                    super::show_planes(&texture.texture, state, over, shown);
-                }
-                QUEUED.fetch_sub(1, Relaxed);
+                run_present(texture, overlay, shown, &QUEUED, crate::host::sweep_upq);
             }
         }
         // (The mark was this submission's alone.)
         crate::port_journal::set_mark(0);
         STATS[BUSY].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
+}
+
+/// Asynchronous `Present` body: presents `texture` when recognized and
+/// unconditionally invokes `sweep` even on texture-less `Present` frames,
+/// then decrements `queued`.
+fn run_present(
+    texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+    overlay: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+    shown: super::Shown,
+    queued: &AtomicU64,
+    sweep: impl FnOnce(),
+) {
+    super::finish_present(
+        texture,
+        |(texture, state)| {
+            // (Where its lists were not translated when the title
+            // presented: the state they left it in.)
+            let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
+            let over = overlay.as_ref().map(|(ov, ov_state)| {
+                let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
+                (&ov.texture, st)
+            });
+            super::show_planes(&texture.texture, state, over, shown);
+        },
+        sweep,
+    );
+    queued.fetch_sub(1, Relaxed);
 }
 
 static LANE: Lane<Job> = Lane::new();
@@ -1235,5 +1252,28 @@ mod tests {
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
         }
+    }
+
+    /// Asynchronous no-texture `Present` jobs must still invoke the `upq`
+    /// sweep hook and decrement their queued counter.
+    #[test]
+    fn async_present_sweeps_upq_without_texture() {
+        // Direct `run_present` route with `texture == None` invokes sweep and
+        // decrements an isolated counter (no dependency on process-wide `QUEUED`).
+        let queued = AtomicU64::new(1);
+        let mut sweeps = 0usize;
+        run_present(None, None, super::super::Shown { frame: 1, resource: 0 }, &queued, || sweeps += 1);
+        assert_eq!(sweeps, 1);
+        assert_eq!(queued.load(Relaxed), 0);
+
+        // Full `Lane<Job>` dispatch of `Job::Present(None, None, ...)` executes
+        // the production `crate::host::sweep_upq` hook and drains cleanly.
+        let lane: Lane<Job> = Lane::new();
+        QUEUED.fetch_add(1, Relaxed);
+        lane.push(1, [Job::Present(None, None, super::super::Shown { frame: 2, resource: 0 })]);
+        let limit = lane.lock().next;
+        lane.look(limit);
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }
 }
