@@ -4612,6 +4612,9 @@ impl Host {
     /// (`crate::picked`).
     fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
         use std::sync::Arc;
+        // Fast-pathed atomic check: reclaim any completed signaled `upq`
+        // unconfirmed entries independent of `upq::on()` / batch eligibility.
+        upq::sweep(&self.device);
         if !crate::shadow::cards() {
             return None;
         }
@@ -4704,11 +4707,6 @@ impl Host {
                         }
                         let from = up.as_ref().and_then(upq::Slot::bounce);
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)), from);
-                    } else if upq::on() {
-                        // Shared `Card::staging` batches bypass `upq` directly
-                        // onto the drawing queue below; still sweep any earlier
-                        // signaled unconfirmed copy-queue slots.
-                        upq::sweep(&self.device);
                     }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, _)) = shadow.card_sides() else {
@@ -4930,6 +4928,9 @@ impl Host {
         if let Some(memory) = sends {
             send::finish_memory(memory, up_confirmed);
         }
+        // Unconditional fast-path sweep (including `plan.up == None` /
+        // `up_unconfirmed` paths) independent of `upq::on()`.
+        upq::sweep(&self.device);
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -9867,6 +9868,9 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        // Per-frame fast-path sweep so even frames with zero card batches
+        // reclaim completed signaled `upq` unconfirmed entries.
+        upq::sweep(&self.device);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {

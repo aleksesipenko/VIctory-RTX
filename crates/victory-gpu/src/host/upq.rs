@@ -186,6 +186,18 @@ struct UnconfirmedSlot<S = Slot, R = ID3D12Resource, F = ID3D12Fence> {
 // SAFETY: free-threaded D3D12 COM interfaces.
 unsafe impl Send for UnconfirmedSlot {}
 
+/// Outcome of attempting to pin a newly unconfirmed copy-queue slot.
+enum PinOutcome<T> {
+    /// Entry was already confirmed complete (or device removed) and should be
+    /// dropped immediately outside all locks rather than left pinned.
+    ImmediateDrop(T),
+    /// Entry is now pinned in the pool awaiting copy-queue fence confirmation.
+    Pinned,
+    /// Entry has no fence value (`Signal` failed) or pool is full at
+    /// `UNCONFIRMED_MAX`: caller must intentionally `std::mem::forget` it.
+    Leak(T),
+}
+
 struct UnconfirmedPool<S, R, F> {
     entries: Vec<UnconfirmedSlot<S, R, F>>,
 }
@@ -229,6 +241,40 @@ impl<S, R, F> UnconfirmedPool<S, R, F> {
         }
         self.entries.push(entry);
         Ok(())
+    }
+
+    /// Sweeps ready entries, then checks whether `entry` itself is already
+    /// confirmed complete (or `device_removed` is true) so an already-finished
+    /// submission is reclaimed immediately instead of sitting pinned until a
+    /// future sweep.
+    fn push_or_reclaim(
+        &mut self,
+        entry: UnconfirmedSlot<S, R, F>,
+        device_removed: bool,
+        mut completed_of: impl FnMut(&F) -> u64,
+    ) -> (Vec<UnconfirmedSlot<S, R, F>>, PinOutcome<UnconfirmedSlot<S, R, F>>) {
+        let ready = self.take_ready(device_removed, &mut completed_of);
+        if entry.signaled.is_none() {
+            let outcome = if device_removed {
+                PinOutcome::ImmediateDrop(entry)
+            } else {
+                PinOutcome::Leak(entry)
+            };
+            return (ready, outcome);
+        }
+        let entry_ready = device_removed
+            || entry
+                .signaled
+                .as_ref()
+                .is_some_and(|(fence, target)| fence_confirmed(true, completed_of(fence), *target));
+        if entry_ready {
+            return (ready, PinOutcome::ImmediateDrop(entry));
+        }
+        let outcome = match self.try_push(entry) {
+            Ok(()) => PinOutcome::Pinned,
+            Err(overflow) => PinOutcome::Leak(overflow),
+        };
+        (ready, outcome)
     }
 }
 
@@ -332,24 +378,40 @@ fn device_removed(device: Option<&ID3D12Device>) -> bool {
     device.is_some_and(|d| unsafe { d.GetDeviceRemovedReason() }.is_err())
 }
 
+fn sweep_pool<S, R, F>(
+    pool_lock: &Mutex<UnconfirmedPool<S, R, F>>,
+    count: &AtomicUsize,
+    device_removed: impl FnOnce() -> bool,
+    completed_of: impl FnMut(&F) -> u64,
+) -> usize {
+    if count.load(Relaxed) == 0 {
+        return 0;
+    }
+    let removed = device_removed();
+    let ready = {
+        let mut pool = pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let ready = pool.take_ready(removed, completed_of);
+        count.store(pool.entries.len(), Relaxed);
+        ready
+    };
+    let reclaimed = ready.len();
+    drop(ready);
+    reclaimed
+}
+
 /// Sweeps any pinned copy-queue slots whose copy-queue fence has reached its
 /// target or whose device has been removed. Runs outside `QUEUE` and drops
 /// released entries outside `UNCONFIRMED`.
 fn sweep_unconfirmed(device: Option<&ID3D12Device>) {
-    if UNCONFIRMED_COUNT.load(Relaxed) == 0 {
-        return;
-    }
-    let removed = device_removed(device);
-    let ready = {
-        let mut pool = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
-        let ready = pool.take_ready(removed, |fence| {
+    sweep_pool(
+        &UNCONFIRMED,
+        &UNCONFIRMED_COUNT,
+        || device_removed(device),
+        |fence| {
             // SAFETY: plain fence query on a live fence.
             unsafe { fence.GetCompletedValue() }
-        });
-        UNCONFIRMED_COUNT.store(pool.entries.len(), Relaxed);
-        ready
-    };
-    drop(ready);
+        },
+    );
 }
 
 /// Clones one COM reference per distinct copy-source `ID3D12Resource` in `ranges`.
@@ -368,29 +430,31 @@ fn pin_sources(ranges: &[Range<'_>]) -> Vec<ID3D12Resource> {
 /// and `pinned_sources` intact) until the copy-queue fence confirms completion
 /// or the device is removed, and poisons the copy queue under `QUEUE` BEFORE
 /// touching `UNCONFIRMED` (strict zero lock nesting between `QUEUE` and
-/// `UNCONFIRMED`). If `Signal` failed (no copy-queue fence value) or
-/// `UNCONFIRMED` is full at `UNCONFIRMED_MAX`, intentionally leaks via
-/// `std::mem::forget` rather than freeing GPU-in-use COM objects.
+/// `UNCONFIRMED`). If `entry` is already confirmed complete (or device is
+/// removed), releases it immediately outside all locks; if `Signal` failed on
+/// a live device or `UNCONFIRMED` is full at `UNCONFIRMED_MAX`, intentionally
+/// leaks via `std::mem::forget` rather than freeing GPU-in-use COM objects.
 fn pin_unconfirmed(entry: UnconfirmedSlot, device: Option<&ID3D12Device>, why: &'static str) {
     poison_queue(why);
-    if entry.signaled.is_none() {
+    let removed = device_removed(device);
+    if entry.signaled.is_none() && !removed {
         std::mem::forget(entry);
         return;
     }
-    let removed = device_removed(device);
-    let (ready, overflow) = {
+    let (ready, outcome) = {
         let mut pool = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
-        let ready = pool.take_ready(removed, |fence| {
+        let res = pool.push_or_reclaim(entry, removed, |fence| {
             // SAFETY: plain fence query on a live fence.
             unsafe { fence.GetCompletedValue() }
         });
-        let overflow = pool.try_push(entry).err();
         UNCONFIRMED_COUNT.store(pool.entries.len(), Relaxed);
-        (ready, overflow)
+        res
     };
     drop(ready);
-    if let Some(entry) = overflow {
-        std::mem::forget(entry);
+    match outcome {
+        PinOutcome::Pinned => {}
+        PinOutcome::ImmediateDrop(entry) => drop(entry),
+        PinOutcome::Leak(entry) => std::mem::forget(entry),
     }
 }
 
@@ -935,5 +999,112 @@ mod tests {
         };
         assert!(!submitted);
         assert!(state.is_poisoned());
+    }
+
+    #[test]
+    fn unconditional_sweep_and_immediate_reclaim_on_pin() {
+        struct FakeSlot {
+            _allocator: Arc<()>,
+            _bounce: Arc<()>,
+        }
+
+        // (a) A signaled unconfirmed entry is reclaimed by unconditional
+        // `sweep_pool` even when `upq::on()` is false and the batch is ineligible.
+        let pool_lock: Mutex<UnconfirmedPool<FakeSlot, Arc<()>, Arc<AtomicU64>>> =
+            Mutex::new(UnconfirmedPool::new());
+        let count = AtomicUsize::new(0);
+        let alloc = Arc::new(());
+        let bounce = Arc::new(());
+        let src = Arc::new(());
+        let fence = Arc::new(AtomicU64::new(3));
+        {
+            let mut pool = pool_lock.lock().unwrap();
+            let (ready, outcome) = pool.push_or_reclaim(
+                UnconfirmedSlot {
+                    slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                    pinned_sources: vec![Arc::clone(&src)],
+                    signaled: Some((Arc::clone(&fence), 7)),
+                },
+                false,
+                |f| f.load(Relaxed),
+            );
+            assert!(ready.is_empty());
+            assert!(matches!(outcome, PinOutcome::Pinned));
+            count.store(pool.entries.len(), Relaxed);
+        }
+        assert_eq!(count.load(Relaxed), 1);
+        // Simulate `VICTORY_UP_QUEUE` toggled off / ineligible batch: sweep still runs.
+        assert!(!batch_eligible(false, false, &[SourceKind::SharedCardStaging]));
+        assert_eq!(sweep_pool(&pool_lock, &count, || false, |f| f.load(Relaxed)), 0);
+        assert_eq!(Arc::strong_count(&bounce), 2);
+        assert_eq!(Arc::strong_count(&src), 2);
+        fence.store(7, Relaxed);
+        assert_eq!(sweep_pool(&pool_lock, &count, || false, |f| f.load(Relaxed)), 1);
+        assert_eq!(count.load(Relaxed), 0);
+        assert_eq!(Arc::strong_count(&alloc), 1);
+        assert_eq!(Arc::strong_count(&bounce), 1);
+        assert_eq!(Arc::strong_count(&src), 1);
+        // Fast path skips lock/device query when empty.
+        assert_eq!(
+            sweep_pool(&pool_lock, &count, || panic!("device query skipped when empty"), |f| f.load(Relaxed)),
+            0
+        );
+
+        // (b) An entry whose fence already completed at `pin_unconfirmed` time
+        // is immediately reclaimed rather than left pinned.
+        fence.store(10, Relaxed);
+        let mut pool = pool_lock.lock().unwrap();
+        let (ready, outcome) = pool.push_or_reclaim(
+            UnconfirmedSlot {
+                slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                pinned_sources: vec![Arc::clone(&src)],
+                signaled: Some((Arc::clone(&fence), 10)),
+            },
+            false,
+            |f| f.load(Relaxed),
+        );
+        assert!(ready.is_empty());
+        assert!(pool.entries.is_empty(), "already-completed entry must not be left pinned");
+        match outcome {
+            PinOutcome::ImmediateDrop(entry) => drop(entry),
+            _ => panic!("expected ImmediateDrop for already-completed fence"),
+        }
+        assert_eq!(Arc::strong_count(&alloc), 1);
+        assert_eq!(Arc::strong_count(&bounce), 1);
+        assert_eq!(Arc::strong_count(&src), 1);
+
+        // Device-removed sentinel (`u64::MAX`) without `device_removed` stays pinned.
+        fence.store(u64::MAX, Relaxed);
+        let (_, outcome) = pool.push_or_reclaim(
+            UnconfirmedSlot {
+                slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                pinned_sources: vec![Arc::clone(&src)],
+                signaled: Some((Arc::clone(&fence), 10)),
+            },
+            false,
+            |f| f.load(Relaxed),
+        );
+        assert!(matches!(outcome, PinOutcome::Pinned));
+        assert_eq!(pool.entries.len(), 1);
+        // Device removal immediately sweeps prior entries AND immediately drops a new one.
+        let (ready, outcome) = pool.push_or_reclaim(
+            UnconfirmedSlot {
+                slot: FakeSlot { _allocator: Arc::clone(&alloc), _bounce: Arc::clone(&bounce) },
+                pinned_sources: vec![Arc::clone(&src)],
+                signaled: Some((Arc::clone(&fence), 11)),
+            },
+            true,
+            |f| f.load(Relaxed),
+        );
+        assert_eq!(ready.len(), 1);
+        assert!(pool.entries.is_empty());
+        drop(ready);
+        match outcome {
+            PinOutcome::ImmediateDrop(entry) => drop(entry),
+            _ => panic!("expected ImmediateDrop when device is already removed"),
+        }
+        assert_eq!(Arc::strong_count(&alloc), 1);
+        assert_eq!(Arc::strong_count(&bounce), 1);
+        assert_eq!(Arc::strong_count(&src), 1);
     }
 }
