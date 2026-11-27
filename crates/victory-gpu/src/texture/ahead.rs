@@ -52,7 +52,7 @@ pub(crate) fn on() -> bool {
 }
 
 enum Callbacks {
-    Waiting(Vec<Box<dyn FnOnce() + Send>>),
+    Waiting(Vec<Box<dyn FnOnce(bool) + Send>>),
     Done,
     Failed,
 }
@@ -62,31 +62,84 @@ pub(crate) struct Job {
     staging: Arc<Staging>,
     copy: Arc<HostTexture>,
     asked: std::time::Instant,
-    /// What to do when it has run (`Done`: run immediately; `Failed`: drop).
+    /// What to do when it has run (`Done`: run with `true`; `Failed`: run with `false`).
     then: Mutex<Callbacks>,
 }
 
 impl Job {
+    /// The staging buffer this ahead job will refresh and upload.
+    pub(crate) fn staging(&self) -> &Arc<Staging> {
+        &self.staging
+    }
+
     /// Calls `f` when the copy has run: now if it has, never if it failed.
     pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
+        self.on_complete(move |ok| {
+            if ok {
+                f();
+            }
+        });
+    }
+
+    /// Calls `f(true)` when the copy has landed on the GPU, or `f(false)` if
+    /// the job failed before submission.
+    pub(crate) fn on_complete(&self, f: impl FnOnce(bool) + Send + 'static) {
         let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
         match &mut *then {
             Callbacks::Waiting(list) => list.push(Box::new(f)),
             Callbacks::Done => {
                 drop(then);
-                f();
+                f(true);
             }
-            Callbacks::Failed => {}
+            Callbacks::Failed => {
+                drop(then);
+                f(false);
+            }
+        }
+    }
+}
+
+/// An owned newly claimed ahead job that is guaranteed to be dispatched via
+/// [`send`] (either explicitly via [`Self::send`] after attaching callbacks, or
+/// automatically on drop) so it can never be stranded in `ON_THEIR_WAY`.
+pub(crate) struct NewJob(Option<Arc<Job>>);
+
+impl NewJob {
+    pub(crate) fn job(&self) -> &Arc<Job> {
+        self.0.as_ref().expect("NewJob still owned before send")
+    }
+
+    pub(crate) fn send(mut self) {
+        if let Some(job) = self.0.take() {
+            send(&job);
+        }
+    }
+}
+
+impl Drop for NewJob {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            send(&job);
         }
     }
 }
 
 /// What a texture asked for here gets.
 pub(crate) enum Taken {
-    /// A job of its own, to be [`send`] once what follows it is added.
-    New(Arc<Job>),
+    /// A job of its own, dispatched via [`NewJob::send`] (or on drop) once
+    /// callbacks are attached.
+    New(NewJob),
     /// One already on its way, or that has run.
     Known(Arc<Job>),
+}
+
+impl Taken {
+    pub(crate) fn job(&self) -> &Arc<Job> {
+        match self {
+            Self::New(new_job) => new_job.job(),
+            Self::Known(job) => job,
+        }
+    }
 }
 
 static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
@@ -114,9 +167,8 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     match copy.ahead.load(Acquire) {
         CLAIMING => {
             let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-            let started = std::time::Instant::now();
-            while copy.ahead.load(Acquire) == CLAIMING && started.elapsed().as_millis() < 1000 {
-                way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+            while copy.ahead.load(Acquire) == CLAIMING {
+                way = LANDED.wait(way).unwrap_or_else(|e| e.into_inner());
             }
             if copy.ahead.load(Acquire) == PENDING {
                 return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
@@ -148,15 +200,31 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     if copy.ahead.compare_exchange(NONE, CLAIMING, AcqRel, Acquire).is_err() {
         return turned_down();
     }
+    struct ClaimGuard<'a> {
+        copy: &'a HostTexture,
+        armed: bool,
+    }
+    impl Drop for ClaimGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                super::PICKING.set(None);
+                let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+                self.copy.ahead.store(LISTED, Release);
+                LANDED.notify_all();
+            }
+        }
+    }
+    let mut claim_guard = ClaimGuard { copy: &copy, armed: true };
     super::PICKING.set(Some(there));
-    let staging = super::staging(resource, &copy, first);
+    // Build a private staging buffer without inserting into global `STAGING`,
+    // so no concurrent pass can observe `is_staged(resource) == true` and
+    // misclassify this one-shot ahead upload as table-managed.
+    let staging = super::staging_private(resource, &copy, first);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Acquire) && s.once.load(Relaxed)
     }) else {
-        let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        copy.ahead.store(LISTED, Release);
-        LANDED.notify_all();
+        drop(claim_guard);
         return turned_down();
     };
     if super::no_wait() != 0 && super::fill_unlocked() {
@@ -164,7 +232,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     }
     let job = Arc::new(Job {
         staging,
-        copy,
+        copy: copy.clone(),
         asked: std::time::Instant::now(),
         then: Mutex::new(Callbacks::Waiting(Vec::new())),
     });
@@ -173,9 +241,10 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         way.push((job.copy.serial, job.clone()));
         job.copy.ahead.store(PENDING, Release);
+        claim_guard.armed = false;
         LANDED.notify_all();
     }
-    Some(Taken::New(job))
+    Some(Taken::New(NewJob(Some(job))))
 }
 
 /// Sends a job of [`take`] on its way.
@@ -193,12 +262,10 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-    let started = std::time::Instant::now();
-    while (copy.ahead.load(Acquire) == CLAIMING
-        || way.iter().any(|(serial, _)| *serial == copy.serial))
-        && started.elapsed().as_millis() < 1000
+    while copy.ahead.load(Acquire) == CLAIMING
+        || way.iter().any(|(serial, _)| *serial == copy.serial)
     {
-        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        way = LANDED.wait(way).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -234,28 +301,45 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
 }
 
 struct Worker {
+    device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
 }
 
-// SAFETY: a worker's objects are its thread's own; the queue is free-threaded.
+// SAFETY: a worker's objects are its thread's own; the device and queue are free-threaded.
 unsafe impl Send for Worker {}
 
 impl Worker {
-    fn new(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Worker> {
+    fn make_list(
+        device: &ID3D12Device,
+    ) -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
         // SAFETY: plain object creation.
         unsafe {
-            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
             let list: ID3D12GraphicsCommandList =
                 device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
-            Ok(Worker { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })
+            Ok((allocator, list))
         }
     }
 
-    fn work(self) {
+    fn new(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Worker> {
+        let (allocator, list) = Self::make_list(device)?;
+        // SAFETY: plain object creation.
+        let fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? };
+        Ok(Worker {
+            device: device.clone(),
+            queue,
+            allocator,
+            list,
+            fence,
+        })
+    }
+
+    fn work(mut self) {
         let mut value = 0;
         loop {
             let mut jobs = Vec::new();
@@ -273,34 +357,77 @@ impl Worker {
                 }
             }
             value += 1;
-            let ok = match self.copy(&jobs, value) {
-                Ok(()) => true,
-                Err(e) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.copy(&jobs, value))) {
+                Ok(Ok(())) => finish(jobs, true),
+                Ok(Err(e)) => {
                     tracing::warn!(error = %e, "uploads ahead did not run");
-                    false
+                    finish(jobs, false);
+                    // A failed `Close` or `Reset` can leave the command list poisoned;
+                    // replace the allocator/list pair before taking another batch.
+                    match Self::make_list(&self.device) {
+                        Ok((allocator, list)) => {
+                            self.allocator = allocator;
+                            self.list = list;
+                        }
+                        Err(recreate) => {
+                            crate::host::fail(format_args!(
+                                "uploads ahead copy list failed ({e}) and could not be recreated ({recreate})"
+                            ));
+                        }
+                    }
                 }
-            };
-            finish(jobs, ok);
+                Err(_) => {
+                    finish(jobs, false);
+                    crate::host::fail(format_args!("uploads ahead worker panicked"));
+                }
+            }
         }
     }
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
-            job.staging.refresh();
-        }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
-        unsafe {
+        let cmd: ID3D12CommandList = unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
             for job in jobs {
+                job.staging.refresh();
                 job.record(&self.list);
             }
             self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
-            self.queue.Signal(&self.fence, value)?;
-            // (Without an event: this waits.)
-            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            self.list.cast()?
+        };
+        // SAFETY: closed command list and fence owned by this worker.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+            if let Err(e) = self.queue.Signal(&self.fence, value) {
+                crate::host::fail(format_args!(
+                    "uploads ahead copy-queue Signal failed at fence {value} ({e})"
+                ));
+            }
+            let early = self.fence.GetCompletedValue();
+            if early == u64::MAX {
+                crate::host::fail(format_args!(
+                    "uploads ahead copy-queue device removed before wait (fence={value}, completed=u64::MAX)"
+                ));
+            }
+            if early < value {
+                // (Without an event: this waits synchronously.)
+                if let Err(e) = self
+                    .fence
+                    .SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())
+                {
+                    crate::host::fail(format_args!(
+                        "uploads ahead copy-queue SetEventOnCompletion failed at fence {value} ({e})"
+                    ));
+                }
+                let after = self.fence.GetCompletedValue();
+                if after == u64::MAX || after < value {
+                    crate::host::fail(format_args!(
+                        "uploads ahead copy-queue wait did not confirm fence {value} (completed={after:#x})"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -352,7 +479,15 @@ fn finish(jobs: Vec<Arc<Job>>, ok: bool) {
     }
     if !ok {
         for job in &jobs {
-            *job.then.lock().unwrap_or_else(|e| e.into_inner()) = Callbacks::Failed;
+            let prev = std::mem::replace(
+                &mut *job.then.lock().unwrap_or_else(|e| e.into_inner()),
+                Callbacks::Failed,
+            );
+            if let Callbacks::Waiting(list) = prev {
+                for f in list {
+                    f(false);
+                }
+            }
         }
         return;
     }
@@ -375,7 +510,7 @@ fn finish(jobs: Vec<Arc<Job>>, ok: bool) {
         let prev = std::mem::replace(&mut *job.then.lock().unwrap_or_else(|e| e.into_inner()), Callbacks::Done);
         if let Callbacks::Waiting(list) = prev {
             for f in list {
-                f();
+                f(true);
             }
         }
     }
@@ -418,14 +553,15 @@ mod tests {
             return;
         }
         assert!(!there(texture));
-        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("not taken") };
+        let Some(Taken::New(new_job)) = claim(texture, 0, u64::MAX) else { panic!("not taken") };
+        let job = new_job.job().clone();
         let (told, heard) = std::sync::mpsc::channel();
         let also = told.clone();
         let Some(Taken::Known(same)) = claim(texture, 0, u64::MAX) else { panic!("not known") };
         assert!(Arc::ptr_eq(&job, &same));
         job.then(move || told.send(1).unwrap());
         same.then(move || also.send(2).unwrap());
-        send(&job);
+        new_job.send();
         let wait = std::time::Duration::from_secs(20);
         assert_eq!((heard.recv_timeout(wait), heard.recv_timeout(wait)), (Ok(1), Ok(2)));
         assert!(there(texture) && claim(texture, 0, u64::MAX).is_none());

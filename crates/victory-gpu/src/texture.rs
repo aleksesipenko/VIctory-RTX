@@ -2244,13 +2244,38 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+    staging_with(resource, copy, first, true)
+}
+
+/// Builds a private one-shot staging buffer for `ahead` without publishing it
+/// into global `STAGING`, so concurrent passes can never misclassify the
+/// texture as table-managed (`is_staged`). Returns `None` if global `STAGING`
+/// already holds an entry for `resource`.
+fn staging_private(
+    resource: This,
+    copy: &crate::resource::HostTexture,
+    first: u32,
+) -> Option<Arc<Staging>> {
+    staging_with(resource, copy, first, false)
+}
+
+fn staging_with(
+    resource: This,
+    copy: &crate::resource::HostTexture,
+    first: u32,
+    register: bool,
+) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize))
+    if !register {
+        if map.contains_key(&(resource as usize)) {
+            return None;
+        }
+    } else if let Some(s) = map.get(&(resource as usize))
         && s.first <= first.max(copy.base)
         && s.serial == copy.serial
     {
@@ -2365,7 +2390,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
         on_upload: Mutex::default(),
     });
-    map.insert(resource as usize, s.clone());
+    if register {
+        map.insert(resource as usize, s.clone());
+    }
     Some(s)
 }
 

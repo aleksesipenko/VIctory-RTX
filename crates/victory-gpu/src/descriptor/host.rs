@@ -1542,6 +1542,41 @@ impl TextureQueue {
         }
     }
 
+    /// Pulls a still-`Pending(attempt)` slot forward to `due` when an async
+    /// ahead upload fails before submission or misses its upload snapshot.
+    pub(crate) fn retry_pending(&mut self, index: u32, write: u64, attempt: u64, due: u64) {
+        if self
+            .live
+            .get(&index)
+            .is_some_and(|&(_, b, _)| b == LiveBaseline::Pending(attempt))
+            && let Some(w) = self.same(index, write)
+        {
+            w.due = w.due.min(due);
+        }
+    }
+
+    /// Completes a non-recheck (`VICTORY_HEAP_RECHECK=0` or partial/unmapped)
+    /// ahead upload once the copy queue finishes: marks the slot done/partly on
+    /// `ok == true`, or pulls its fallback `due` forward to `retry_due` on
+    /// pre-submit failure (strictly guarded by `write`).
+    pub(crate) fn finish_ahead(
+        &mut self,
+        index: u32,
+        write: u64,
+        ok: bool,
+        again: Option<(u64, u64)>,
+        retry_due: u64,
+    ) {
+        if ok {
+            match again {
+                Some((frame, mapped)) => self.partly(index, write, frame, mapped),
+                None => self.done(index, write),
+            }
+        } else if let Some(w) = self.same(index, write) {
+            w.due = w.due.min(retry_due);
+        }
+    }
+
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look, plus its `dense_print`, [`LiveState`], and
     /// [`LiveBaseline`].
@@ -6377,6 +6412,67 @@ mod tests {
             q.checked(42).map(|c| (c.2, c.7)),
             Some((1, LiveBaseline::Pending(same_frame_second))),
             "stale same-frame upload callback must not overwrite newer Pending(attempt)"
+        );
+
+        // 4) `retry_pending` pulls a distant ahead fallback (`due = 40`) forward to `11`
+        //    only when both `write` and `Pending(attempt)` match, ignoring stale attempts
+        //    or already-committed slots.
+        let ahead_attempt = next_upload_attempt();
+        q.written(44, 10, 10, false);
+        let w44 = q.slots[&44].write;
+        q.recheck(
+            44,
+            w44,
+            40,
+            (0x3000, 0x1000),
+            1,
+            0,
+            0,
+            10,
+            LiveState::Plain,
+            LiveBaseline::Pending(ahead_attempt),
+        );
+        q.retry_pending(44, w44, same_frame_first, 11);
+        assert!(!q.due(11, 10).iter().any(|&(s, _)| s == 44), "stale attempt must not move due");
+        q.retry_pending(44, w44.wrapping_add(1), ahead_attempt, 11);
+        assert!(!q.due(11, 10).iter().any(|&(s, _)| s == 44), "stale write must not move due");
+        q.retry_pending(44, w44, ahead_attempt, 11);
+        assert!(q.due(11, 10).iter().any(|&(s, _)| s == 44), "matching Pending(attempt) must pull due to 11");
+        // After baseline commits (e.g. due = 15), a stale `retry_pending` must not pull due back.
+        q.commit_baseline(44, w44, ahead_attempt, 15, 0xaaaa, 0, LiveState::Plain, LiveBaseline::Strip);
+        q.retry_pending(44, w44, ahead_attempt, 11);
+        assert!(!q.due(11, 10).iter().any(|&(s, _)| s == 44), "committed baseline must ignore retry_pending");
+        assert!(q.due(15, 10).iter().any(|&(s, _)| s == 44));
+
+        // 5) `finish_ahead` handles non-recheck / partial ahead completion & pre-submit failure.
+        q.written(45, 10, 10, false);
+        let w45 = q.slots[&45].write;
+        q.defer_recheck(45, w45, 40);
+        q.finish_ahead(45, w45.wrapping_add(1), false, None, 11);
+        assert!(!q.due(11, 10).iter().any(|&(s, _)| s == 45), "stale write must not move due");
+        q.finish_ahead(45, w45, false, None, 11);
+        assert!(q.due(11, 10).iter().any(|&(s, _)| s == 45), "failed ahead must schedule retry at frame+1");
+        q.finish_ahead(45, w45, true, Some((20, 4096)), 11);
+        assert!(!q.due(19, 10).iter().any(|&(s, _)| s == 45));
+        assert!(q.due(20, 10).iter().any(|&(s, _)| s == 45));
+        q.finish_ahead(45, w45, true, None, 11);
+        assert!(!q.slots.contains_key(&45), "successful whole ahead without recheck retires slot");
+
+        // 6) Remap while an older `Taken::Known` job is in flight: newer `write`
+        //    calls `finish_ahead(..., false, None, frame + 1)` and stays queued
+        //    at `frame + 1` instead of retiring against the older snapshot.
+        q.written(46, 10, 10, false);
+        let w46_old = q.slots[&46].write;
+        q.changed(46, 10, 10);
+        let w46_new = q.slots[&46].write;
+        assert!(w46_new > w46_old);
+        q.defer_recheck(46, w46_new, 40);
+        q.finish_ahead(46, w46_old, true, None, 11);
+        assert!(q.slots.contains_key(&46), "old write callback must not retire remapped slot");
+        q.finish_ahead(46, w46_new, false, None, 11);
+        assert!(
+            q.due(11, 10).iter().any(|&(s, _)| s == 46),
+            "Known ahead job finishing after remap must keep slot queued at frame + 1"
         );
         q.commit_baseline(
             42,

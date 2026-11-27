@@ -2948,26 +2948,29 @@ impl State {
                         force_upload = force;
                     }
                 }
-                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-                if n < 200 || n.is_multiple_of(1000) {
-                    // Whether its pages are the title's at other addresses
-                    // too: what is written there is told of there alone.
-                    let elsewhere = crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
-                    let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
-                        View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
-                        _ => 0,
-                    });
-                    tracing::warn!(
-                        first_level = first,
-                        blocks_shown_elsewhere = elsewhere.len(),
-                        slot = index,
-                        address = format_args!("{at:#x}"),
-                        bytes = len,
-                        frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
-                        changed = n + 1,
-                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-                    );
+                if !force_upload {
+                    let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                    if n < 200 || n.is_multiple_of(1000) {
+                        // Whether its pages are the title's at other addresses
+                        // too: what is written there is told of there alone.
+                        let elsewhere =
+                            crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
+                        let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
+                            View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
+                            _ => 0,
+                        });
+                        tracing::warn!(
+                            first_level = first,
+                            blocks_shown_elsewhere = elsewhere.len(),
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                        );
+                    }
                 }
             }
             let mut partly = None;
@@ -3164,19 +3167,18 @@ impl State {
             }
             // The first upload of a texture no list has used: on a queue of
             // its own, and the slot shows it as soon as that has run.
+            // `Taken::New(NewJob)` dispatches automatically on drop if an early
+            // exit or unwind happens before the explicit `send()` below, so it
+            // can never be stranded in `ON_THEIR_WAY`.
             let ahead = if late && !tabled && texture.is_some_and(crate::pool::fresh) {
                 crate::texture::ahead::take(resource, first, there.filter(|_| partly.is_none()).unwrap_or(u64::MAX))
             } else {
                 None
             };
             if let Some(ahead) = &ahead {
-                use crate::texture::ahead::Taken;
-                let (Taken::New(job) | Taken::Known(job)) = ahead;
+                let job = ahead.job();
                 if let Some(handle) = heap.handle(index) {
                     host.texture_slot_show_ahead(job, index, handle);
-                }
-                if let Taken::New(job) = ahead {
-                    crate::texture::ahead::send(job);
                 }
             }
             let late = late && ahead.is_none();
@@ -3237,7 +3239,13 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
+            let (bytes, whole) = match &ahead {
+                Some(taken) => {
+                    let (mem, read) = taken.job().staging().memory();
+                    (read as u64, there.is_some() || crate::texture::committed(mem as *const u8, read))
+                }
+                None => crate::texture::staged(resource, there.is_none()).unwrap_or((0, true)),
+            };
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
@@ -3268,9 +3276,14 @@ impl State {
             if let Some(ref s) = staged_now {
                 pass_staged.insert((resource as usize, first_key), s.clone());
             }
-            let staging_for_slot =
-                staged_now.or_else(|| pass_staged.get(&(resource as usize, first_key)).cloned());
-            crate::texture::unstage(resource);
+            let staging_for_slot = ahead
+                .as_ref()
+                .map(|taken| taken.job().staging().clone())
+                .or(staged_now)
+                .or_else(|| pass_staged.get(&(resource as usize, first_key)).cloned());
+            if ahead.is_none() {
+                crate::texture::unstage(resource);
+            }
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
@@ -3284,17 +3297,20 @@ impl State {
                     // Arm slot as `Pending(attempt)` with a strictly monotonic
                     // upload-attempt token now, then commit the verified
                     // baseline from the EXACT `tiled` byte slice detiled into
-                    // `staging` at submit time (eliminating record-vs-submit
-                    // and same-frame callback ABA races). If pass hash budget
-                    // is full, skip callback so zero bytes are hashed and next
-                    // pass retries cleanly.
+                    // `staging` at submit/ahead time (eliminating record-vs-submit
+                    // and same-frame callback ABA races). For `ahead` jobs, keep
+                    // the fallback `due` past normal copy-queue latency so
+                    // `frame + 1` does not race an in-flight copy; `on_complete`
+                    // commits immediately on GPU landing or pulls `due` back to
+                    // `frame + 1` on pre-submit failure / missed snapshot.
                     let (at, len) = staging.memory();
                     let (at, len) = (at as u64, len as u64);
                     let attempt = crate::descriptor::host::next_upload_attempt();
+                    let pending_due = if ahead.is_some() { frame + 30 } else { frame + 1 };
                     host.texture_slot_recheck(
                         index,
                         write,
-                        frame + 1,
+                        pending_due,
                         (at, len),
                         1,
                         0,
@@ -3303,7 +3319,22 @@ impl State {
                         live_state,
                         crate::descriptor::host::LiveBaseline::Pending(attempt),
                     );
-                    if let Some(verified_baseline) =
+                    if let Some(taken) = &ahead
+                        && !matches!(taken, crate::texture::ahead::Taken::New(_))
+                    {
+                        // A `Taken::Known` job may have started reading an older
+                        // snapshot before a remap/new write. Keep this slot
+                        // `Pending(attempt)` without charging hash budget and
+                        // trigger a fresh forced upload at `frame + 1` once the
+                        // in-flight job finishes.
+                        let queue = host.texture_queue();
+                        taken.job().on_complete(move |_| {
+                            queue
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .retry_pending(index, write, attempt, frame + 1);
+                        });
+                    } else if let Some(verified_baseline) =
                         reserve_deferred_recheck(len, live_state, &mut hash_budget)
                     {
                         // For `Plain` textures > 16 MiB, reserve the 256 KiB
@@ -3315,23 +3346,67 @@ impl State {
                             reserve_plain_dense_grid(len, live_state, &mut hash_budget);
                         let queue = host.texture_queue();
                         let verified_due = frame + again_in;
-                        // If an unsnapshotted in-place refresh already started
-                        // concurrently, `on_uploaded` returns `false` and the
-                        // slot simply remains `Pending(attempt)` for `frame + 1`.
-                        let _ = staging.on_uploaded(move |tiled, whole_hash| {
-                            let (print, dense_print) =
-                                compute_upload_prints(tiled, whole_hash, dense, have_dense_grid);
-                            queue.lock().unwrap_or_else(|e| e.into_inner()).commit_baseline(
-                                index,
-                                write,
-                                attempt,
-                                verified_due,
-                                print,
-                                dense_print,
-                                live_state,
-                                verified_baseline,
-                            );
-                        });
+                        if let Some(crate::texture::ahead::Taken::New(new_job)) = &ahead {
+                            let prints = std::sync::Arc::new(std::sync::Mutex::new(None));
+                            let prints_in = prints.clone();
+                            let attached = staging.on_uploaded(move |tiled, whole_hash| {
+                                *prints_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+                                    compute_upload_prints(tiled, whole_hash, dense, have_dense_grid),
+                                );
+                            });
+                            if attached {
+                                new_job.job().on_complete(move |ok| {
+                                    let captured = ok
+                                        .then(|| *prints.lock().unwrap_or_else(|e| e.into_inner()))
+                                        .flatten();
+                                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                                    if let Some((print, dense_print)) = captured {
+                                        q.commit_baseline(
+                                            index,
+                                            write,
+                                            attempt,
+                                            verified_due,
+                                            print,
+                                            dense_print,
+                                            live_state,
+                                            verified_baseline,
+                                        );
+                                    } else {
+                                        q.retry_pending(index, write, attempt, frame + 1);
+                                    }
+                                });
+                            } else {
+                                queue
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .retry_pending(index, write, attempt, frame + 1);
+                            }
+                        } else {
+                            // If an unsnapshotted in-place refresh already started
+                            // concurrently, `on_uploaded` returns `false` and the
+                            // slot simply remains `Pending(attempt)` for `frame + 1`.
+                            let _ = staging.on_uploaded(move |tiled, whole_hash| {
+                                let (print, dense_print) =
+                                    compute_upload_prints(tiled, whole_hash, dense, have_dense_grid);
+                                queue.lock().unwrap_or_else(|e| e.into_inner()).commit_baseline(
+                                    index,
+                                    write,
+                                    attempt,
+                                    verified_due,
+                                    print,
+                                    dense_print,
+                                    live_state,
+                                    verified_baseline,
+                                );
+                            });
+                        }
+                    } else if ahead.is_some() {
+                        // Budget skipped attaching a callback for a dense ahead
+                        // upload: retry on `frame + 1` instead of waiting 30 frames.
+                        host.texture_queue()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retry_pending(index, write, attempt, frame + 1);
                     }
                 } else {
                     match post_upload_without_staging(
@@ -3363,8 +3438,28 @@ impl State {
                         PostUploadFallback::Done => host.texture_slot_done(index, write, again),
                     }
                 }
+            } else if let Some(taken) = &ahead {
+                // Keep the slot queued past normal copy-queue latency until the
+                // ahead job finishes so a pre-submit copy failure retries at
+                // `frame + 1` even when `VICTORY_HEAP_RECHECK=0` or `again.is_some()`.
+                // Only `Taken::New` is guaranteed to refresh strictly after this
+                // pass's mapping/write observation; `Taken::Known` may carry an
+                // older in-flight snapshot (e.g. before a remap) and must stay
+                // queued for verification at `frame + 1` instead of retiring.
+                let owns_snapshot = matches!(taken, crate::texture::ahead::Taken::New(_));
+                host.texture_slot_defer_recheck(index, write, frame + 30);
+                let queue = host.texture_queue();
+                taken.job().on_complete(move |ok| {
+                    queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .finish_ahead(index, write, ok && owns_snapshot, again, frame + 1);
+                });
             } else {
                 host.texture_slot_done(index, write, again);
+            }
+            if let Some(crate::texture::ahead::Taken::New(new_job)) = ahead {
+                new_job.send();
             }
         }
         if baking && served {
@@ -6474,6 +6569,28 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A 200-texture `Plain` boot burst stays strictly within the documented
+    /// 2 MiB `PLAIN_PASS_BUDGET_BYTES` cap (admitting 42 x 48 KiB = 2,016 KiB
+    /// per pass and deferring excess cleanly) while keeping `budget.live == 0`.
+    #[test]
+    fn plain_boot_burst_respects_2mib_cap_without_starving_live() {
+        use super::{PLAIN_PASS_BUDGET_BYTES, PassHashBudget, reserve_deferred_recheck};
+        use crate::descriptor::host::{LiveBaseline, LiveState};
+
+        let mut budget = PassHashBudget::default();
+        let mut admitted = 0usize;
+        for _ in 0..200 {
+            if reserve_deferred_recheck(256 << 10, LiveState::Plain, &mut budget)
+                == Some(LiveBaseline::Strip)
+            {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, (PLAIN_PASS_BUDGET_BYTES / (48 << 10)) as usize);
+        assert!(budget.plain <= PLAIN_PASS_BUDGET_BYTES);
+        assert_eq!(budget.live, 0);
     }
 }
 
