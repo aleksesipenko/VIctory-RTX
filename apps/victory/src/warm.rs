@@ -46,8 +46,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             done.insert(key);
         }
     }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let bad_text = std::fs::read_to_string(&bad_file).unwrap_or_default();
+    let (bad, stale_bad) = known::bad_keys(&bad_text, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -62,7 +62,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} made before ({fingerprint}), {} bad ({stale_bad} stale); {} to make, {jobs} processes",
         keys.len(),
         done.len(),
         bad.len(),
@@ -93,7 +93,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            let _ = writeln!(lock(&bad_out), "{}", known::bad_line(&keys[n], &fingerprint, &why));
             lock(&state).2 += 1;
         },
     )?;
@@ -345,5 +345,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("worker unavailable"));
+    }
+
+    #[test]
+    fn warm_bad_lines_round_trip_and_retry_legacy_or_other_fingerprints() {
+        let fp_new = "0123456789abcdef";
+        let fp_old = "fedcba9876543210";
+        let listed = [
+            "# comment line".to_owned(),
+            known::bad_line("key_current", fp_new, "hung for 180 s"),
+            known::bad_line("key_other_fp", fp_old, "exit code: 1"),
+            "key_legacy exit code: 1".to_owned(),
+            format!("key_legacy_two {fp_new}"),
+        ]
+        .join("\n");
+        let (bad, stale) = known::bad_keys(&listed, fp_new);
+        assert_eq!(bad, HashSet::from(["key_current".to_owned()]));
+        assert_eq!(stale, 3);
     }
 }

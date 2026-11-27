@@ -218,9 +218,27 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
 }
 
 fn init(device: &ID3D12Device) -> Option<Dlss> {
+    const DLL: &str = "nvngx_dlss.dll";
     let dir = std::env::var_os("VICTORY_DLSS_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_exe().ok()?.parent().map(|p| p.to_path_buf()))?;
+    // Without a local copy of `nvngx_dlss.dll`, NGX's driver/OTA copy has hit
+    // an access violation inside `NVSDK_NGX_D3D12_Init_with_ProjectID`
+    // (`_nvngx.dll`) on 610+/617+ drivers (GPL-3.0 provenance: TaynanGT #186).
+    let trust_ngx = std::env::var_os("VICTORY_DLSS_TRUST_NGX").is_some_and(|v| v == "1");
+    let beside_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    let has_local_dll = std::iter::once(dir.clone())
+        .chain(beside_exe)
+        .any(|d| d.join(DLL).is_file());
+    if !trust_ngx && !has_local_dll {
+        tracing::warn!(
+            dir = %dir.display(),
+            "DLSS: no local {DLL} in VICTORY_DLSS_DIR or beside the executable; skipping NGX init to prevent _nvngx.dll AV on newer drivers (set VICTORY_DLSS_TRUST_NGX=1 to override)"
+        );
+        return None;
+    }
     let data = std::env::var_os("VICTORY_DATA_DIR")
         .map(|d| std::path::PathBuf::from(d).join("ngx"))
         .unwrap_or_else(|| std::env::temp_dir().join("victory-ngx"));

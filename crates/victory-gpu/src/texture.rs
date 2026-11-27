@@ -593,10 +593,13 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
+    map.retain(|&resource, s| {
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
+            // (A live texture: one the title releases leaves the table
+            // first, under this lock, in `forget`.)
+            crate::resource::set_staged_first(resource as This, u32::MAX);
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
@@ -619,25 +622,36 @@ pub(crate) fn host_written(resource: This) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
-    // Diagnostics (run 177): where its title memory is, for placed views
-    // the title reads that memory through ([`placed_in_host_written`]).
+    crate::resource::mark_host_written(resource);
+    // Diagnostics (run 177) & BC3/UAV aliasing (`alias_of`): where its title
+    // memory is, for placed views the title reads that memory through.
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
-            HOST_WRITTEN_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+            let mut map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let entries = map.entry(at as u64).or_default();
+            entries.retain(|e| e.5 != resource as usize);
+            entries.push((bytes, words[4], words[6], words[7], words[8], resource as usize));
+            MAX_HOST_WRITTEN_LEN.fetch_max(bytes, std::sync::atomic::Ordering::Release);
+            crate::resource::note_target_range_changed(at as u64, bytes);
         }
     }
 }
 
+type HostWrittenEntry = (u64, u32, u32, u32, u32, usize);
+
+/// Upper bound on byte span length of entries in [`HOST_WRITTEN_AT`], so
+/// covering-range scans starting at `address.saturating_sub(max_len)` never
+/// miss an earlier wider texture behind a nearer narrower entry.
+static MAX_HOST_WRITTEN_LEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
-/// format).
-static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
+/// format), keeping all live written textures at the same address so releasing
+/// one never hides an older still-live written texture.
+static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, Vec<HostWrittenEntry>>> =
     Mutex::new(std::collections::BTreeMap::new());
 
 /// A texture the title placed at `address` (description words `desc`) was
@@ -649,10 +663,16 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     let hit = {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.range(..=address)
-            .next_back()
-            .filter(|(at, d)| address < **at + d.0)
-            .map(|(at, d)| (*at, *d))
+        let min_start = address.saturating_sub(
+            MAX_HOST_WRITTEN_LEN.load(std::sync::atomic::Ordering::Acquire),
+        );
+        map.range(min_start..=address).rev().find_map(|(&at, entries)| {
+            entries
+                .iter()
+                .rev()
+                .find(|d| address < at.saturating_add(d.0))
+                .map(|&d| (at, d))
+        })
     };
     if let Some((at, (bytes, width, height, layers_levels, format, _))) = hit {
         static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -687,6 +707,44 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
+/// Scans all live resources (other than `skip`) in [`HOST_WRITTEN_AT`] starting
+/// at the exact `address` and returns `(matched, first_rejected)` where
+/// `matched` is the first candidate accepted by `accept` and `first_rejected`
+/// is the first live candidate rejected by `accept` (for diagnostic logging
+/// when no compatible alias exists). Exact start-address matching is required
+/// because [`alias`] copies whole subresources from guest offset 0.
+///
+/// Every rejected [`crate::resource::ResourceRef`] is collected into a vector
+/// declared outside the `HOST_WRITTEN_AT` lock so dropping the last reference
+/// to a resource (whose `Drop` calls [`forget`] and reacquires
+/// `HOST_WRITTEN_AT`) can never self-deadlock while the lock is held.
+pub(crate) fn find_host_written_at(
+    address: u64,
+    skip: This,
+    mut accept: impl FnMut(&crate::resource::ResourceRef) -> bool,
+) -> (Option<crate::resource::ResourceRef>, Option<crate::resource::ResourceRef>) {
+    let mut rejected: Vec<crate::resource::ResourceRef> = Vec::new();
+    let matched = {
+        let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&address).and_then(|entries| {
+            for d in entries.iter().rev() {
+                if d.5 as This == skip {
+                    continue;
+                }
+                let Some(cand) = crate::resource::try_ref_resource(d.5 as This) else {
+                    continue;
+                };
+                if accept(&cand) {
+                    return Some(cand);
+                }
+                rejected.push(cand);
+            }
+            None
+        })
+    };
+    (matched, rejected.into_iter().next())
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -699,7 +757,19 @@ pub(crate) fn forget(resource: usize) {
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
-    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
+    // Only remove `resource` itself so any other still-live written texture at
+    // the same address remains visible, and bump `TARGET_CHANGES` under the
+    // lock so concurrent `alias_of()` negative caches invalidate cleanly.
+    {
+        let mut written_at = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+        written_at.retain(|&at, entries| {
+            for e in entries.iter().filter(|e| e.5 == resource) {
+                crate::resource::note_target_range_changed(at, e.0);
+            }
+            entries.retain(|e| e.5 != resource);
+            !entries.is_empty()
+        });
+    }
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
@@ -869,11 +939,9 @@ pub(crate) fn uploaded_in_list(list: &HostList, resource: This, first: u32) -> b
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = upload_first_key(first);
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
+    // Asked of the texture itself, not of the shared tables: every read of
+    // every texture by every recording thread asked them under those locks.
+    let host_written = crate::resource::host_written_mark(resource);
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written {
@@ -884,7 +952,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
         return;
     }
-    if !list.first_use(resource as usize) && staged_from(resource) <= first {
+    if !list.first_use(resource as usize) && crate::resource::staged_first(resource) <= first {
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
@@ -1754,8 +1822,10 @@ impl Staging {
 /// anew.
 pub(crate) fn unstage(resource: This) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
+    if let Some(map) = map.as_mut()
+        && map.remove(&(resource as usize)).is_some()
+    {
+        crate::resource::set_staged_first(resource, u32::MAX);
     }
 }
 
@@ -1940,15 +2010,6 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
-}
-
-/// The first level a title texture's staging buffer holds; `u32::MAX`
-/// without one.
-fn staged_from(resource: This) -> u32 {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|map| map.get(&(resource as usize)))
-        .map_or(u32::MAX, |s| s.first)
 }
 
 /// When `on_upload` callbacks are attached, copies `live` guest memory once
@@ -2212,17 +2273,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return mapped_texture_blocks(start, end);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -2240,6 +2291,43 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         p = next;
     }
     there
+}
+
+/// Counts readable 64 KiB blocks where the runtime has no mapping record,
+/// querying the extent of an unmapped/inaccessible hole only after its first
+/// failed read.
+fn mapped_texture_blocks(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    const BLOCK: usize = 64 << 10;
+    let mut there = 0u64;
+    let mut block = start & !(BLOCK - 1);
+    while block < end {
+        let next = block.saturating_add(BLOCK);
+        let lo = block.max(start);
+        block = next;
+        if readable(lo, 1, true).0 == 1 {
+            there += (next.min(end) - lo) as u64;
+            continue;
+        }
+        // SAFETY: queries an address and fills a structure of the right size.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe { VirtualQuery(lo as *const _, &mut info, size_of_val(&info)) };
+        if queried != 0 && (info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0) {
+            let hole_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+            block = block.max(hole_end.checked_next_multiple_of(BLOCK).unwrap_or(end));
+        }
+    }
+    there
+}
+
+/// Whether a texture in `layout` at `memory` has a base pipe/bank XOR. In an
+/// XOR layout the GPU takes one from base-address bits 8-15 of the texture's
+/// descriptor (`va |= tile_swizzle << 8`). Render-target XOR tables assume
+/// none, so they hold only for a texture at a 64 KiB boundary.
+fn pipe_bank_xor(memory: *const u8, layout: &victory_formats::texture::Layout) -> bool {
+    layout.desc.swizzle.xor() && memory as usize & 0xFFFF != 0
 }
 
 /// The staging state of a title texture, made on first use.
@@ -2290,8 +2378,18 @@ fn staging_with(
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    // Render-target XOR layouts of one 2D slice and mip have addresses
+    // (`Layout::addressable`); the other XOR modes do not.
+    if !layout.addressable() {
         once!(?desc, "texture contents in an XOR mode not uploaded");
+        return None;
+    }
+    if pipe_bank_xor(memory, &layout) {
+        once!(
+            ?desc,
+            ?memory,
+            "texture contents in an XOR mode with a base pipe/bank XOR not uploaded"
+        );
         return None;
     }
     let host = host()?;
@@ -2392,6 +2490,7 @@ fn staging_with(
     });
     if register {
         map.insert(resource as usize, s.clone());
+        crate::resource::set_staged_first(resource, s.first);
     }
     Some(s)
 }

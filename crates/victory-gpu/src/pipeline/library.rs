@@ -50,7 +50,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -415,14 +415,29 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// Only names with a load in progress are kept here. Different names
+/// can load independently, even when the driver's calls take seconds.
+static LOADING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static LOAD_FINISHED: Condvar = Condvar::new();
+
+struct PipelineLoad<'a>(&'a str);
+
+impl Drop for PipelineLoad<'_> {
+    fn drop(&mut self) {
+        LOADING.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        LOAD_FINISHED.notify_all();
+    }
+}
+
+/// Serialise loads of the same name: the host may change that entry as
+/// it is loaded. The registry lock is released before calling the host.
+fn same_name(name: &str) -> PipelineLoad<'_> {
+    let mut loading = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    while loading.contains(name) {
+        loading = LOAD_FINISHED.wait(loading).unwrap_or_else(|e| e.into_inner());
+    }
+    loading.insert(name.to_owned());
+    PipelineLoad(name)
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -438,17 +453,81 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
+/// Records the translator + driver [`super::known::fingerprint`] that built
+/// [`LIBRARY_FILE`]; a mismatch clears stale multi-GB blobs before opening.
+const FOR_FILE: &str = "host-pipelines.for";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
+static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+
+fn remove_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Ensures any on-disk pipeline library in `dir` matches `fingerprint`.
+/// If `host-pipelines.for` is missing or differs while a library blob exists,
+/// the stale blob(s) are removed so stale multi-GB caches do not accumulate or
+/// waste startup mapping time across translator/driver upgrades. Returns
+/// `false` (leaving the old marker untouched) if a stale blob could not be
+/// deleted, so the caller bypasses opening/promoting the stale disk blob.
+fn begun_for(dir: &std::path::Path, fingerprint: &str) -> bool {
+    let marker = dir.join(FOR_FILE);
+    let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
+    if recorded.trim() == fingerprint {
+        return true;
+    }
+    let path = dir.join(LIBRARY_FILE);
+    let next = dir.join(NEXT_FILE);
+    let had_stale = path.exists() || next.exists();
+    if had_stale {
+        tracing::info!(
+            previous = recorded.trim(),
+            current = fingerprint,
+            "host pipeline library fingerprint changed; clearing stale host-pipelines.bin"
+        );
+        if let Err(e) = remove_if_present(&path) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "could not remove stale host pipeline library; keeping old fingerprint marker and bypassing disk load"
+            );
+            return false;
+        }
+        if let Err(e) = remove_if_present(&next) {
+            tracing::warn!(
+                error = %e,
+                path = %next.display(),
+                "could not remove stale pending host pipeline library; keeping old fingerprint marker and bypassing disk load"
+            );
+            return false;
+        }
+    }
+    if std::fs::create_dir_all(dir).is_ok()
+        && let Err(e) = write_atomically(&marker, fingerprint.as_bytes())
+    {
+        tracing::warn!(error = %e, "could not write host pipeline library fingerprint marker");
+    }
+    true
+}
+
 fn library() -> Option<&'static Library> {
-    static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = DIR.get().map_or(Blob::None, |d| {
+                if begun_for(d, &super::known::fingerprint()) {
+                    Blob::of(d)
+                } else {
+                    Blob::None
+                }
+            });
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -493,7 +572,33 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    // Pass a null pointer with zero length for an empty library so strict
+    // drivers / vkd3d-proton accept it (GPL-3.0 provenance: avatarmanz #166).
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: no blob is read; on S_OK, `raw` holds an owned ID3D12PipelineLibrary.
+    let made = unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &mut raw,
+        )
+        .ok()
+        .and_then(|()| {
+            if raw.is_null() {
+                return Err(windows::Win32::Foundation::E_POINTER.into());
+            }
+            ID3D12PipelineLibrary::from_raw(raw).cast::<ID3D12PipelineLibrary1>()
+        })
+    };
+    let library = match made {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::info!(error = %e, "the host refused an empty pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -515,8 +620,10 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
+/// When `name` is `None`, bypasses `ID3D12PipelineLibrary1` and creates
+/// directly on the device (used on NVIDIA for static-sampler PSOs).
 pub(crate) fn pipeline(
-    name: &str,
+    name: Option<&str>,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
@@ -524,11 +631,11 @@ pub(crate) fn pipeline(
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
         create()
     };
-    let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    let Some((name, library)) = name.and_then(|name| library().map(|library| (name, library))) else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    let wide = HSTRING::from(name);
     let began = std::time::Instant::now();
     let loaded = {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
@@ -578,12 +685,54 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// PCI vendor ID of `device`'s adapter via DXGI LUID lookup.
+fn adapter_vendor_id(device: &ID3D12Device) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain DXGI queries on a live device LUID.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+        Some(adapter.GetDesc1().ok()?.VendorId)
+    }
+}
+
+/// On NVIDIA GPUs (`0x10DE`), `ID3D12PipelineLibrary1` can restore stale static
+/// sampler LUT indices across runs (e.g. `64 -> 3` corruption on RTX 4090).
+/// Bypass the library for pipelines carrying static samplers unless
+/// `VICTORY_LIBRARY_STATIC_SAMPLERS=1` opts back in (GPL-3.0 provenance:
+/// TaynanGT #158).
+pub(super) fn allows_static_samplers(host: &crate::host::Host) -> bool {
+    const NVIDIA: u32 = 0x10DE;
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let vendor = adapter_vendor_id(&host.device);
+        let override_on =
+            std::env::var_os("VICTORY_LIBRARY_STATIC_SAMPLERS").is_some_and(|v| v == "1");
+        let allow = vendor != Some(NVIDIA) || override_on;
+        if !allow {
+            tracing::info!(
+                "bypassing ID3D12PipelineLibrary1 for static-sampler PSOs on NVIDIA (VICTORY_LIBRARY_STATIC_SAMPLERS=1 to opt in)"
+            );
+        }
+        allow
+    })
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else {
+        return;
+    };
+    if LIBRARY.get().is_none() && !USED_CHANGED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(library) = library() else {
+        return;
+    };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -796,6 +945,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bypassing_the_library_calls_pipeline_creation() {
+        let created = std::cell::Cell::new(false);
+        let result = pipeline(
+            None,
+            |_, _| panic!("loaded a pipeline without a library name"),
+            || {
+                created.set(true);
+                Err(windows::core::Error::empty())
+            },
+        );
+        assert!(created.get());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn begun_for_resets_stale_library_on_fingerprint_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(LIBRARY_FILE);
+        let next = dir.path().join(NEXT_FILE);
+        std::fs::write(&bin, b"old-blob").unwrap();
+        std::fs::write(&next, b"next-blob").unwrap();
+        // Missing marker clears stale blobs and stamps the current fingerprint.
+        begun_for(dir.path(), "fp-v1");
+        assert!(!bin.exists());
+        assert!(!next.exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join(FOR_FILE)).unwrap(), "fp-v1");
+        // Matching fingerprint keeps the active blob.
+        std::fs::write(&bin, b"fresh-v1").unwrap();
+        begun_for(dir.path(), "fp-v1");
+        assert_eq!(std::fs::read(&bin).unwrap(), b"fresh-v1");
+        // Different fingerprint clears the stale blob and updates the marker.
+        begun_for(dir.path(), "fp-v2");
+        assert!(!bin.exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join(FOR_FILE)).unwrap(), "fp-v2");
+    }
+
+    #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
         assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
@@ -941,5 +1127,75 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn distinct_concurrent_names_do_not_wait_on_the_same_stripe() {
+        let _first = same_name("distinct-a");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let _second = same_name("distinct-b");
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok(),
+            "a distinct pipeline name must not block behind another load"
+        );
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn same_pipeline_name_waits_until_the_first_load_leaves() {
+        let first = same_name("same-name-serialized");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let _second = same_name("same-name-serialized");
+            let _ = acquired_tx.send(());
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "same pipeline name must serialize while first load is active"
+        );
+        drop(first);
+        assert!(
+            acquired_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok(),
+            "waiting load must resume once first load completes"
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn begun_for_does_not_stamp_marker_when_stale_blob_cannot_be_removed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(FOR_FILE);
+        let bin = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&marker, b"old-fingerprint").unwrap();
+        std::fs::write(&bin, b"stale-blob").unwrap();
+
+        // Hold an exclusive Windows handle (share_mode = 0) so remove_file fails.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&bin)
+            .unwrap();
+        assert!(
+            !begun_for(dir.path(), "new-fingerprint"),
+            "must report failure so caller bypasses loading the stale blob"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "old-fingerprint",
+            "fingerprint marker must NOT be updated while stale blob remains"
+        );
+        assert!(bin.exists());
+        drop(lock);
+
+        assert!(begun_for(dir.path(), "new-fingerprint"));
+        assert!(!bin.exists());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "new-fingerprint");
     }
 }

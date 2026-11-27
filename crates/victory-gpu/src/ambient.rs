@@ -323,8 +323,66 @@ fn shade() -> [f32; 2] {
     })
 }
 
+/// Minimum linear floor in dark/shaded areas before crease shading
+/// (`VICTORY_AMBIENT_FLOOR=<level>`; unset/empty: [`FLOOR_DEFAULT`], `0`/`off`:
+/// disabled). Prevents shaded night scenes and characters under awnings from
+/// crushing to pitch black. Provenance (GPL-3.0): Peppacodes #24.
+const FLOOR_DEFAULT: f32 = 0.02;
+
+fn floor() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let val = std::env::var("VICTORY_AMBIENT_FLOOR")
+            .map_or(FLOOR_DEFAULT, |v| parse_floor(&v));
+        if val > 0.0 && set() != Set::Off {
+            tracing::info!(floor = val, "ambient linear shadow floor enabled (VICTORY_AMBIENT_FLOOR)");
+        }
+        val
+    })
+}
+
+fn parse_floor(set: &str) -> f32 {
+    let set = set.trim();
+    if set.is_empty() {
+        return FLOOR_DEFAULT;
+    }
+    set.parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+}
+
+/// Whether magenta probe/reflection artifacts (`c.g < 0.5 * min(c.r, c.b) &&
+/// max(c.r, c.b) > 0.02`) are dropped in diffuse resolve and desaturated using
+/// surrounding room luminance in reflections (`VICTORY_AMBIENT_MAGENTA`; default
+/// on, `0`/`off` disables). Provenance (GPL-3.0): Peppacodes #24.
+fn magenta() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_AMBIENT_MAGENTA")
+            .map_or(true, |v| parse_flag_default_on(&v));
+        if on && set() != Set::Off {
+            tracing::info!("ambient magenta artifact filter enabled (VICTORY_AMBIENT_MAGENTA)");
+        }
+        on
+    })
+}
+
+fn parse_flag_default_on(set: &str) -> bool {
+    let s = set.trim();
+    !(s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false"))
+}
+
+/// Whether per-channel chroma clamping is enabled on diffuse resolve and fog
+/// air (`VICTORY_AMBIENT_CHROMA=1`; opt-in, default off). Provenance (GPL-3.0):
+/// Peppacodes #24.
+fn chroma() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_AMBIENT_CHROMA").is_ok_and(|v| v.trim() == "1"))
+}
+
+const FLAG_MAGENTA: u32 = 1;
+const FLAG_CHROMA: u32 = 2;
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=19, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -335,13 +393,15 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt; float reflect_cap;
-    float least;
+    float least; float floor_val; uint flags;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
 RWStructuredBuffer<float4> cells : register(u1);
-// Three a point: red, green and blue, each a mean and a direction.
+// Four float4s a point (64-byte cache-line aligned): red, green and blue
+// (each a direction and mean), then `(depth_z, 0, 0, 0)` so `raise` reuses
+// the coarse depth without 4 extra full-res `depth.Load` calls per pixel.
 RWStructuredBuffer<float4> points : register(u2);
 // For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
 // what the title's resolve left, what was found and what was written.
@@ -373,13 +433,22 @@ void keep(uint3 at : SV_DispatchThreadID) {
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
+groupshared float3 mean_acc[64];
 [RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void mean() {
+[numthreads(64, 1, 1)]
+void mean(uint gi : SV_GroupIndex) {
     float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    for (uint i = gi; i < CELLS; i += 64) sum += cells[i].rgb;
+    mean_acc[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (gi < s) mean_acc[gi] += mean_acc[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi != 0) return;
     float4 was = cells[CELLS];
-    float3 now = sum / CELLS;
+    float3 now = mean_acc[0] / CELLS;
     // (`jump` > 0: a change of more than that factor either way is
     // followed at once, as a new room is.)
     float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
@@ -402,35 +471,50 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+groupshared float4 tile_pos[64];
+groupshared float3 tile_lit[64];
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
-void gather(uint3 at : SV_DispatchThreadID) {
+[numthreads(8, 8, 1)]
+void gather(uint3 at : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    bool valid = at.x < PX && at.y < PY;
     float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float3 p = valid ? seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size) : float3(0, 0, 1);
     float r2 = 0.25 + 0.0025 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
-        float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
-        float3 d = c.xyz - p;
-        float dd = dot(d, d);
-        float w = c.w / (dd + r2);
-        float3 dir = d / sqrt(dd + 0.25 * r2);
-        whole += w;
-        toward += w * dir;
-        light += w * L;
-        red += w * L.r * dir;
-        green += w * L.g * dir;
-        blue += w * L.b * dir;
+    // Cooperative 64-cell tiling cuts global UAV loads 64x while preserving
+    // the exact 0..CELLS accumulation order (AnyXboxX #475, GPL-3.0).
+    for (uint base = 0; base < CELLS; base += 64) {
+        tile_pos[gi] = cells[CELLS + 1 + base + gi];
+        tile_lit[gi] = cells[base + gi].rgb;
+        GroupMemoryBarrierWithGroupSync();
+        if (valid) {
+            for (uint k = 0; k < 64; k++) {
+                float4 c = tile_pos[k];
+                float3 L = tile_lit[k];
+                float3 d = c.xyz - p;
+                float dd = dot(d, d);
+                float w = c.w / (dd + r2);
+                float3 dir = d / sqrt(dd + 0.25 * r2);
+                whole += w;
+                toward += w * dir;
+                light += w * L;
+                red += w * L.r * dir;
+                green += w * L.g * dir;
+                blue += w * L.b * dir;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (!valid) return;
     whole = max(whole, 1e-6);
     light /= whole;
     toward /= whole;
-    uint at0 = (at.y * PX + at.x) * 3;
+    uint at0 = (at.y * PX + at.x) * 4;
     points[at0] = float4(red / whole - light.r * toward, light.r);
     points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
     points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    points[at0 + 3] = float4(p.z, 0.0, 0.0, 0.0);
 }
 #endif
 
@@ -446,14 +530,14 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
+    uint at0 = (q.y * PX + q.x) * 4;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
     // Scrub NaN/infinity in fog volume before view-ray summation (trustno1-coder 77e13a9).
     if (any(isnan(c)) || any(isinf(c))) { scattered[at] = 0; return; }
-    float has = dot(c, LUMA);
+    float has = (flags & 2u) != 0 ? max(c.r, max(c.g, c.b)) : dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
 #endif
@@ -472,8 +556,11 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+// 32x32 groups (1024 threads, D3D12 max) keep each 32x32 pixel tile resident on
+// one SM so the 12-tap +/-128 px spiral depth taps share L1 texture cache
+// (AnyXboxX #486, GPL-3.0).
 [RootSignature(RS)]
-[numthreads(8, 8, 1)]
+[numthreads(32, 32, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     if (at.x >= width || at.y >= height) return;
@@ -517,10 +604,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float sum = 0;
     for (int k = 0; k < 4; k++) {
         int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        uint at0 = (q.y * PX + q.x) * 4;
+        float z = points[at0 + 3].x;
         float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
         float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-        uint at0 = (q.y * PX + q.x) * 3;
         sr += w * points[at0];
         sg += w * points[at0 + 1];
         sb += w * points[at0 + 2];
@@ -530,18 +617,29 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float3 min_light = floor_val > 0.0 ? float3(1.0, 0.98, 0.94) * floor_val * open : 0.0;
+    if (floor_val > 0.0) found = max(found, min_light);
     float3 was = unpack(light[p]);
     float left = dot(was, LUMA);
+    // VICTORY_AMBIENT_MAGENTA (flags bit 0): drop magenta probe memory garbage.
+    if ((flags & 1u) != 0 && was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the
     // title's leftover counts for no more than the estimate, then up to
     // `most` times it again: its history holds the place before.
     float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
-    float top = max(dot(found, LUMA) * bound, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
-    float3 written = max(was, found * least);
+    if ((flags & 2u) != 0) {
+        // VICTORY_AMBIENT_CHROMA (flags bit 1): per-channel cap.
+        float3 cap = max(found * bound, 1e-6);
+        float3 over = was / cap;
+        was *= min(1.0, 1.0 / max(max(over.r, over.g), max(over.b, 1e-6)));
+    } else {
+        float top = max(dot(found, LUMA) * bound, 1e-6);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+    }
+    float3 written = max(was, max(found * least, min_light));
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
@@ -582,7 +680,7 @@ void hold_reflections(uint3 at : SV_DispatchThreadID) {
         for (int k = 0; k < 4; k++) {
             int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
             float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-            uint at0 = (q.y * PX + q.x) * 3;
+            uint at0 = (q.y * PX + q.x) * 4;
             around += b.x * b.y * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
         }
         around = lerp(around, cells[CELLS].rgb, 0.2);
@@ -591,15 +689,26 @@ void hold_reflections(uint3 at : SV_DispatchThreadID) {
     float3 c = unpack_r(reflections[at.xy]);
     if (any(isnan(c)) || any(isinf(c))) { reflections[at.xy] = 0; return; }
     float has = dot(c, LUMA);
-    if (has > top) reflections[at.xy] = pack_r(c * (top / has));
+    // VICTORY_AMBIENT_MAGENTA (flags bit 0): desaturate magenta missed
+    // reflection rays using the surrounding room luminance so capped indoor
+    // floors/cabinets do not tint pink.
+    bool pink = (flags & 1u) != 0 && c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02;
+    if (pink) {
+        float3 tint = dot(around, LUMA) > 1e-5 ? around : float3(1.0, 0.98, 0.94);
+        c = tint * (has / max(dot(tint, LUMA), 1e-6));
+    }
+    if (has > top || pink) reflections[at.xy] = pack_r(c * (has > top ? top / has : 1.0));
 }
 #endif
 "#;
 
+/// Thread-group width/height of [`SOURCE`]'s `raise` pass.
+const RAISE_GROUP: u32 = 32;
+
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
-const POINT_BYTES: u64 = 160 * 90 * 48;
+const POINT_BYTES: u64 = 160 * 90 * 64;
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
 
@@ -681,10 +790,16 @@ pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
     pass().map(|p| (p.stats.clone(), p.cells.clone()))
 }
 
-fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
-    // SAFETY: an open list; the barrier names no resource.
-    unsafe { list.ResourceBarrier(&[barrier]) };
+fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
 }
 
 /// Whether the light of a frame has been kept: the estimate has something
@@ -731,7 +846,17 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 5 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, reflect = reflect(), "a stand-in for the indirect light");
+            tracing::info!(
+                ?role,
+                size = ?views.size,
+                level,
+                constant,
+                floor = floor(),
+                magenta = magenta(),
+                chroma = chroma(),
+                reflect = reflect(),
+                "a stand-in for the indirect light"
+            );
         }
     }
     list.keep(&pass.cells);
@@ -739,7 +864,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 17];
+    let mut words = [0u32; 19];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -755,14 +880,17 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[14] = (frame_ms(role) / 1000.0).to_bits();
     words[15] = reflect().to_bits();
     words[16] = least.to_bits();
+    words[17] = floor().to_bits();
+    words[18] = (if magenta() { FLAG_MAGENTA } else { 0 }) | (if chroma() { FLAG_CHROMA } else { 0 });
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
-    // these views need; buffers the list keeps.
+    // these views need; buffers the list keeps. Global UAV barriers order
+    // `cells`, `points`, and the target image across all ambient roles and frames.
     unsafe {
-        uav_barrier(l);
+        l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
         if let Some(depth) = views.depth {
             l.SetComputeRootDescriptorTable(1, depth);
         }
@@ -770,10 +898,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
-        let run = |pso: &ID3D12PipelineState, x, y, z| {
-            l.SetPipelineState(pso);
+        let run = |p: &ID3D12PipelineState, x: u32, y: u32, z: u32| {
+            l.SetPipelineState(p);
             l.Dispatch(x, y, z);
-            uav_barrier(l);
+            l.ResourceBarrier(&[uav_barrier()]);
         };
         match role {
             Role::Radiance => {
@@ -781,14 +909,29 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
-            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::Air => run(
+                &pass.air,
+                views.size[0].div_ceil(8),
+                views.size[1].div_ceil(8),
+                views.slices.div_ceil(2),
+            ),
+            Role::Reflect => run(
+                &pass.reflect,
+                views.size[0].div_ceil(8),
+                views.size[1].div_ceil(8),
+                1,
+            ),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    run(&pass.gather, 20, 12, 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                run(
+                    &pass.raise,
+                    views.size[0].div_ceil(RAISE_GROUP),
+                    views.size[1].div_ceil(RAISE_GROUP),
+                    1,
+                );
             }
         }
     }
@@ -811,6 +954,17 @@ mod tests {
         assert_eq!(parse_reflect("off"), 0.0);
         assert_eq!(parse_reflect("0"), 0.0);
         assert_eq!(parse_reflect("1.5"), 1.5);
+        assert_eq!(parse_floor(""), FLOOR_DEFAULT);
+        assert_eq!(parse_floor("0"), 0.0);
+        assert_eq!(parse_floor("off"), 0.0);
+        assert_eq!(parse_floor("-1"), 0.0);
+        assert_eq!(parse_floor("nan"), 0.0);
+        assert_eq!(parse_floor("0.05"), 0.05);
+        assert!(parse_flag_default_on(""));
+        assert!(parse_flag_default_on("1"));
+        assert!(!parse_flag_default_on("0"));
+        assert!(!parse_flag_default_on("off"));
+        assert!(!parse_flag_default_on("FALSE"));
         assert_eq!(parse_band("0.5,1.5"), Some(Band { least: 0.5, most: 1.5, level: 0.8 }));
         assert_eq!(parse_band("1,1,0.6"), Some(Band { least: 1.0, most: 1.0, level: 0.6 }));
         assert_eq!(parse_band("2,1"), Some(Band { least: 2.0, most: 2.0, level: 0.8 }));

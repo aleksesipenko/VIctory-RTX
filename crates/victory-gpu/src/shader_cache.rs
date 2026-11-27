@@ -275,7 +275,6 @@ fn cached_by(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         source,
@@ -283,8 +282,9 @@ fn cached_by(
     };
     let mut old: Option<HostShader> = None;
     for _ in 0..3 {
+        // No combined `[build ++ container]` buffer is built on cache hits.
         let path = cache
-            .get_or_convert(&converter, &input)
+            .get_or_convert_chained(&converter, &build[..], container)
             .map_err(|e| format!("{e:#}"))?;
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let ran = converter.ran.load(Ordering::Relaxed);
@@ -325,7 +325,7 @@ fn cached_by(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -419,11 +419,21 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             word(&mut out, value);
         }
     }
-    out
+    checksum_entry(out)
+}
+
+fn checksum_entry(mut bytes: Vec<u8>) -> Vec<u8> {
+    let digest = blake3::hash(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes
 }
 
 /// The shader and the build of the translator that made it.
 fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
+    let (bytes, digest) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
+    if blake3::hash(bytes).as_bytes() != digest {
+        return None;
+    }
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -580,7 +590,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -611,10 +621,16 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
-        // Entries of the encoding before the translator's build was in them.
-        let mut v1 = bytes.clone();
-        v1[3] = b'1';
-        assert_eq!(decode(&v1), None);
+        // Entries of the encoding before the trailing BLAKE3 digest.
+        let mut v2 = bytes.clone();
+        v2[3] = b'2';
+        assert_eq!(decode(&v2), None);
+        // Same-length bit flip in DXIL payload fails checksum verification.
+        let mut flipped = bytes.clone();
+        let dxil = &shader().dxil;
+        let at = flipped.windows(dxil.len()).position(|w| w == dxil).unwrap();
+        flipped[at + 3] ^= 1;
+        assert_eq!(decode(&flipped), None);
     }
 
     /// An entry an earlier build of the translator made, under the same

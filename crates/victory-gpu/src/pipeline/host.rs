@@ -6,6 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
+use std::ops::Range;
 use std::sync::Arc;
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
@@ -16,6 +17,37 @@ use windows::core::PCSTR;
 
 use super::{Shader, Translated};
 use crate::host::host;
+
+/// Zeroes padding byte ranges in place inside `value` so D3D12 pipeline
+/// descriptions and subobject streams hash identically across runs
+/// (GPL-3.0 provenance: Harryisadag 2a10008 / fxceless#238).
+fn zero_padding<T>(value: &mut T, ranges: &[Range<usize>]) {
+    let base = std::ptr::from_mut(value).cast::<u8>();
+    for range in ranges {
+        debug_assert!(range.end <= size_of::<T>());
+        if range.start < range.end {
+            // SAFETY: `range` covers only padding bytes inside `value`.
+            unsafe { base.add(range.start).write_bytes(0, range.end - range.start) };
+        }
+    }
+}
+
+/// Padding ranges inside `D3D12_BLEND_DESC`: 3 trailing bytes after
+/// `RenderTargetWriteMask` in each of the 8 `D3D12_RENDER_TARGET_BLEND_DESC`
+/// elements.
+fn blend_padding() -> [Range<usize>; 8] {
+    let base = std::mem::offset_of!(D3D12_BLEND_DESC, RenderTarget);
+    let stride = size_of::<D3D12_RENDER_TARGET_BLEND_DESC>();
+    let tail = std::mem::offset_of!(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1;
+    std::array::from_fn(|i| base + i * stride + tail..base + (i + 1) * stride)
+}
+
+/// Padding range inside `D3D12_DEPTH_STENCIL_DESC` (and identical in
+/// `D3D12_DEPTH_STENCIL_DESC1`): between `StencilWriteMask` and `FrontFace`.
+fn depth_padding() -> Range<usize> {
+    std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + 1
+        ..std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, FrontFace)
+}
 
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
@@ -602,6 +634,7 @@ impl HostPipeline {
                 return None;
             }
         };
+        let use_library = samplers.is_empty() || super::library::allows_static_samplers(host);
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -620,7 +653,7 @@ impl HostPipeline {
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
-                &name,
+                use_library.then_some(name.as_str()),
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -691,7 +724,15 @@ impl HostPipeline {
                 &[&code_bytes(&ms_code), &code_bytes(&ps_code)],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, ms_code, ps_code, g, depth_bounds, &name) {
+            let pso = match mesh_pipeline(
+                &host.device,
+                &root,
+                ms_code,
+                ps_code,
+                g,
+                depth_bounds,
+                use_library.then_some(name.as_str()),
+            ) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -760,6 +801,10 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
+        // Zeroed again where the host reads them: a copy need not keep
+        // padding bytes (Harryisadag 2a10008 / fxceless#238).
+        zero_padding(&mut desc.BlendState, &blend_padding());
+        zero_padding(&mut desc.DepthStencilState, &[depth_padding()]);
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {
@@ -777,11 +822,12 @@ impl HostPipeline {
             ),
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
+            let library_name = use_library.then_some(name);
             if depth_bounds {
-                return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), name);
+                return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), library_name);
             }
             super::library::pipeline(
-                name,
+                library_name,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
                 // SAFETY: as above.
@@ -863,10 +909,21 @@ impl HostPipeline {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+/// Zeroes the gaps of a stream subobject: between its type and its
+/// description, and after the description (Harryisadag 2a10008 / fxceless#238).
+fn zero_gaps<T>(sub: &mut Sub<T>) {
+    let at = std::mem::offset_of!(Sub<T>, 1);
+    let end = at + size_of::<T>();
+    zero_padding(
+        sub,
+        &[size_of::<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>()..at, end..size_of::<Sub<T>>()],
+    );
+}
+
 fn stream_pipeline<S>(
     device: &ID3D12Device,
     stream: &mut S,
-    name: &str,
+    name: Option<&str>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
@@ -891,7 +948,7 @@ fn graphics_depth_bounds_pipeline(
     root: &ID3D12RootSignature,
     d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC1,
-    name: &str,
+    name: Option<&str>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     #[repr(C)]
@@ -915,6 +972,26 @@ fn graphics_depth_bounds_pipeline(
         base: Stream,
         gs: Sub<D3D12_SHADER_BYTECODE>,
     }
+    impl Stream {
+        /// Padding zeroed in place, after the last move (see `zero_padding`).
+        fn clean(&mut self) {
+            zero_padding(&mut self.blend.1, &blend_padding());
+            zero_padding(&mut self.depth.1, &[depth_padding()]);
+            zero_gaps(&mut self.root);
+            zero_gaps(&mut self.vs);
+            zero_gaps(&mut self.ps);
+            zero_gaps(&mut self.blend);
+            zero_gaps(&mut self.mask);
+            zero_gaps(&mut self.raster);
+            zero_gaps(&mut self.depth);
+            zero_gaps(&mut self.input);
+            zero_gaps(&mut self.strip_cut);
+            zero_gaps(&mut self.topology);
+            zero_gaps(&mut self.targets);
+            zero_gaps(&mut self.dsv);
+            zero_gaps(&mut self.samples);
+        }
+    }
     let targets = D3D12_RT_FORMAT_ARRAY {
         RTFormats: d.RTVFormats,
         NumRenderTargets: d.NumRenderTargets,
@@ -936,12 +1013,15 @@ fn graphics_depth_bounds_pipeline(
     };
     if d.GS.pShaderBytecode.is_null() {
         let mut stream = base;
+        stream.clean();
         stream_pipeline(device, &mut stream, name)
     } else {
         let mut stream = StreamGs {
             base,
             gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
         };
+        stream.base.clean();
+        zero_gaps(&mut stream.gs);
         stream_pipeline(device, &mut stream, name)
     }
 }
@@ -1017,7 +1097,7 @@ fn mesh_pipeline(
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     depth_bounds: bool,
-    name: &str,
+    name: Option<&str>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     #[repr(C)]
@@ -1033,6 +1113,25 @@ fn mesh_pipeline(
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+    }
+    impl<D> Stream<D> {
+        /// Padding zeroed in place, after the last move (see `zero_padding`;
+        /// `D` is a depth-stencil description, either kind).
+        fn clean(&mut self) {
+            zero_padding(&mut self.blend.1, &blend_padding());
+            zero_padding(&mut self.depth.1, &[depth_padding()]);
+            zero_gaps(&mut self.root);
+            zero_gaps(&mut self.ms);
+            zero_gaps(&mut self.ps);
+            zero_gaps(&mut self.blend);
+            zero_gaps(&mut self.mask);
+            zero_gaps(&mut self.raster);
+            zero_gaps(&mut self.depth);
+            zero_gaps(&mut self.targets);
+            zero_gaps(&mut self.dsv);
+            zero_gaps(&mut self.samples);
+            zero_gaps(&mut self.topology);
+        }
     }
     let build = |depth: Sub<_>| {
         let mut stream = Stream {
@@ -1051,6 +1150,7 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
+        stream.clean();
         stream_pipeline(device, &mut stream, name)
     };
     if depth_bounds {
@@ -1070,6 +1170,7 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
+        stream.clean();
         stream_pipeline(device, &mut stream, name)
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
@@ -1209,9 +1310,9 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, Some(&name)).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, Some(&name)).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -1347,10 +1448,10 @@ mod tests {
             &[&vs, &ps],
             &g.describe(),
         );
-        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), Some(&name))
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), Some(&name))
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
@@ -1605,5 +1706,70 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    fn padding_of<T>(value: &T, ranges: &[Range<usize>]) -> Vec<u8> {
+        let base = std::ptr::from_ref(value).cast::<u8>();
+        let mut out = Vec::new();
+        for range in ranges {
+            // SAFETY: bytes within `value` written explicitly by the test.
+            let slice = unsafe { std::slice::from_raw_parts(base.add(range.start), range.len()) };
+            out.extend_from_slice(slice);
+        }
+        out
+    }
+
+    #[test]
+    fn stream_subobjects_carry_no_gaps() {
+        assert_eq!(
+            depth_padding(),
+            std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC1, StencilWriteMask) + 1
+                ..std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC1, FrontFace)
+        );
+        let mut root = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, 0x1234_5678_9abc_def0u64);
+        // SAFETY: plain data; every byte, the gaps too, is 0xff.
+        unsafe { std::ptr::from_mut(&mut root).cast::<u8>().write_bytes(0xff, size_of::<Sub<u64>>()) };
+        root.1 = 0x1234_5678_9abc_def0;
+        zero_gaps(&mut root);
+        assert_eq!(padding_of(&root, std::slice::from_ref(&(4..8))), [0; 4]);
+        assert_eq!(root.1, 0x1234_5678_9abc_def0);
+
+        let mut samples = Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+            DXGI_SAMPLE_DESC { Count: 4, Quality: 1 },
+        );
+        // SAFETY: as above.
+        unsafe {
+            std::ptr::from_mut(&mut samples)
+                .cast::<u8>()
+                .write_bytes(0xff, size_of::<Sub<DXGI_SAMPLE_DESC>>());
+        }
+        samples.1 = DXGI_SAMPLE_DESC { Count: 4, Quality: 1 };
+        zero_gaps(&mut samples);
+        assert_eq!(padding_of(&samples, std::slice::from_ref(&(12..16))), [0; 4]);
+        assert_eq!((samples.1.Count, samples.1.Quality), (4, 1));
+    }
+
+    #[test]
+    fn mip_lod_bias_clamps_to_d3d12_bounds() {
+        let clamp = |bias: f32| {
+            victory_shader::emit::StaticSampler {
+                filter: 0,
+                address: [0; 3],
+                mip_lod_bias: bias,
+                max_anisotropy: 1,
+                comparison: 0,
+                border: 0,
+                min_lod: 0.0,
+                max_lod: 0.0,
+            }
+            .mip_lod_bias_for_host()
+        };
+        assert_eq!(clamp(-32.0), -16.0);
+        assert_eq!(clamp(-16.0), -16.0);
+        assert_eq!(clamp(0.5), 0.5);
+        assert_eq!(clamp(15.992), 15.99);
+        assert_eq!(clamp(31.996), 15.99);
+        assert_eq!(clamp(f32::NAN), 0.0);
     }
 }

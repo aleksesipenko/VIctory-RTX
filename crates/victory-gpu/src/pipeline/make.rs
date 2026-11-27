@@ -60,6 +60,12 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// A compute pipeline whose dispatches use the bounded compute-wait path
+    /// ([`compute_waits`]), whether a dropped dispatch was logged, and how many
+    /// cumulative microseconds have been waited for it (capped at [`COMPUTE_CHANCE`]).
+    compute: bool,
+    compute_dropped: AtomicBool,
+    compute_waited_us: AtomicU64,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
     /// How long draws have waited for this pipeline so far, in microseconds
@@ -144,6 +150,35 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+/// Pipeline keys the driver compiler crashed on under this translation and
+/// driver fingerprint (`warm-bad.txt` beside the pipeline library; see
+/// [`super::known::bad_keys`]). `VICTORY_WARM_BAD=0` leaves the file unread.
+/// Provenance (GPL-3.0): avatarmanz #430.
+static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn is_bad_key(key: &str) -> bool {
+    if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+        return false;
+    }
+    let mut guard = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = guard.get_or_insert_with(|| {
+        let listed = super::library::folder()
+            .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
+            .unwrap_or_default();
+        if listed.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let (keys, stale) = super::known::bad_keys(&listed, &super::known::fingerprint());
+        tracing::info!(
+            left_out = keys.len(),
+            tried_again = stale,
+            "pipelines the driver compiler crashed on (warm-bad.txt): entries under other fingerprints are retried"
+        );
+        keys
+    });
+    keys.contains(key)
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
@@ -152,14 +187,23 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key.finalize().to_hex()[..32].to_owned();
         let scene_input = scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders);
+        let compute = graphics.is_none()
+            && shaders.first().is_some_and(|s| s.stage == "compute")
+            && compute_waits();
+        let left_out = left_out(&shaders).or_else(|| {
+            is_bad_key(&key).then_some("driver compiler crashed on this pipeline under this fingerprint (warm-bad.txt)")
+        });
         Pending {
             screen,
             scene_input,
+            compute,
+            compute_dropped: AtomicBool::new(false),
+            compute_waited_us: AtomicU64::new(0),
             left_out,
             waited_us: AtomicU64::new(0),
             wait_state: Mutex::new(WaitFrameState::default()),
@@ -168,7 +212,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -496,8 +540,64 @@ impl FrameSpent {
     }
 }
 
+/// Bounded compute-dispatch wait policy (`VICTORY_PIPELINE_COMPUTE_WAIT` or
+/// `VICTORY_COMPUTE_WAIT`; default on, `0`/`off` disables).
+/// Gives first-use compute pipelines a bounded wait (500 ms/frame cap,
+/// 100 ms/pipeline cap, and 1 worker kept in reserve when >= 4 workers exist)
+/// so one-off character skin/clothing bake dispatches finish without risking
+/// 10-30 s watchdog stalls (GPL-3.0 provenance: avatarmanz #166 / fxceless #1312).
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let parse = |raw: String| {
+            let s = raw.trim();
+            !(s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false"))
+        };
+        let on = std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT")
+            .or_else(|_| std::env::var("VICTORY_COMPUTE_WAIT"))
+            .map_or(true, parse);
+        if on {
+            tracing::info!(
+                frame_ms = COMPUTE_BUDGET.as_millis() as u64,
+                pipeline_ms = COMPUTE_CHANCE.as_millis() as u64,
+                "bounded compute pipeline wait enabled (VICTORY_PIPELINE_COMPUTE_WAIT)"
+            );
+        }
+        on
+    })
+}
+
+/// Per-frame microsecond budget for all bounded compute waits combined.
+const COMPUTE_BUDGET: Duration = Duration::from_millis(500);
+const COMPUTE_BUDGET_US: u64 = COMPUTE_BUDGET.as_micros() as u64;
+
+/// Per-pipeline cap (and threshold for marking a compute pipeline's single
+/// bounded wait spent).
+const COMPUTE_CHANCE: Duration = Duration::from_millis(100);
+const COMPUTE_CHANCE_US: u64 = COMPUTE_CHANCE.as_micros() as u64;
+
+/// Monotonic per-frame microsecond budget state for [`wait_compute`].
+struct FrameBudgetState {
+    frame: Option<u64>,
+    remaining_us: u64,
+}
+
+impl FrameBudgetState {
+    const fn new() -> Self {
+        FrameBudgetState { frame: None, remaining_us: 0 }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+fn wait(p: &Arc<Pending>, frame: u64) {
+    // Bounded compute wait: strictly enforced 100 ms cumulative cap per pipeline
+    // and 500 ms per-frame wall-clock cap for ALL compute pipelines (checked
+    // BEFORE `screen` so compute `scene_input` shaders also obey the compute cap
+    // instead of inheriting the 10 s screen pass budget).
+    if p.compute {
+        wait_compute(p, frame);
+        return;
+    }
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
@@ -560,10 +660,132 @@ fn wait(p: &Pending, frame: u64) {
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
     }
+    let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
+    // A frame that began meanwhile has its own budget.
+    spent.finish(frame, left, waited, shared);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::PipelineWaitUs,
+        started.elapsed().as_micros() as u64,
+    );
+}
+
+/// Atomically reserves remaining bounded compute wait for `p` in `frame`,
+/// strictly capped by both [`COMPUTE_CHANCE`] (cumulative per pipeline across
+/// concurrent waiters) and [`COMPUTE_BUDGET`] (atomic per-frame microsecond
+/// pool across all concurrent pipelines). Stale callers with `frame < active`
+/// receive [`Duration::ZERO`] and can never steal a newer frame's budget.
+fn reserve_compute_wait(
+    state: &mut FrameBudgetState,
+    waited_us: &AtomicU64,
+    frame: u64,
+) -> Duration {
+    if state.frame.is_some_and(|active| frame < active) {
+        return Duration::ZERO;
+    }
+    if state.frame.is_none_or(|active| frame > active) {
+        *state = FrameBudgetState {
+            frame: Some(frame),
+            remaining_us: COMPUTE_BUDGET_US,
+        };
+    }
+    if state.remaining_us == 0 {
+        return Duration::ZERO;
+    }
+    let frame_avail = state.remaining_us;
+    let mut granted_us = 0u64;
+    let _ = waited_us.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        let pipeline_left = COMPUTE_CHANCE_US.saturating_sub(used);
+        let grant = pipeline_left.min(frame_avail);
+        if grant == 0 {
+            return None;
+        }
+        granted_us = grant;
+        Some(used + grant)
+    });
+    state.remaining_us = state.remaining_us.saturating_sub(granted_us);
+    Duration::from_micros(granted_us)
+}
+
+/// Refunds unused reserved compute-wait microseconds back to both the pipeline's
+/// cumulative counter and (when `frame` is still active) the frame's remaining
+/// budget pool.
+fn refund_compute_wait(
+    state: &mut FrameBudgetState,
+    waited_us: &AtomicU64,
+    frame: u64,
+    granted: Duration,
+    actual: Duration,
+) {
+    let granted_us = granted.as_micros().min(u64::MAX as u128) as u64;
+    let actual_us = actual.as_micros().min(granted_us as u128) as u64;
+    let unused_us = granted_us.saturating_sub(actual_us);
+    if unused_us == 0 {
+        return;
+    }
+    let _ = waited_us.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        Some(used.saturating_sub(unused_us))
+    });
+    if state.frame == Some(frame) {
+        state.remaining_us = state
+            .remaining_us
+            .saturating_add(unused_us)
+            .min(COMPUTE_BUDGET_US);
+    }
+}
+
+fn wait_compute(p: &Arc<Pending>, frame: u64) {
+    if p.made.get().is_some() {
+        return;
+    }
+    // Hurry before reserving budget so queue lock time does not stretch past
+    // the reserved wait grant.
+    if p.compute_waited_us.load(Ordering::Acquire) < COMPUTE_CHANCE_US {
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner()).hurry(p);
+    }
+    static WAITS: Mutex<FrameBudgetState> = Mutex::new(FrameBudgetState::new());
+    let left = {
+        let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        reserve_compute_wait(&mut waits, &p.compute_waited_us, frame)
+    };
+    if left.is_zero() {
+        if p.made.get().is_none() && !p.compute_dropped.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                shaders = %hashes(p),
+                frame,
+                waited_ms = 0u64,
+                allowed = false,
+                "a compute dispatch was dropped: its pipeline wait budget was exhausted"
+            );
+        }
+        return;
+    }
+    let waiting = crate::timeline::span("pipeline: first use waits for a compute pipeline");
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let waited = started.elapsed().min(left);
+    waiting.end();
     {
-        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        spent.finish(frame, left, waited, shared);
+        let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        refund_compute_wait(&mut waits, &p.compute_waited_us, frame, left, waited);
+    }
+    if p.made.get().is_none() && !p.compute_dropped.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            shaders = %hashes(p),
+            frame,
+            waited_ms = waited.as_millis() as u64,
+            allowed = true,
+            "a compute dispatch was dropped: its pipeline was not made within its wait"
+        );
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
@@ -600,22 +822,35 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Compute pipelines a dispatch waits for now ([`Queue::hurry`]), and
+    /// other requested compute pipelines whose dispatches wait
+    /// ([`compute_waits`]): before requested graphics, newest first.
+    hurried: VecDeque<Arc<Pending>>,
+    compute: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Non-screen worker jobs currently in flight and the worker count, for
+    /// keeping one worker in reserve for hurried compute pipelines.
+    taken: Vec<Arc<Pending>>,
+    workers: Option<usize>,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            hurried: VecDeque::new(),
+            compute: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            taken: Vec::new(),
+            workers: None,
         }
     }
 
@@ -633,6 +868,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && p.compute {
+            self.compute.push_front(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -643,20 +880,61 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    /// Promotes a requested compute pipeline a dispatch is actively waiting for
+    /// ahead of all other compute work.
+    fn hurry(&mut self, p: &Arc<Pending>) {
+        if p.queue_state.load(Ordering::Relaxed) == REQUESTED
+            && !self.hurried.iter().any(|q| Arc::ptr_eq(q, p))
+        {
+            self.hurried.push_front(p.clone());
+            AVAILABLE.notify_all();
+        }
+    }
+
+    /// Reserves the last free worker (when >= 4 non-screen workers exist) for
+    /// screen passes and actively waited-for compute pipelines (`Queue::hurry`).
+    fn reserved(&mut self) -> bool {
+        if !compute_waits() {
+            return false;
+        }
+        let workers = *self.workers.get_or_insert_with(|| {
+            worker_count_for(
+                std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
+                std::thread::available_parallelism().map_or(2, |n| n.get()),
+                crate::residency::limited_host_ram(),
+            )
+        });
+        self.taken.retain(|p| p.made.get().is_none());
+        workers >= 4 && self.taken.len() + 1 >= workers
+    }
+
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
+        let waiting = |list: &mut VecDeque<Arc<Pending>>| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == REQUESTED)
+        };
         let mut p = self.screen.pop_front();
-        if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
-            if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
-                if let Some(p) = &p {
-                    p.was_slow.store(true, Ordering::Relaxed);
-                    self.slow_now += 1;
+        if !screens_only {
+            p = p.or_else(|| waiting(&mut self.hurried));
+            if p.is_none() && !self.reserved() {
+                p = waiting(&mut self.compute)
+                    .or_else(|| self.requested.pop_front())
+                    .or_else(|| unclaimed(&mut self.early));
+                if p.is_none() && self.slow_now < slow_limit {
+                    p = unclaimed(&mut self.slow);
+                    if let Some(p) = &p {
+                        p.was_slow.store(true, Ordering::Relaxed);
+                        self.slow_now += 1;
+                    }
                 }
+            }
+            if let Some(p) = &p
+                && compute_waits()
+            {
+                self.taken.push(p.clone());
             }
         }
         let p = p?;
@@ -751,9 +1029,15 @@ fn workers() -> bool {
                     loop {
                         let p = next(screens_only);
                         p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
+                        let was_slow = p.was_slow.load(Ordering::Relaxed);
+                        if was_slow || (!screens_only && compute_waits()) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
+                            if was_slow {
+                                queue.slow_now -= 1;
+                            }
+                            if !screens_only && compute_waits() {
+                                queue.taken.retain(|q| q.made.get().is_none());
+                            }
                             AVAILABLE.notify_all();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -1070,5 +1354,184 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn waiting_compute_dispatches_go_first() {
+        let of = |compute, screen| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = compute;
+            p.screen = screen;
+            Arc::new(p)
+        };
+        let (world, compute, screen) = (of(false, false), of(true, false), of(false, true));
+        let mut queue = Queue::new();
+        queue.workers = Some(64);
+        assert_eq!(queue.push(&world, REQUESTED), Some(true));
+        assert_eq!(queue.push(&compute, REQUESTED), Some(true));
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert!(queue.pop(true, 1).is_some_and(|p| Arc::ptr_eq(&p, &screen)));
+        assert!(queue.pop(true, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &compute));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn a_pipeline_a_dispatch_waits_for_is_made_next() {
+        let of = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = true;
+            Arc::new(p)
+        };
+        let (first, second, waited, later) = (of(), of(), of(), of());
+        let world = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.workers = Some(64);
+        for p in [&world, &first, &waited, &second, &later] {
+            assert_eq!(queue.push(p, REQUESTED), Some(true));
+        }
+        assert_eq!(queue.push(&first, REQUESTED), None);
+        queue.hurry(&waited);
+        queue.hurry(&waited);
+        assert!(queue.pop(true, 1).is_none());
+        for p in [&waited, &later, &second, &first, &world] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), p));
+        }
+        queue.hurry(&first);
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn the_last_worker_is_kept_for_a_waited_for_pipeline() {
+        if !compute_waits() {
+            return;
+        }
+        let of = |compute| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = compute;
+            Arc::new(p)
+        };
+        let mut queue = Queue::new();
+        queue.workers = Some(4);
+        let (a, b, c, d, waited) = (of(true), of(true), of(true), of(false), of(true));
+        for p in [&a, &b, &c, &d] {
+            queue.push(p, REQUESTED);
+        }
+        for p in [&c, &b, &a] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), p));
+        }
+        assert!(queue.pop(false, 1).is_none());
+        queue.push(&waited, REQUESTED);
+        assert!(queue.pop(false, 1).is_none());
+        queue.hurry(&waited);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &waited));
+        let _ = c.made.set(None);
+        let _ = waited.made.set(None);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &d));
+    }
+
+    #[test]
+    fn compute_waits_end_with_the_frames_budget() {
+        let ms = Duration::from_millis;
+
+        // 1) Six distinct pipelines concurrently reserving in the same frame
+        //    must have total reserved sum <= 500 ms (COMPUTE_BUDGET).
+        let state = Arc::new(Mutex::new(FrameBudgetState::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let s = state.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    let used = AtomicU64::new(0);
+                    b.wait();
+                    let mut guard = s.lock().unwrap();
+                    reserve_compute_wait(&mut guard, &used, 7)
+                })
+            })
+            .collect();
+        let grants: Vec<Duration> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let total: Duration = grants.iter().copied().sum();
+        assert_eq!(total, COMPUTE_BUDGET);
+        assert!(grants.iter().all(|&g| g <= COMPUTE_CHANCE));
+        assert_eq!(grants.iter().filter(|&&g| g.is_zero()).count(), 1);
+        assert_eq!(state.lock().unwrap().remaining_us, 0);
+
+        // 2) Frame 8 starts fresh with full 500 ms budget; a late frame-7 caller
+        //    immediately receives zero and never steals frame 8's budget.
+        let mut s = state.lock().unwrap();
+        let p8 = AtomicU64::new(0);
+        assert_eq!(reserve_compute_wait(&mut s, &p8, 8), COMPUTE_CHANCE);
+        assert_eq!(s.remaining_us, COMPUTE_BUDGET_US - COMPUTE_CHANCE_US);
+        let stale_p7 = AtomicU64::new(0);
+        assert_eq!(reserve_compute_wait(&mut s, &stale_p7, 7), Duration::ZERO);
+        assert_eq!(s.remaining_us, COMPUTE_BUDGET_US - COMPUTE_CHANCE_US);
+
+        // 3) Early wake refunds unused budget to both pipeline and active frame;
+        //    stale-frame refund does not inflate active frame 8's remaining budget.
+        refund_compute_wait(&mut s, &p8, 8, COMPUTE_CHANCE, ms(25));
+        assert_eq!(p8.load(Ordering::Acquire), 25_000);
+        assert_eq!(s.remaining_us, COMPUTE_BUDGET_US - 25_000);
+        let old_used = AtomicU64::new(COMPUTE_CHANCE_US);
+        refund_compute_wait(&mut s, &old_used, 7, COMPUTE_CHANCE, ms(10));
+        assert_eq!(old_used.load(Ordering::Acquire), 10_000);
+        assert_eq!(s.remaining_us, COMPUTE_BUDGET_US - 25_000);
+    }
+
+    #[test]
+    fn compute_wait_cap_is_cumulative_atomic_and_applies_to_screen_compute() {
+        let ms = Duration::from_millis;
+        let mut s = FrameBudgetState { frame: Some(1), remaining_us: 60_000 };
+        let used = AtomicU64::new(0);
+        // Frame 1 only has 60 ms left: reserves 60 ms atomically.
+        assert_eq!(reserve_compute_wait(&mut s, &used, 1), ms(60));
+        assert_eq!(s.remaining_us, 0);
+        // Frame 2 starts fresh (500 ms frame budget), but pipeline only has 40 ms left of 100 ms.
+        assert_eq!(reserve_compute_wait(&mut s, &used, 2), ms(40));
+        assert_eq!(s.remaining_us, COMPUTE_BUDGET_US - 40_000);
+        // Once 100 ms cumulative is reserved, any later waiter immediately receives zero.
+        assert_eq!(reserve_compute_wait(&mut s, &used, 3), Duration::ZERO);
+        // Early-wake refund in active frame 3 restores unused allowance to both pipeline and frame.
+        refund_compute_wait(&mut s, &used, 3, ms(40), ms(15));
+        assert_eq!(used.load(Ordering::Acquire), 75_000);
+        assert_eq!(reserve_compute_wait(&mut s, &used, 3), ms(25));
+
+        // Concurrent waiters racing on the same pipeline cannot exceed COMPUTE_CHANCE.
+        let shared_used = Arc::new(AtomicU64::new(0));
+        let shared_state = Arc::new(Mutex::new(FrameBudgetState::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let u = shared_used.clone();
+                let st = shared_state.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    let mut guard = st.lock().unwrap();
+                    reserve_compute_wait(&mut guard, &u, 10)
+                })
+            })
+            .collect();
+        let total: Duration = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, COMPUTE_CHANCE);
+        assert_eq!(shared_used.load(Ordering::Acquire), COMPUTE_CHANCE_US);
+        assert_eq!(
+            shared_state.lock().unwrap().remaining_us,
+            COMPUTE_BUDGET_US - COMPUTE_CHANCE_US
+        );
+
+        // Compute pipeline with `screen == true` (e.g. scene_input compute shader)
+        // must STILL take the bounded compute wait path (not 10 s screen_budget).
+        let mut p = Pending::new(Vec::new(), None);
+        p.compute = true;
+        p.screen = true;
+        p.compute_waited_us.store(COMPUTE_CHANCE_US, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let began = Instant::now();
+        wait(&p, 99);
+        assert!(
+            began.elapsed() < ms(50),
+            "screen+compute with exhausted compute budget must return immediately, not enter screen_budget"
+        );
     }
 }
