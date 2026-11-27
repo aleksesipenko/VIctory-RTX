@@ -913,17 +913,37 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Atomically advances `taken` to at least `total` and returns the monotonic
+/// increment since the previous call. Lets periodic log lines take interval
+/// deltas while [`panel`] reads the same underlying counters monotonically
+/// without racing resets.
+pub(crate) fn take_delta(
+    total: &std::sync::atomic::AtomicU64,
+    taken: &std::sync::atomic::AtomicU64,
+) -> u64 {
+    let mut prev = taken.load(Ordering::Relaxed);
+    loop {
+        let now = total.load(Ordering::Relaxed);
+        let next = now.max(prev);
+        match taken.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next - prev,
+            Err(cur) => prev = cur,
+        }
+    }
+}
+
 /// After submissions: shader-written ranges compared and copied back into
-/// title memory (microseconds, bytes that differed), since the last
-/// frame-rate line.
+/// title memory (monotonic totals since the start: microseconds, bytes that
+/// differed).
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
-/// The card's clock, for the frame line of every run, in microseconds since
-/// the last one: how long the card had nothing of ours queued; how much of
-/// that while the thread that holds the submission lock was working (the
-/// card idle behind us: preparing and copying back are done with the card
-/// standing); and how long that thread stood waiting for the card.
+/// The card's clock, for the frame line and panel of every run, as monotonic
+/// microsecond totals since the start: how long the card had nothing of ours
+/// queued; how much of that while the thread that holds the submission lock
+/// was working (the card idle behind us: preparing and copying back are done
+/// with the card standing); and how long that thread stood waiting for the
+/// card.
 ///
 /// Every send of lists to the queue is followed by a signal on a fence of
 /// the clock's own ([`Host::card_sent`]). A thread of the clock waits for
@@ -931,27 +951,55 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 /// newer sent; the next send ends that idle stretch.
 static CARD_CLOCK_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Consistent pair of accumulated working microseconds and active start
+/// timestamp (`now_us() + 1`, or `0` while idle). Guarded by [`WORKING`] and
+/// sampled with `now_us()` read under the same lock so [`worked`] is strictly
+/// monotonic across concurrent [`working`] transitions.
+struct WorkingClock {
+    total: u64,
+    since: u64,
+}
+
+impl WorkingClock {
+    const fn new() -> Self {
+        Self { total: 0, since: 0 }
+    }
+
+    fn set(&mut self, on: bool, now: u64) -> bool {
+        let was = self.since != 0;
+        if was {
+            self.total = self.total.saturating_add(now.saturating_sub(self.since));
+        }
+        self.since = if on { now } else { 0 };
+        was
+    }
+
+    fn elapsed(&self, now: u64) -> u64 {
+        let active = if self.since != 0 {
+            now.saturating_sub(self.since)
+        } else {
+            0
+        };
+        self.total.saturating_add(active)
+    }
+}
+
 /// Of the thread that holds the submission lock: the microseconds it has
 /// worked so far (preparing, copying back; not its waits for the card), and
-/// since when it works now ([`now_us`] plus one; 0: it does not).
-static WORKING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// since when it works now.
+static WORKING: Mutex<WorkingClock> = Mutex::new(WorkingClock::new());
 
 /// The thread that holds the submission lock starts (`on`) or stops
 /// working; whether it worked until now.
 fn working(on: bool) -> bool {
-    let now = now_us() + 1;
-    let since = WORKING[1].swap(if on { now } else { 0 }, Ordering::Relaxed);
-    if since != 0 {
-        WORKING[0].fetch_add(now.saturating_sub(since), Ordering::Relaxed);
-    }
-    since != 0
+    let mut clock = WORKING.lock().unwrap_or_else(|e| e.into_inner());
+    clock.set(on, now_us() + 1)
 }
 
-/// [`WORKING`] as of now: microseconds worked so far.
+/// [`WORKING`] as of now: microseconds worked so far (strictly monotonic).
 fn worked() -> u64 {
-    let since = WORKING[1].load(Ordering::Relaxed);
-    let now = if since != 0 { (now_us() + 1).saturating_sub(since) } else { 0 };
-    WORKING[0].load(Ordering::Relaxed) + now
+    let clock = WORKING.lock().unwrap_or_else(|e| e.into_inner());
+    clock.elapsed(now_us() + 1)
 }
 
 /// The thread that holds the submission lock stood waiting for the card
@@ -1007,7 +1055,9 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
-    let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    static SAID: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+    let [idle, behind, stood] =
+        [0, 1, 2].map(|i| take_delta(&CARD_CLOCK_US[i], &SAID[i]) as f64 / 1000.0 / frames);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -1016,8 +1066,9 @@ fn card_clock_line(frames: f64, ms: f64) {
     );
 }
 
-/// Of the preparing: title memory copies (microseconds, bytes) and texture
-/// refreshes (microseconds, bytes hashed), since the last frame-rate line.
+/// Of the preparing: title memory copies (microseconds, bytes, reset per line)
+/// and texture refreshes (microseconds reset per line; bytes hashed in `[3]`
+/// kept monotonic so [`panel`] can diff without racing the frame-rate line).
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -4366,7 +4417,6 @@ mod card_steps;
 mod combine;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -10562,7 +10612,6 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
 
@@ -10635,7 +10684,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -10691,12 +10739,21 @@ impl Meter {
             let [cpu, gpu] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
             });
+            static PREPARING_TEX_BYTES_SAID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
                 let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-                PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+                let raw = if i == 3 {
+                    take_delta(&PREPARING[3], &PREPARING_TEX_BYTES_SAID)
+                } else {
+                    PREPARING[i].swap(0, Ordering::Relaxed)
+                };
+                raw as f64 / scale / frames
             });
+            static COPY_BACK_SAID: [std::sync::atomic::AtomicU64; 2] =
+                [const { std::sync::atomic::AtomicU64::new(0) }; 2];
             let [back_ms, back_mb] = [0, 1].map(|i| {
-                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+                take_delta(&COPY_BACK[i], &COPY_BACK_SAID[i]) as f64 / [1e3, 1e6][i] / frames
             });
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
@@ -11263,7 +11320,6 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -11312,7 +11368,6 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 // The panel is a display aid: a failure in it must not abort the run.
                 let due = p.meter.line_due();
@@ -11379,7 +11434,6 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
         }

@@ -165,8 +165,10 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
     out
 }
 
-/// The counters read for it. They grow, and go back to 0 with the frame-rate
-/// line (right behind a look of ours).
+/// The counters read for it. Every counter in this snapshot is strictly
+/// monotonic across the run (periodic log lines take deltas via
+/// [`super::take_delta`] instead of resetting them to 0), so sampling on the
+/// present thread can never race a background log flush and drop counts.
 #[derive(Clone, Copy, Default)]
 struct Counters([u64; COUNTERS]);
 
@@ -175,8 +177,11 @@ const COUNTERS: usize = 11;
 impl Counters {
     fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
-        use crate::copystat::{C, peek};
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let record_ns = crate::copystat::peek(crate::copystat::C::RecordNs);
+        #[cfg(not(feature = "diagnostics"))]
+        let record_ns = 0;
         Counters([
             super::worked(),
             get(&CARD_CLOCK_US[0]),
@@ -187,7 +192,7 @@ impl Counters {
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
-            peek(C::RecordNs),
+            record_ns,
             crate::draw::drawn(),
         ])
     }
@@ -196,8 +201,7 @@ impl Counters {
     fn since(self, before: Counters, frames: f64) -> [f64; COUNTERS] {
         let mut out = [0.0; COUNTERS];
         for (i, out) in out.iter_mut().enumerate() {
-            let (was, is) = (before.0[i], self.0[i]);
-            *out = if is >= was { is - was } else { is } as f64 / frames;
+            *out = self.0[i].saturating_sub(before.0[i]) as f64 / frames;
         }
         out
     }
@@ -427,6 +431,20 @@ fn cpu_line(total_pct: Option<f32>, peak_core_pct: Option<f32>) -> String {
     }
 }
 
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.WorkingSetSize as u64, c.PagefileUsage as u64)
+}
+
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(
@@ -437,7 +455,7 @@ fn text(
     host: &Host,
     cpu: &CpuMeter,
 ) -> Vec<String> {
-    let (working, private) = crate::copystat::process_memory();
+    let (working, private) = process_memory();
     let [local, shared] = host.sample_video_memory();
     let dedicated = gpu_dedicated_memory(host);
     let [vram_local, vram_capacity] = video_memory_lines(
@@ -446,12 +464,16 @@ fn text(
         shared.map(|s| s.CurrentUsage),
     );
     let idle = (c[1] / 1e3).min(ms);
+    #[cfg(feature = "diagnostics")]
+    let rec_line = format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3);
+    #[cfg(not(feature = "diagnostics"))]
+    let rec_line = format!("RECORDING N/A  COPY BACK {:.1} MS", c[5] / 1e3);
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
+        rec_line,
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("COMMIT {:.1} GIB  IN MEMORY {:.1}", gib(private), gib(working)),
         vram_local,
@@ -542,6 +564,7 @@ pub(super) struct Panel {
     /// What this took since the last text.
     cost: Duration,
     before: Counters,
+    was_shown: bool,
     cpu: CpuMeter,
     lines: Vec<String>,
     changed: bool,
@@ -559,6 +582,7 @@ impl Panel {
             worst: 0.0,
             cost: Duration::ZERO,
             before: Counters::default(),
+            was_shown: false,
             cpu: CpuMeter::default(),
             lines: Vec::new(),
             changed: false,
@@ -567,23 +591,32 @@ impl Panel {
         }
     }
 
-    /// A frame was presented; `line`: the counters go back to 0 right behind
-    /// this call. (Not shown it asks for the key's state and no more.)
+    /// A frame was presented; `line`: the frame-rate line is due right behind
+    /// this call (used only to keep the cadence aligned). (Not shown it asks
+    /// for the key's state and no more.)
     pub(super) fn frame(&mut self, line: bool) {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
         if !shown().load(Ordering::Relaxed) {
+            self.was_shown = false;
             self.frames = 0;
+            self.cost = Duration::ZERO;
+            self.lines.clear();
             return;
         }
         let now = Instant::now();
-        if self.frames == 0 && now - self.last > 2 * EVERY {
-            // (Shown from here on.)
-            (self.since, self.last, self.worst, self.before) = (now, now, 0.0, Counters::now());
+        if !self.was_shown || (self.frames == 0 && now - self.last > 2 * EVERY) {
+            // Re-anchor baselines when first shown, toggled back on via F3,
+            // or resuming after a long stall so prior totals and draw cost do
+            // not spike the next sample.
+            (self.since, self.last, self.worst, self.cost, self.before) =
+                (now, now, 0.0, Duration::ZERO, Counters::now());
             self.cpu.reset();
             self.cpu.sample();
             self.frames = 0;
+            self.was_shown = true;
+            return;
         } else if self.cpu.prev.is_empty() {
             self.cpu.sample();
         }
@@ -622,6 +655,7 @@ impl Panel {
         }
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
@@ -741,12 +775,100 @@ mod tests {
     }
 
     #[test]
-    fn counters_that_went_back_to_nothing_count_from_there() {
-        let (mut a, mut b) = (Counters::default(), Counters::default());
-        (a.0[0], b.0[0]) = (10, 30);
-        (a.0[1], b.0[1]) = (50, 20);
-        let c = b.since(a, 10.0);
-        assert_eq!((c[0], c[1]), (2.0, 2.0));
+    fn monotonic_counters_never_lose_deltas_across_log_flushes() {
+        use std::sync::atomic::AtomicU64;
+        // Reproduces the old reset race: panel reads 1, log flushes (takes 1),
+        // then 1 more event arrives. With monotonic totals + take_delta, the
+        // log gets 1 and the panel still observes the new +1 instead of 0.
+        let total = AtomicU64::new(0);
+        let taken = AtomicU64::new(0);
+        total.fetch_add(1, Ordering::Relaxed);
+        let mut a = Counters::default();
+        a.0[8] = total.load(Ordering::Relaxed);
+        assert_eq!(super::super::take_delta(&total, &taken), 1);
+        total.fetch_add(1, Ordering::Relaxed);
+        let mut b = Counters::default();
+        b.0[8] = total.load(Ordering::Relaxed);
+        assert_eq!(super::super::take_delta(&total, &taken), 1);
+        let c = b.since(a, 1.0);
+        assert_eq!(c[8], 1.0);
+        // Saturating subtraction guards against any out-of-order snapshot.
+        let mut backward = Counters::default();
+        (a.0[0], backward.0[0]) = (50, 20);
+        assert_eq!(backward.since(a, 10.0)[0], 0.0);
+    }
+
+    #[test]
+    fn working_clock_is_strictly_monotonic_across_transitions_and_threads() {
+        let mut clock = super::super::WorkingClock::new();
+        assert_eq!(clock.elapsed(10), 0);
+        assert!(!clock.set(true, 100));
+        assert_eq!(clock.elapsed(100), 0);
+        assert_eq!(clock.elapsed(125), 25);
+        // Re-entering `working(true)` while active folds the interval cleanly.
+        assert!(clock.set(true, 150));
+        assert_eq!(clock.elapsed(150), 50);
+        assert_eq!(clock.elapsed(180), 80);
+        // Stopping folds remaining elapsed time without any drop or double-count.
+        assert!(clock.set(false, 200));
+        assert_eq!(clock.elapsed(200), 100);
+        assert_eq!(clock.elapsed(500), 100);
+        assert!(!clock.set(false, 600));
+        assert_eq!(clock.elapsed(700), 100);
+
+        // Concurrent writer/reader stress on the real global `working()`/`worked()`.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let done = Arc::new(AtomicBool::new(false));
+        let done_r = Arc::clone(&done);
+        let reader = std::thread::spawn(move || {
+            let mut prev = super::super::worked();
+            while !done_r.load(Ordering::Relaxed) {
+                let cur = super::super::worked();
+                assert!(cur >= prev, "worked() stepped backwards: {prev} -> {cur}");
+                prev = cur;
+            }
+        });
+        for i in 0..50_000u32 {
+            super::super::working(i & 1 == 0);
+        }
+        super::super::working(false);
+        done.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn panel_reanchor_resets_cost_and_clears_stale_lines() {
+        let mut panel = Panel::new();
+        panel.was_shown = true;
+        panel.frames = 7;
+        panel.cost = Duration::from_millis(42);
+        panel.lines = vec!["STALE".to_owned()];
+
+        // Hiding resets cost, frame count, and stale lines.
+        shown().store(false, Ordering::Relaxed);
+        panel.frame(false);
+        assert!(!panel.was_shown);
+        assert_eq!(panel.frames, 0);
+        assert_eq!(panel.cost, Duration::ZERO);
+        assert!(panel.lines.is_empty());
+
+        // Showing again after accumulating prior cost re-anchors cleanly with zero cost.
+        panel.cost = Duration::from_millis(99);
+        panel.frames = 3;
+        shown().store(true, Ordering::Relaxed);
+        panel.frame(false);
+        assert!(panel.was_shown);
+        assert_eq!(panel.frames, 0);
+        assert_eq!(panel.cost, Duration::ZERO);
+
+        // Long stall when frames == 0 also re-anchors and zeroes cost.
+        panel.cost = Duration::from_millis(17);
+        panel.last = Instant::now() - 3 * EVERY;
+        panel.frame(false);
+        assert_eq!(panel.frames, 0);
+        assert_eq!(panel.cost, Duration::ZERO);
+        shown().store(false, Ordering::Relaxed);
     }
 }
 

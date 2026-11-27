@@ -5181,6 +5181,40 @@ impl<'a> Lower<'a> {
         self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
     }
 
+    /// Whether source lane `lane_src` is guest-`EXEC`-active at `inst`.
+    /// Requires every guest-active lane to remain present in this host block.
+    fn source_lane_active(
+        &mut self,
+        inst: &Inst,
+        guard: Option<V>,
+        lane_src: V,
+        mesh_quad: bool,
+        why: Why,
+    ) -> Result<V, Why> {
+        let present = lane_regions(self.x.st)
+            .is_some_and(|r| self.x.st.guest_exec_present(self.x.p, self.cur_ir, inst, &r));
+        if !present {
+            need(self.cur_ir);
+            return Err(why);
+        }
+        let c = self.cur;
+        let mut enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
+        if let Some(active) = self.partial_active {
+            enabled = self.s.m.bin(c, Bin::And, enabled, active);
+        }
+        let (lo, hi) = self.host_ballot(c, enabled);
+        let ballot_lane = if mesh_quad {
+            let host_lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let qbase = self.s.m.bin(c, Bin::And, host_lane, not3);
+            let qoff = self.s.m.bin(c, Bin::And, lane_src, three);
+            self.s.m.bin(c, Bin::Or, qbase, qoff)
+        } else {
+            lane_src
+        };
+        Ok(self.lane_bit_of(c, ballot_lane, lo, Some(hi)))
+    }
+
     /// The low and high words of the current host wave's active ballot of `on`.
     fn host_ballot(&mut self, at: usize, on: V) -> (V, V) {
         let i32t = self.s.t.i32;
@@ -5875,17 +5909,39 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
-                self.quad_pick(x, src)
-            } else if self.helpers_read(quad) {
+            let z = k(self, 0);
+            let r = if self.helpers_read(quad) {
                 let lanes = if offset & 0x8000 != 0 {
                     [0, 1, 2, 3].map(|i| (offset >> (2 * i) & 3) as u8)
                 } else {
                     [0, 1, 2, 3].map(|i| ((i & offset | offset >> 5 & 3) ^ offset >> 10 & 3) as u8 & 3)
                 };
-                self.quad_read(x, lanes)
+                let read = self.quad_read(x, lanes);
+                // Pixel helper lanes are EXEC-active on RDNA2; only an explicit
+                // guest EXEC guard disables a quad lane (swizzle yields 0).
+                if let Some(g) = guard {
+                    let g_i32 = self.s.m.cast(c, Cast::ZExt, g, self.s.t.i32);
+                    let act = self.quad_read(g_i32, lanes);
+                    let active = self.s.m.cmp(c, pred::NE, act, z);
+                    self.s.m.select(c, active, read, z)
+                } else {
+                    read
+                }
             } else {
-                self.read_lane(x, src)
+                let active = self.source_lane_active(
+                    inst,
+                    guard,
+                    src,
+                    mesh_quad,
+                    "a ds_swizzle source check where not every lane runs",
+                )?;
+                let safe_src = self.s.m.select(c, active, src, lane);
+                let read = if mesh_quad {
+                    self.quad_pick(x, safe_src)
+                } else {
+                    self.read_lane(x, safe_src)
+                };
+                self.s.m.select(c, active, read, z)
             };
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
@@ -9039,7 +9095,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -9053,7 +9109,7 @@ impl<'a> Lower<'a> {
 
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, exec_guard: Option<V>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -9073,9 +9129,10 @@ impl<'a> Lower<'a> {
         let (sixteen_mask, low) = (k(self, !15), k(self, 15));
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
-        // Source lane, and whether it lies in the row.
-        let (src, inside, masks, zero) = match dpp {
-            Dpp::Lanes { sel, .. } => {
+        // Source lane, whether it lies in the row, masks, zero-on-invalid, and
+        // fetch-inactive (`fi`).
+        let (src, inside, masks, zero, fi) = match dpp {
+            Dpp::Lanes { sel, fi } => {
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
                 let p = self.s.m.bin(c, Bin::And, lane, seven);
                 let sh = self.s.m.bin(c, Bin::Mul, p, three);
@@ -9083,14 +9140,15 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                // GFX10 DPP8 without FI substitutes 0 when the source lane is inactive.
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, true, fi)
             }
             Dpp::Row {
                 ctrl,
                 row_mask,
                 bank_mask,
                 bound_ctrl,
-                ..
+                fi,
             } => {
                 let n = u32::from(ctrl & 15);
                 let (src, inside) = match ctrl {
@@ -9138,26 +9196,80 @@ impl<'a> Lower<'a> {
                     }
                     _ => return Err("a DPP lane pattern"),
                 };
-                let masks = (row_mask != 0xF || bank_mask != 0xF).then_some((row_mask, bank_mask));
-                (src, inside, masks, bound_ctrl)
+                let all_rows = if self.x.native.wave64 { 0xF } else { 0x3 };
+                let masks =
+                    (row_mask & all_rows != all_rows || bank_mask != 0xF).then_some((row_mask, bank_mask));
+                (src, inside, masks, bound_ctrl, fi)
             }
         };
+        let safe_in = match inside {
+            Some(in_row) => self.s.m.select(c, in_row, src, lane),
+            None => src,
+        };
+        let src_active = if fi {
+            if self.s.mesh.is_some() {
+                let all_here = lane_regions(self.x.st).is_some_and(|regions| {
+                    !regions.iter().any(|(d, r)| {
+                        r[self.cur_ir]
+                            || (*d == self.cur_ir
+                                && matches!(
+                                    self.x.st.exits[*d],
+                                    LaneExit::Branch { taken, not_taken, .. }
+                                        if taken == *d || not_taken == *d
+                                ))
+                    })
+                });
+                if !all_here {
+                    // DXIL cannot fetch an exited host lane's VGPR (branch or
+                    // self-loop); guard mesh shaders while keeping PS/CS lowering.
+                    return Err("a DPP fetch-inactive from lanes outside the host branch");
+                }
+            }
+            None
+        } else if let Dpp::Row { ctrl, .. } = dpp
+            && self.helpers_read(quad)
+        {
+            // Pixel helper lanes are EXEC-active on RDNA2; only an explicit EXEC
+            // guard disables a quad lane.
+            exec_guard.map(|g| {
+                let g_i32 = self.s.m.cast(c, Cast::ZExt, g, self.s.t.i32);
+                let act = self.quad_read(g_i32, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8));
+                let z = k(self, 0);
+                self.s.m.cmp(c, pred::NE, act, z)
+            })
+        } else {
+            Some(self.source_lane_active(
+                inst,
+                exec_guard,
+                safe_in,
+                mesh_quad,
+                "a DPP source check where not every lane runs",
+            )?)
+        };
+        let valid = match (inside, src_active) {
+            (Some(a), Some(b)) => Some(self.s.m.bin(c, Bin::And, a, b)),
+            (a, b) => a.or(b),
+        };
+        let safe_src = match valid {
+            Some(v) => self.s.m.select(c, v, src, lane),
+            None => src,
+        };
         let mut r = if mesh_quad {
-            self.quad_pick(x, src)
+            self.quad_pick(x, safe_src)
         } else if let Dpp::Row { ctrl, .. } = dpp
             && self.helpers_read(quad)
         {
             self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
         } else {
-            self.read_lane(x, src)
+            self.read_lane(x, safe_src)
         };
         let mut enable = None;
-        if let Some(inside) = inside {
+        if let Some(valid) = valid {
             if zero {
                 let z = k(self, 0);
-                r = self.s.m.select(c, inside, r, z);
+                r = self.s.m.select(c, valid, r, z);
             } else {
-                enable = Some(inside);
+                enable = Some(valid);
             }
         }
         if let Some((rows, banks)) = masks {
@@ -10328,15 +10440,22 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), zeroed (pad),
+        // or sign-extended above WORD_0 (sext; a sign extension above WORD_1
+        // has no upper bits and pads low bits with zero).
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
-                (4, 2) => {}
+                (4, 2) => high = false,
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 0) | (6, 0..=2) => (high, keep) = (false, false),
+                (4, 1) => {
+                    high = false;
+                    keep = false;
+                    sext = true;
+                }
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
@@ -10347,7 +10466,10 @@ impl<'a> Lower<'a> {
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
+        let r = if sext {
+            let shifted = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, shifted, k16)
+        } else if high {
             let o = self.s.m.bin(c, Bin::And, old, low);
             let x = self.s.m.bin(c, Bin::Shl, x, k16);
             self.s.m.bin(c, Bin::Or, o, x)

@@ -1551,6 +1551,94 @@ const DROPPED: &[&str] = &[
 /// Registers read, registers written.
 type Effects = (Vec<Reg>, Vec<Reg>);
 
+/// Whether a VALU instruction writes only a 16-bit half of its destination VGPR
+/// (preserving the unselected 16-bit half per RDNA2/GFX10 ISA). Full 32-bit or
+/// 64-bit instructions whose mnemonics contain `16` (e.g. `v_cvt_f32_f16`,
+/// packed `v_pk_*` / `v_cvt_pk*` / `v_pack_b32_f16` / `v_sat_pk_u8_i16`,
+/// `v_mad_u32_u16`, `v_mad_i32_i16`, `v_dot2_*` / `v_dot2c_*` (32-bit
+/// accumulator handled separately), `v_sad_u16`, `v_qsad_pk_u16_u8`,
+/// `v_mqsad_pk_u16_u8`, `v_interp_p1ll_f16`, `v_interp_p1lv_f16`, `v_cmp*`,
+/// and `v_permlane*16_b32`) overwrite the full destination (or write SGPRs)
+/// rather than preserving an unselected half.
+fn valu_writes_half_vgpr(name: &str) -> bool {
+    if !name.contains("16") {
+        return false;
+    }
+    !(name.starts_with("v_pk_")
+        || name.starts_with("v_cmp_")
+        || name.starts_with("v_cmpx_")
+        || name.starts_with("v_dot2_")
+        || name.starts_with("v_dot2c_")
+        || name.starts_with("v_cvt_pk")
+        || name.starts_with("v_permlane")
+        || matches!(
+            name,
+            "v_cvt_f32_f16"
+                | "v_pack_b32_f16"
+                | "v_sat_pk_u8_i16"
+                | "v_mad_u32_u16"
+                | "v_mad_i32_i16"
+                | "v_sad_u16"
+                | "v_qsad_pk_u16_u8"
+                | "v_mqsad_pk_u16_u8"
+                | "v_interp_p1ll_f16"
+                | "v_interp_p1lv_f16"
+        ))
+}
+
+/// Whether an SDWA destination modifier preserves untouched bits of the old
+/// VGPR (`dst_sel`: 0..=3 byte, 4..=5 word, 6 dword, 7 reserved; `dst_unused`:
+/// 0 `UNUSED_PAD`, 1 `UNUSED_SEXT`, 2 `UNUSED_PRESERVE`, 3 reserved).
+fn sdwa_preserves_dst(sd: crate::gfx10::Sdwa, dst_dwords: u8) -> bool {
+    dst_dwords > 1 || sd.dst_sel > 6 || sd.dst_unused > 2 || (sd.dst_sel < 6 && sd.dst_unused == 2)
+}
+
+/// Whether a DPP modifier can skip writing an EXEC-enabled destination lane
+/// (preserving its old VGPR value), or uses `fi: true` whose DXIL lowering
+/// cannot soundly fetch a lane that exited a divergent host branch.
+///
+/// Per RDNA2/GFX10 ISA and LLVM AMDGPU DPP semantics:
+/// - `Dpp::Row` (DPP16): any masked-off existing row (`row_mask & 0x3 != 0x3`
+///   in wave32, `row_mask & 0xF != 0xF` in wave64) or bank (`bank_mask != 0xF`)
+///   preserves masked-off active lanes. With all active rows and banks enabled,
+///   `fi: false` + `bound_ctrl: true` substitutes `0` for invalid/out-of-bounds
+///   or inactive source lanes and writes every active lane for recognized GFX10
+///   controls (matching the host-ballot lowering in `emit/lower.rs`).
+/// - `Dpp::Lanes` (DPP8): every 3-bit selector stays within its 8-lane group;
+///   `fi: false` substitutes `0` for an inactive source lane, so active lanes
+///   always overwrite `vdst`.
+/// - Both `fi: true` forms (`Dpp::Row { fi: true, .. }` and `Dpp::Lanes { fi: true, .. }`)
+///   stay conservative (`true`), matching pre-change `operand_reads` behavior,
+///   so we never newly admit `fi: true` overwrites whose source lane may have
+///   left a divergent host branch.
+fn dpp_preserves_dst(dpp: crate::gfx10::Dpp, wave64: bool) -> bool {
+    match dpp {
+        crate::gfx10::Dpp::Row {
+            ctrl,
+            row_mask,
+            bank_mask,
+            bound_ctrl,
+            fi,
+        } => {
+            let all_rows = if wave64 { 0xF } else { 0x3 };
+            if fi || row_mask & all_rows != all_rows || bank_mask != 0xF || !bound_ctrl {
+                return true;
+            }
+            !matches!(
+                ctrl,
+                0x000..=0x0FF
+                    | 0x101..=0x10F
+                    | 0x111..=0x11F
+                    | 0x121..=0x12F
+                    | 0x140..=0x141
+                    | 0x150..=0x15F
+                    | 0x160..=0x16F
+            )
+        }
+        crate::gfx10::Dpp::Lanes { fi, .. } => fi,
+    }
+}
+
 /// The registers `inst` of `p` reads as operands: its reads without the old
 /// value of a VGPR it only writes.
 pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
@@ -1565,8 +1653,16 @@ pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
     let name = inst.name();
     let reads_dst = match &inst.fields {
         Fields::Valu(f) => {
-            f.sdwa.is_some()
-                || f.dpp.is_some()
+            let dst_dwords = match f.dst {
+                Some(Operand::Vector { dwords, .. }) => dwords.max(1),
+                _ => 1,
+            };
+            let partial_dst = match f.sdwa {
+                Some(sd) => sdwa_preserves_dst(sd, dst_dwords),
+                None => valu_writes_half_vgpr(name),
+            };
+            partial_dst
+                || f.dpp.is_some_and(|d| dpp_preserves_dst(d, p.wave64))
                 || [
                     "v_mac_",
                     "v_fmac_",
@@ -1578,7 +1674,7 @@ pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
                 ]
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
-                || name.contains("16")
+                || (matches!(name, "v_permlane16_b32" | "v_permlanex16_b32") && f.opsel & 3 == 0)
                 || matches!(name, "v_writelane_b32" | "v_movreld_b32" | "v_movrelsd_b32")
         }
         Fields::Vintrp { .. } => name.starts_with("v_interp_p2"),
@@ -2695,5 +2791,72 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn operand_reads_distinguishes_full32_and_half16_valu_destinations() {
+        let check = |words: &[u32], expected_name: &str, expect_v5_read: bool| {
+            let mut full = words.to_vec();
+            full.push(S_ENDPGM);
+            let p = build_words(&full, false);
+            let inst = &p.blocks[0].insts[0];
+            assert_eq!(inst.name(), expected_name);
+            let ops = operand_reads(&p, inst);
+            assert_eq!(
+                ops.contains(&Reg::V(5)),
+                expect_v5_read,
+                "{expected_name}: operand_reads={ops:?}"
+            );
+        };
+        // Full 32-bit destinations whose mnemonics contain "16": must NOT read old v5.
+        check(&[0x7E0A_1700], "v_cvt_f32_f16", false);
+        check(&[0x7E0A_C500], "v_sat_pk_u8_i16", false);
+        check(&[0x5E0A_0300], "v_cvt_pkrtz_f16_f32", false);
+        check(&[0xCC0F_0005, 0x0002_0300], "v_pk_add_f16", false);
+        check(&[0xD773_0005, 0x040A_0300], "v_mad_u32_u16", false);
+        // SDWA on full 32-bit VALU: only sub-dword UNUSED_PRESERVE (or reserved
+        // dst_sel/dst_unused) reads old v5; DWORD / UNUSED_PAD / UNUSED_SEXT overwrite all 32 bits.
+        check(&[0x7E0A_0CF9, 0x0005_0602], "v_cvt_f32_u32", false); // dst_sel=DWORD, dst_unused=PAD
+        check(&[0x7E0A_0CF9, 0x0005_1602], "v_cvt_f32_u32", false); // dst_sel=DWORD, dst_unused=PRESERVE
+        check(&[0x7E0A_0CF9, 0x0005_0402], "v_cvt_f32_u32", false); // dst_sel=WORD_0, dst_unused=PAD
+        check(&[0x7E0A_0CF9, 0x0005_0C02], "v_cvt_f32_u32", false); // dst_sel=WORD_0, dst_unused=SEXT
+        check(&[0x7E0A_0CF9, 0x0005_1402], "v_cvt_f32_u32", true); // dst_sel=WORD_0, dst_unused=PRESERVE
+        check(&[0x7E0A_0CF9, 0x0005_0702], "v_cvt_f32_u32", true); // reserved dst_sel=7
+        check(&[0x7E0A_0CF9, 0x0005_1C02], "v_cvt_f32_u32", true); // reserved dst_unused=3
+        // Half-width 16-bit op with SDWA: PAD/SEXT/DWORD overwrite all 32 bits; PRESERVE or reserved keeps conservative.
+        check(&[0x7E0A_14F9, 0x0006_0402], "v_cvt_f16_f32", false); // dst_sel=WORD_0, dst_unused=PAD
+        check(&[0x7E0A_14F9, 0x0006_0C02], "v_cvt_f16_f32", false); // dst_sel=WORD_0, dst_unused=SEXT
+        check(&[0x7E0A_14F9, 0x0006_0602], "v_cvt_f16_f32", false); // dst_sel=DWORD, dst_unused=PAD
+        check(&[0x7E0A_14F9, 0x0006_1402], "v_cvt_f16_f32", true); // dst_sel=WORD_0, dst_unused=PRESERVE
+        check(&[0x7E0A_14F9, 0x0006_1E02], "v_cvt_f16_f32", true); // dst_sel=DWORD, reserved dst_unused=3
+        // DPP16 & DPP8: `fi:0` with full masks and `bound_ctrl:1` on a known GFX10 ctrl
+        // (or DPP8 `fi:0`) checks source-lane activity and overwrites all active lanes;
+        // `fi:1` forms stay conservative (`true`).
+        check(&[0x7E0A_02FA, 0xFF08_B102], "v_mov_b32", false); // quad_perm:[1,0,3,2] row:0xf bank:0xf bound_ctrl:1 fi:0
+        check(&[0x7E0A_02FA, 0x3F08_B102], "v_mov_b32", false); // wave32: row:0x3 enables both existing rows
+        check(&[0x7E0A_02FA, 0xFF09_0102], "v_mov_b32", false); // row_shl:1 row:0xf bank:0xf bound_ctrl:1 fi:0
+        check(&[0x7E0A_02FA, 0xFF04_B102], "v_mov_b32", true); // quad_perm fi:1 bound_ctrl:0 stays conservative
+        check(&[0x7E0A_02FA, 0xFF0C_B102], "v_mov_b32", true); // quad_perm fi:1 bound_ctrl:1 stays conservative
+        check(&[0x7E0A_02FA, 0xFF05_0102], "v_mov_b32", true); // row_shl:1 fi:1 bound_ctrl:0 (OOB lane preserves dst)
+        check(&[0x7E0A_02FA, 0xEF08_B102], "v_mov_b32", true); // quad_perm row:0xe masks row 0
+        check(&[0x7E0A_02FA, 0xFF00_B102], "v_mov_b32", true); // quad_perm fi:0 bound_ctrl:0 (inactive src preserves dst)
+        check(&[0x7E0A_02FA, 0xFF09_4202], "v_mov_b32", true); // unknown/removed GFX10 ctrl 0x142 stays conservative
+        check(&[0x7E0A_02EA, 0x0000_0002], "v_mov_b32", true); // DPP8FI (fi:1) stays conservative
+        check(&[0x7E0A_02E9, 0x0000_0002], "v_mov_b32", false); // DPP8 (fi:0) substitutes 0 and overwrites all active lanes
+        check(&[0x7E0A_14FA, 0xFF08_B102], "v_cvt_f16_f32", true); // half-width + DPP still preserves unselected half
+        // Wave64 requires all four rows (row_mask == 0xF); row_mask == 0x3 preserves rows 2..3.
+        let p64 = build_words(&[0x7E0A_02FA, 0x3F08_B102, S_ENDPGM], true);
+        assert!(operand_reads(&p64, &p64.blocks[0].insts[0]).contains(&Reg::V(5)));
+        let p64_all = build_words(&[0x7E0A_02FA, 0xFF08_B102, S_ENDPGM], true);
+        assert!(!operand_reads(&p64_all, &p64_all.blocks[0].insts[0]).contains(&Reg::V(5)));
+        // permlane16 overwrites all active lanes when fi=1 (opsel bit 0) or bc=1 (opsel bit 1).
+        check(&[0xD777_0805, 0x0004_0100], "v_permlane16_b32", false);
+        check(&[0xD777_1005, 0x0004_0100], "v_permlane16_b32", false);
+        // permlane16 with fi=0 & bc=0 preserves old v5 on inactive source lanes.
+        check(&[0xD777_0005, 0x0004_0100], "v_permlane16_b32", true);
+        // True half-width 16-bit destinations and accumulators: MUST read old v5.
+        check(&[0x7E0A_1500], "v_cvt_f16_f32", true);
+        check(&[0x640A_0300], "v_add_f16", true);
+        check(&[0x780A_0300], "v_pk_fmac_f16", true);
     }
 }

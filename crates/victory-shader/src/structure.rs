@@ -470,6 +470,393 @@ impl Structured {
         }
         .copied()
     }
+
+    /// Whether every lane whose guest `EXEC` bit is `1` at `inst` is guaranteed
+    /// to still be participating in the host wave at block `b`.
+    ///
+    /// When true, `host_ballot(exec_guard & partial_active)` matches guest
+    /// `EXEC` exactly — no guest-active lane can have left via a per-lane host
+    /// branch such as `s_cbranch_vccz` or a divergent loop.
+    pub(crate) fn guest_exec_present(
+        &self,
+        p: &Program,
+        b: usize,
+        inst: &Inst,
+        regions: &[(usize, Vec<bool>)],
+    ) -> bool {
+        if !regions.iter().any(|(d, r)| *d == b || r[b]) {
+            return true;
+        }
+        // Inside (or downstream of an early exit from) a divergent loop,
+        // `reach` forgets loop-redefined atoms on back-edges, so a lane may
+        // have exited on an earlier iteration while retaining guest `EXEC == 1`.
+        let n = p.blocks.len();
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut index = vec![usize::MAX; n];
+        for (i, &blk) in order.iter().enumerate() {
+            index[blk] = i;
+        }
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (u, e) in self.exits.iter().enumerate() {
+            match *e {
+                LaneExit::Jump(t) => {
+                    succs[u].push(t);
+                    preds[t].push(u);
+                }
+                LaneExit::Branch { taken, not_taken, .. } => {
+                    succs[u].push(taken);
+                    succs[u].push(not_taken);
+                    preds[taken].push(u);
+                    preds[not_taken].push(u);
+                }
+                LaneExit::End | LaneExit::Indirect => {}
+            }
+        }
+        let Some(exec_lo) = inst.read(Reg::S(EXEC)) else {
+            return false;
+        };
+        let exec_hi = if p.wave64 {
+            let Some(hi) = inst.read(Reg::S(EXEC + 1)) else {
+                return false;
+            };
+            Some(hi)
+        } else {
+            None
+        };
+        let exec_key = (exec_lo, exec_hi.unwrap_or(exec_lo));
+        for (q, vs) in succs.iter().enumerate() {
+            if index[q] == usize::MAX {
+                continue;
+            }
+            for &h in vs {
+                if index[h] > index[q] {
+                    continue;
+                }
+                let mut in_loop = vec![false; n];
+                in_loop[h] = true;
+                let mut stack = Vec::new();
+                if !in_loop[q] {
+                    in_loop[q] = true;
+                    stack.push(q);
+                }
+                while let Some(u) = stack.pop() {
+                    for &pred in &preds[u] {
+                        if !in_loop[pred] {
+                            in_loop[pred] = true;
+                            stack.push(pred);
+                        }
+                    }
+                }
+                // Only loops with an internal per-lane branch can diverge
+                // across iterations.
+                if !regions.iter().any(|(d, r)| in_loop[*d] && (*d == q || r[q])) {
+                    continue;
+                }
+                if in_loop[b] {
+                    if !monotone_exec_loop(p, &in_loop, h, q, regions, exec_key) {
+                        return false;
+                    }
+                } else if regions.iter().any(|(d, r)| r[b] && in_loop[*d]) {
+                    return false;
+                }
+            }
+        }
+        let Some(exec) = self.mask_bits(exec_lo, exec_hi) else {
+            return false;
+        };
+        !self.bools.meet(&[(exec, true), (self.reach[b], false)])
+    }
+}
+
+/// Whether a divergent natural loop (`in_loop`, headed at `h`, back-edge from `q`)
+/// only exits lanes when their guest `EXEC` is `0` and never widens `EXEC` past
+/// the loop header's `EXEC` phi inside the loop body.
+///
+/// Under those invariants, any lane that exited the loop on an earlier host
+/// iteration retains guest `EXEC == 0` on every subsequent iteration, so a host
+/// ballot inside `in_loop` never drops a guest-active lane.
+fn monotone_exec_loop(
+    p: &Program,
+    in_loop: &[bool],
+    h: usize,
+    q: usize,
+    regions: &[(usize, Vec<bool>)],
+    exec_at_inst: Key,
+) -> bool {
+    let read_pair = |inst: &Inst, code: u8| -> Option<Key> {
+        let lo = inst.read(Reg::S(code))?;
+        let hi = if p.wave64 {
+            inst.read(Reg::S(code + 1))?
+        } else {
+            lo
+        };
+        Some((lo, hi))
+    };
+    let write_pair = |inst: &Inst, code: u8| -> Option<Key> {
+        let lo = inst.write(Reg::S(code))?;
+        let hi = if p.wave64 {
+            inst.write(Reg::S(code + 1))?
+        } else {
+            lo
+        };
+        Some((lo, hi))
+    };
+
+    // Every internal per-lane branch that can send lanes out of `in_loop` before
+    // `q -> h` must be `s_cbranch_execz` / `s_cbranch_execnz` staying in `in_loop`
+    // only when `EXEC == 1`. Also collect blocks inside `in_loop` reachable after
+    // any early-exit branch (`d != q`) without looping through `h`: restoring a
+    // saved header mask there would reactivate lanes that already left the loop.
+    let mut after_early_exit = vec![false; p.blocks.len()];
+    for (d, r) in regions {
+        if !in_loop[*d] || (*d != q && !r[q]) {
+            continue;
+        }
+        let Exit::Branch { taken, not_taken } = p.blocks[*d].exit else {
+            return false;
+        };
+        let Some(last) = p.blocks[*d].insts.last() else {
+            return false;
+        };
+        let staying = match last.name() {
+            "s_cbranch_execz" if !in_loop[taken] && in_loop[not_taken] => not_taken,
+            "s_cbranch_execnz" if in_loop[taken] && !in_loop[not_taken] => taken,
+            _ => return false,
+        };
+        if *d != q && staying != h && !after_early_exit[staying] {
+            after_early_exit[staying] = true;
+            let mut stack = vec![staying];
+            while let Some(u) = stack.pop() {
+                match p.blocks[u].exit {
+                    Exit::Jump(t) if in_loop[t] && t != h && !after_early_exit[t] => {
+                        after_early_exit[t] = true;
+                        stack.push(t);
+                    }
+                    Exit::Branch { taken, not_taken } => {
+                        for t in [taken, not_taken] {
+                            if in_loop[t] && t != h && !after_early_exit[t] {
+                                after_early_exit[t] = true;
+                                stack.push(t);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Header `h` must carry an `EXEC` phi; every `EXEC` write inside `in_loop`
+    // must stay within that header mask (never `s_mov exec, -1`, outer restores,
+    // or waterfall `s_andn2_wrexec` re-activating previously inactive lanes).
+    let Some(h_lo) = p.blocks[h]
+        .phis
+        .iter()
+        .find(|phi| phi.reg == Reg::S(EXEC))
+        .map(|phi| phi.value)
+    else {
+        return false;
+    };
+    let h_hi = if p.wave64 {
+        let Some(hi) = p.blocks[h]
+            .phis
+            .iter()
+            .find(|phi| phi.reg == Reg::S(EXEC + 1))
+            .map(|phi| phi.value)
+        else {
+            return false;
+        };
+        hi
+    } else {
+        h_lo
+    };
+
+    let width = if p.wave64 { "_b64" } else { "_b32" };
+    let mut narrowed: HashSet<Key> = HashSet::new();
+    narrowed.insert((h_lo, h_hi));
+
+    let op_in = |inst: &Inst, op: Option<&Operand>, set: &HashSet<Key>| -> bool {
+        match op {
+            Some(Operand::Const(0)) => true,
+            Some(Operand::Scalar { code, .. }) => {
+                read_pair(inst, *code).is_some_and(|k| set.contains(&k))
+            }
+            _ => false,
+        }
+    };
+
+    loop {
+        let before = narrowed.len();
+        for (u, blk) in p.blocks.iter().enumerate() {
+            if !in_loop[u] {
+                continue;
+            }
+            if u != h {
+                for phi in &blk.phis {
+                    let Reg::S(c) = phi.reg else { continue };
+                    if p.wave64 {
+                        let Some(hi_phi) = blk.phis.iter().find(|q| q.reg == Reg::S(c + 1)) else {
+                            continue;
+                        };
+                        if phi.args.len() == hi_phi.args.len()
+                            && phi
+                                .args
+                                .iter()
+                                .zip(&hi_phi.args)
+                                .all(|(&a, &b)| narrowed.contains(&(a, b)))
+                        {
+                            narrowed.insert((phi.value, hi_phi.value));
+                        }
+                    } else if phi.args.iter().all(|&a| narrowed.contains(&(a, a))) {
+                        narrowed.insert((phi.value, phi.value));
+                    }
+                }
+            }
+            for inst in &blk.insts {
+                let name = inst.name();
+                let exec_ok = read_pair(inst, EXEC).is_some_and(|k| narrowed.contains(&k));
+                match &inst.fields {
+                    Fields::Valu(v) if name.starts_with("v_cmpx_") => {
+                        if exec_ok
+                            && let Some(eo) = write_pair(inst, EXEC)
+                        {
+                            narrowed.insert(eo);
+                        }
+                    }
+                    Fields::Valu(v) if name.starts_with("v_cmp_") => {
+                        if exec_ok
+                            && let Some(Operand::Scalar { code, .. }) = v.dst
+                            && let Some(d) = write_pair(inst, code)
+                        {
+                            narrowed.insert(d);
+                        }
+                    }
+                    Fields::Sop { dst, src, .. } => {
+                        let Some(op) = name.strip_suffix(width) else {
+                            continue;
+                        };
+                        let dst_k = match dst {
+                            Some(Operand::Scalar { code, .. }) => write_pair(inst, *code),
+                            _ => None,
+                        };
+                        let exec_k = write_pair(inst, EXEC);
+                        match op {
+                            "s_and" => {
+                                if (op_in(inst, src.first(), &narrowed)
+                                    || op_in(inst, src.get(1), &narrowed))
+                                    && let Some(d) = dst_k
+                                {
+                                    narrowed.insert(d);
+                                }
+                            }
+                            "s_andn2" => {
+                                if op_in(inst, src.first(), &narrowed)
+                                    && let Some(d) = dst_k
+                                {
+                                    narrowed.insert(d);
+                                }
+                            }
+                            "s_or" | "s_xor" => {
+                                if op_in(inst, src.first(), &narrowed)
+                                    && op_in(inst, src.get(1), &narrowed)
+                                    && let Some(d) = dst_k
+                                {
+                                    narrowed.insert(d);
+                                }
+                            }
+                            "s_mov" => {
+                                if op_in(inst, src.first(), &narrowed)
+                                    && let Some(d) = dst_k
+                                {
+                                    narrowed.insert(d);
+                                }
+                            }
+                            "s_and_saveexec" | "s_and_wrexec" => {
+                                if exec_ok {
+                                    if let Some(d) = dst_k {
+                                        narrowed.insert(d);
+                                    }
+                                    if let Some(e) = exec_k {
+                                        narrowed.insert(e);
+                                    }
+                                }
+                            }
+                            "s_andn2_saveexec" => {
+                                if exec_ok
+                                    && let Some(d) = dst_k
+                                {
+                                    narrowed.insert(d);
+                                }
+                                if op_in(inst, src.first(), &narrowed)
+                                    && let Some(e) = exec_k
+                                {
+                                    narrowed.insert(e);
+                                }
+                            }
+                            "s_andn2_wrexec" => {
+                                if op_in(inst, src.first(), &narrowed) {
+                                    if let Some(d) = dst_k {
+                                        narrowed.insert(d);
+                                    }
+                                    if let Some(e) = exec_k {
+                                        narrowed.insert(e);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if narrowed.len() == before {
+            break;
+        }
+    }
+
+    // Verify every write to EXEC (lo or hi) anywhere in `in_loop`, plus the
+    // EXEC value read at `inst`, stayed within `narrowed`, and no block after an
+    // early-exit branch widens/restores EXEC from a pre-exit saved mask.
+    for (u, blk) in p.blocks.iter().enumerate() {
+        if !in_loop[u] {
+            continue;
+        }
+        for inst in &blk.insts {
+            let writes_exec = inst.write(Reg::S(EXEC)).is_some()
+                || (p.wave64 && inst.write(Reg::S(EXEC + 1)).is_some());
+            if !writes_exec {
+                continue;
+            }
+            if !write_pair(inst, EXEC).is_some_and(|k| narrowed.contains(&k)) {
+                return false;
+            }
+            if after_early_exit[u] {
+                let name = inst.name();
+                let strictly_narrows = name.starts_with("v_cmpx_")
+                    || name.strip_suffix(width).is_some_and(|op| {
+                        matches!(
+                            op,
+                            "s_and" | "s_andn2" | "s_and_saveexec" | "s_and_wrexec"
+                        )
+                    }) && match &inst.fields {
+                        Fields::Sop { src, .. } if name.starts_with("s_andn2") => {
+                            matches!(src.first(), Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                        }
+                        Fields::Sop { src, .. } if name.starts_with("s_and_") && !name.contains("exec") => {
+                            src.iter()
+                                .any(|op| matches!(op, Operand::Scalar { code, .. } if *code == EXEC))
+                        }
+                        _ => true,
+                    };
+                if !strictly_narrows {
+                    return false;
+                }
+            }
+        }
+    }
+    narrowed.contains(&exec_at_inst)
 }
 
 /// Builds the per-lane form of `program`.

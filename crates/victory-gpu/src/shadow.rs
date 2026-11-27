@@ -421,9 +421,10 @@ pub(crate) fn card_room_kept() -> u64 {
 /// the bytes copied (GPL-3.0 provenance: Peppacodes/playablegames-peppa #6).
 static CARDED: Mutex<Vec<(usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(Vec::new());
 
-/// Since the last frame line: bytes copied to card sides and the ranges
-/// they were; pieces compared on the card, pieces fetched and their
-/// bytes; the waits for the card the fetches added and their microseconds.
+/// Bytes copied to card sides (`[0]`, kept monotonic so [`crate::host::panel`]
+/// can diff without racing resets) and, since the last frame line, the ranges
+/// they were; pieces compared on the card, pieces fetched and their bytes;
+/// the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Bytes of buffer copies in the card's memory and in windows (for the
@@ -437,8 +438,10 @@ pub(crate) fn live_span_bytes() -> u64 {
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {
+    static UPLOAD_BYTES_SAID: AtomicU64 = AtomicU64::new(0);
     let mut out = [0u64; 10];
-    for (i, stat) in CARD_STATS.iter().enumerate() {
+    out[0] = crate::host::take_delta(&CARD_STATS[0], &UPLOAD_BYTES_SAID);
+    for (i, stat) in CARD_STATS.iter().enumerate().skip(1) {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, _, w)| w.strong_count() > 0).count() as u64;

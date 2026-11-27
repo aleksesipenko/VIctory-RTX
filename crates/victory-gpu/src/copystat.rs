@@ -163,15 +163,29 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
 }
 
-/// The counter, all sets together, as it is now (it goes back to 0 with
-/// [`log`]).
+/// The counter, all sets together, as it is now (`C::RecordNs` is kept
+/// monotonic across [`log`] calls so [`crate::host::panel`] can diff it
+/// without racing resets; the other counters go back to 0 with [`log`]).
 pub(crate) fn peek(c: C) -> u64 {
     let i = c as usize;
     COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
 }
 
-/// Counter `i`, all sets together, from now on 0.
+/// Counter `i`, all sets together, since the previous call (`C::RecordNs` stays
+/// monotonic in `COUNT`; all other counters reset to 0).
 fn taken(i: usize) -> u64 {
+    if i == C::RecordNs as usize {
+        static RECORD_NS_TAKEN: AtomicU64 = AtomicU64::new(0);
+        let mut prev = RECORD_NS_TAKEN.load(Relaxed);
+        loop {
+            let now = peek(C::RecordNs);
+            let next = now.max(prev);
+            match RECORD_NS_TAKEN.compare_exchange_weak(prev, next, Relaxed, Relaxed) {
+                Ok(_) => return next - prev,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
     COUNT.iter().map(|b| b.0[i].swap(0, Relaxed)).sum()
 }
 

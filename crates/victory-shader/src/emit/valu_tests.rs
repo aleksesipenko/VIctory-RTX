@@ -2287,3 +2287,695 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         }
     }
 }
+
+/// 16-bit VALU SDWA destination modes on both hardware and WARP:
+/// `WORD_0 + UNUSED_SEXT` sign-extends bit 15 into bits 31..16 (so `-1.0f16`
+/// `0xBC00` becomes `0xFFFF_BC00`), `WORD_0 + UNUSED_PAD` and `DWORD` clear
+/// the upper half, `WORD_1 + UNUSED_SEXT` places into the high half with zero
+/// low half, and `WORD_0 + UNUSED_PRESERVE` keeps the old upper half.
+#[test]
+fn half_sdwa_dst_unused_sext_pad_dword_and_preserve() {
+    let sdwa_cvt = |dst_sel: u32, dst_unused: u32| -> HostShader {
+        // v0 = v2 (sentinel old value), then v_cvt_f16_f32_sdwa v0, v1.
+        let body = [
+            vop1(0x001, 0, vgpr(2)),
+            0x7E00_14F9,
+            (6 << 16) | (dst_unused << 11) | (dst_sel << 8) | 1,
+        ];
+        build_valu_cs(&body)
+    };
+    let sentinel = 0xCAFE_BEEFu32;
+    let neg_one = (-1.0f32).to_bits();
+    let pos_one = 1.0f32.to_bits();
+    let neg_zero = (-0.0f32).to_bits();
+    let modes: [(&str, u32, u32, &[(u32, u32)]); 5] = [
+        (
+            "WORD_0 UNUSED_SEXT",
+            4,
+            1,
+            &[
+                (neg_one, 0xFFFF_BC00),
+                (pos_one, 0x0000_3C00),
+                (neg_zero, 0xFFFF_8000),
+            ],
+        ),
+        (
+            "WORD_0 UNUSED_PAD",
+            4,
+            0,
+            &[(neg_one, 0x0000_BC00), (pos_one, 0x0000_3C00)],
+        ),
+        (
+            "DWORD UNUSED_PAD",
+            6,
+            0,
+            &[(neg_one, 0x0000_BC00), (pos_one, 0x0000_3C00)],
+        ),
+        (
+            "WORD_1 UNUSED_SEXT",
+            5,
+            1,
+            &[(neg_one, 0xBC00_0000), (pos_one, 0x3C00_0000)],
+        ),
+        (
+            "WORD_0 UNUSED_PRESERVE",
+            4,
+            2,
+            &[(neg_one, 0xCAFE_BC00), (pos_one, 0xCAFE_3C00)],
+        ),
+    ];
+    for (label, sel, unused, expected) in modes {
+        let shader = sdwa_cvt(sel, unused);
+        let cases: Vec<[u32; 4]> = expected.iter().map(|&(x, _)| [x, sentinel, 0, 0]).collect();
+        let mut idx = 0usize;
+        run_cases_on(&shader, &cases, &[("hardware", false), ("WARP", true)], |backend, _, _, got| {
+            let want = expected[idx % expected.len()].1;
+            idx += 1;
+            assert_eq!(got, want, "{label} on {backend}: got {got:#010X}, want {want:#010X}");
+        });
+    }
+}
+
+/// DPP16 (`fi:0`) and DPP8 (`fi:0`) must check the source lane's active EXEC
+/// bit: when lane 0 is active and lane 1 is disabled by EXEC, `quad_perm:[1,0,3,2]`
+/// with `bound_ctrl:1` and `dpp8:[1,0,3,2,5,4,7,6]` (`0xE9`) must substitute `0`,
+/// whereas `bound_ctrl:0` must preserve the destination VGPR's old value.
+#[test]
+fn dpp_fi0_checks_source_lane_exec_on_hardware() {
+    let build_dpp = |dpp_words: [u32; 2]| -> HostShader {
+        // 32 threads (1 wave): v0 starts as lane id; load v5 = sentinel (v2),
+        // v6 = payload (v1), narrow EXEC to lane 0 only (v0 == 0), run DPP into v5,
+        // and store lane 0's v5 via build_cs's trailing buffer_store_dword(v0).
+        let mut body = vec![
+            vop1(0x001, 5, vgpr(2)), // v_mov_b32 v5, v2 (old dst sentinel)
+            vop1(0x001, 6, vgpr(1)), // v_mov_b32 v6, v1 (source payload)
+            // v_cmp_eq_u32 vcc_lo, 0, v0 (VOPC op 0xC2, src0 = 0 (0x80), vsrc1 = v0)
+            0x7D84_0080,
+            // s_and_saveexec_b32 s6, vcc_lo (SOP1 op 0x3C, sdst = s6, src0 = 0x6A)
+            0xBE86_3C6A,
+        ];
+        body.extend_from_slice(&dpp_words);
+        body.push(vop1(0x001, 0, vgpr(5))); // v_mov_b32 v0, v5 (under lane-0 EXEC)
+        build_cs(&body, 32, 0)
+    };
+    let payload = 0x1234_5678u32;
+    let sentinel = 0xCAFE_BEEFu32;
+    let cases = [[payload, sentinel, 0, 0]];
+    // src0 = v6 (0x06), vdst = v5 (w0 = 0x7E0A_02FA / 0x7E0A_02E9),
+    // and `ds_swizzle_b32 v5, v6 offset:0x80B1` (`quad_perm:[1,0,3,2]`).
+    let modes: [(&str, [u32; 2], u32); 6] = [
+        (
+            "DPP16 quad_perm:[1,0,3,2] fi:0 bound_ctrl:1",
+            [0x7E0A_02FA, 0xFF08_B106],
+            0,
+        ),
+        (
+            "DPP16 quad_perm:[1,0,3,2] fi:0 bound_ctrl:0",
+            [0x7E0A_02FA, 0xFF00_B106],
+            sentinel,
+        ),
+        (
+            "DPP8 [1,0,3,2,5,4,7,6] fi:0",
+            [0x7E0A_02E9, 0xDE54_C106],
+            0,
+        ),
+        (
+            "ds_swizzle_b32 quad_perm:[1,0,3,2]",
+            [0xD8D4_80B1, 0x0500_0006],
+            0,
+        ),
+        (
+            "DPP8FI [1,0,3,2,5,4,7,6] fi:1",
+            [0x7E0A_02EA, 0xDE54_C106],
+            payload,
+        ),
+        (
+            "DPP16 quad_perm:[1,0,3,2] fi:1 bound_ctrl:0",
+            [0x7E0A_02FA, 0xFF04_B106],
+            payload,
+        ),
+    ];
+    // Cross-lane code declares WaveSize(32), which WARP's pipeline creation
+    // refuses: execute on hardware.
+    for (label, words, want) in modes {
+        let shader = build_dpp(words);
+        run_cases_on(&shader, &cases, &[("hardware", false)], |backend, _, _, got| {
+            assert_eq!(got, want, "{label} on {backend}: got {got:#010X}, want {want:#010X}");
+        });
+    }
+}
+
+/// In mesh shaders (whose admission `io::raise` widens), DPP with `fi:1` must
+/// be rejected inside a divergent host lane branch (`s_cbranch_execz`), while
+/// `fi:0` forms remain allowed and check source-lane activity via host ballot
+/// even when the source lane exited a divergent host branch.
+#[test]
+fn dpp_fetch_inactive_outside_the_host_branch_is_rejected() {
+    let try_lower_mesh = |dpp_words: [u32; 2]| -> Result<(), crate::ShaderError> {
+        let mut words = vec![
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0 (lane 0 only)
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBF88_0002, // s_cbranch_execz +2 (divergent host lane branch)
+        ];
+        words.extend_from_slice(&dpp_words);
+        words.extend_from_slice(&[
+            0x887E_067E, // s_or_b32 exec_lo, exec_lo, s6 (restore EXEC)
+            0x7E08_0304, // v_mov_b32 v4, v4
+            0x7E12_0280, // v_mov_b32 v9, 0
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v6, v7, v7 done
+            0x0707_0604,
+            S_ENDPGM,
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: vec![super::container::SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    };
+
+    // vdst = v4 (0x08), src0 = v6 (0x06), quad_perm:[1,0,3,2] (0xB1).
+    for (label, words) in [
+        ("mesh DPP16 fi:1 bound_ctrl:0", [0x7E08_02FA, 0xFF04_B106]),
+        ("mesh DPP16 fi:1 bound_ctrl:1", [0x7E08_02FA, 0xFF0C_B106]),
+    ] {
+        let err = try_lower_mesh(words).err();
+        assert!(
+            matches!(
+                err,
+                Some(crate::ShaderError::Unsupported {
+                    what: "a DPP fetch-inactive from lanes outside the host branch",
+                    ..
+                })
+            ),
+            "{label}: expected unsupported error, got {err:?}"
+        );
+    }
+    try_lower_mesh([0x7E08_02FA, 0xFF08_B106])
+        .unwrap_or_else(|e| panic!("mesh DPP16 fi:0 bound_ctrl:1 should lower: {e}"));
+
+    // Divergent host branch (`s_cbranch_execz`) hardware check for `fi:0` forms:
+    // lane 0 enters the branch while lane 1 exits it; host_ballot sees lane 1
+    // inactive, so bound_ctrl:1 / DPP8 substitute 0 and bound_ctrl:0 keeps sentinel.
+    let build_divergent_cs = |dpp_words: [u32; 2]| -> HostShader {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(5, 0x80));
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        for i in 0..4u8 {
+            words.push(vop1(0x001, i + 1, sgpr(i)));
+        }
+        words.push(vop1(0x001, 5, vgpr(2))); // v5 = sentinel
+        words.push(vop1(0x001, 6, vgpr(1))); // v6 = payload
+        words.push(0x7D84_0080); // v_cmp_eq_u32 vcc_lo, 0, v0 (lane 0 only)
+        words.push(0xBE86_3C6A); // s_and_saveexec_b32 s6, vcc_lo
+        words.push(0xBF88_0002); // s_cbranch_execz +2 (divergent host lane branch)
+        words.extend_from_slice(&dpp_words);
+        words.push(0x887E_067E); // s_or_b32 exec_lo, exec_lo, s6 (restore EXEC)
+        words.push(vop1(0x001, 0, vgpr(5)));
+        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        }
+    };
+
+    let sentinel = 0xCAFE_BEEFu32;
+    for (label, words, want) in [
+        ("DPP16 fi:0 bound_ctrl:1", [0x7E0A_02FA, 0xFF08_B106], 0),
+        ("DPP16 fi:0 bound_ctrl:0", [0x7E0A_02FA, 0xFF00_B106], sentinel),
+        ("DPP8 fi:0", [0x7E0A_02E9, 0xDE54_C106], 0),
+        ("ds_swizzle_b32 quad_perm", [0xD8D4_80B1, 0x0500_0006], 0),
+    ] {
+        let shader = build_divergent_cs(words);
+        run_cases_on(
+            &shader,
+            &[[0x1234_5678, sentinel, 0, 0]],
+            &[("hardware", false)],
+            |backend, _, _, got| {
+                assert_eq!(got, want, "{label} on {backend}: got {got:#010X}, want {want:#010X}");
+            },
+        );
+    }
+}
+
+/// In a partial wave64 compute dispatch (`USER_DISPATCH_THREADS_X`), host lanes
+/// beyond the guest thread count stay running for barrier/exchange sync with
+/// `partial_active == false`. DPP `fi:0` (`DPP16 bound_ctrl:1` and `DPP8`) must
+/// exclude those lanes from its source-activity ballot and substitute `0`.
+#[test]
+fn dpp_fi0_excludes_partial_dispatch_lanes_on_hardware() {
+    let payload = 0x1234_5678u32;
+    let mut words = vec![
+        // Read descriptor-table offset (user_data 16) from spilled table s[0:1] + 0.
+        0x8703_FF01,
+        0x0000_00FF, // s_and_b32 s3, s1, 0xff
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0x3D << 26 | 4 << 6 | 1,
+        125 << 25, // s_load_dword s4, s[2:3], 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+        125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x7E0E_0281, // v_mov_b32 v7, 1 (feed cross-half wave OR to force partial_active)
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E0A_02FF,
+        payload,     // v_mov_b32 v5, 0x12345678 (set in every running host lane)
+        0x7E08_02FA,
+        0xFF08_B105, // v_mov_b32_dpp v4, v5 quad_perm:[1,0,3,2] bound_ctrl:1 fi:0
+        0x7E06_02E9,
+        0xDE54_C105, // v_mov_b32_dpp v3, v5 dpp8:[1,0,3,2,5,4,7,6] fi:0
+        0xD8D4_80B1,
+        0x0200_0005, // ds_swizzle_b32 v2, v5 offset:0x80B1 (quad_perm:[1,0,3,2])
+        0x7E0A_0207, // v_mov_b32 v5, s7 (keep wave OR live)
+        0x3402_0084, // v_lshlrev_b32 v1, 4, v0 (lane * 16 bytes)
+        0x38 << 26 | 0x1E << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 1, // buffer_store_dwordx4 v[2:5], v1, s[8:11], 0 offen
+        S_ENDPGM,
+    ]);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 16,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 16,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = crate::spill::build(&native).expect("spill::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.unwrap_or_else(|e| panic!("lower: {e}"));
+    assert_eq!(lowered.wave_size, Some(32));
+    let limit = *lowered
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .expect("USER_DISPATCH_THREADS_X");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .unwrap_or_else(|e| panic!("DXIL validation: {e}"));
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).expect("32-lane pipeline");
+    for (count, want_lane0) in [(1u32, 0u32), (2, payload), (0, payload)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        ud[limit.index as usize] = count;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch (count {count}): {e}"));
+        // out[0][0] = v2 (ds_swizzle_b32), out[0][1] = v3 (DPP8 fi:0),
+        // out[0][2] = v4 (DPP16 fi:0 bc:1), out[0][3] = s7 (wave OR == 1).
+        assert_eq!(out[0][0], want_lane0, "count={count} ds_swizzle_b32");
+        assert_eq!(out[0][1], want_lane0, "count={count} DPP8 fi:0");
+        assert_eq!(out[0][2], want_lane0, "count={count} DPP16 fi:0 bound_ctrl:1");
+        assert_eq!(out[0][3], 1, "count={count} wave OR");
+    }
+}
+
+/// When `structure` turns a wave-wide `s_cbranch_vccz` into a per-lane host
+/// branch without narrowing guest `EXEC`, host-absent lanes are still guest
+/// `EXEC`-active. `ds_swizzle_b32` and DPP `fi:0` must reject lowering there
+/// instead of letting `host_ballot` misclassify those lanes as guest-inactive.
+#[test]
+fn cross_lane_source_ballot_rejects_vccz_per_lane_host_branch() {
+    let try_lower_mesh = |op_words: [u32; 2]| -> Result<(), crate::ShaderError> {
+        let mut words = vec![
+            0xD765_0000, // v_mbcnt_lo_u32_b32 v0, -1, 0
+            0x0001_00C1,
+            0x7E0C_02FF,
+            0x0000_3C00, // v_mov_b32 v6, 0x3c00
+            0x7E0A_1706, // v_cvt_f32_f16 v5, v6 (1.0 in every active lane; EXEC unchanged)
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0 (only lane 0 sets VCC)
+            0xBF86_0002, // s_cbranch_vccz +2 (per-lane host branch; guest EXEC still all!)
+        ];
+        words.extend_from_slice(&op_words);
+        words.extend_from_slice(&[
+            0x7E12_0280, // v_mov_b32 v9, 0
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v1, v5, v6, v6 done
+            0x0606_0501,
+            S_ENDPGM,
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: vec![super::container::SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    };
+
+    // vdst = v1, src = v5, quad_perm:[1,0,3,2].
+    for (label, words, want_what) in [
+        (
+            "ds_swizzle_b32 under s_cbranch_vccz",
+            [0xD8D4_80B1, 0x0100_0005],
+            "a ds_swizzle source check where not every lane runs",
+        ),
+        (
+            "DPP16 fi:0 bound_ctrl:1 under s_cbranch_vccz",
+            [0x7E02_02FA, 0xFF08_B105],
+            "a DPP source check where not every lane runs",
+        ),
+    ] {
+        let err = try_lower_mesh(words).err();
+        assert!(
+            matches!(
+                err,
+                Some(crate::ShaderError::Unsupported { what, .. }) if what == want_what
+            ),
+            "{label}: expected Unsupported({want_what:?}), got {err:?}"
+        );
+    }
+
+    // A divergent loop controlled by `s_cbranch_vccnz` (leaving guest `EXEC` active
+    // in exited lanes) must also be rejected for `ds_swizzle_b32`, whereas a
+    // monotone `s_cbranch_execnz` loop where `EXEC` only narrows lowers cleanly.
+    let try_loop_mesh = |words: &[u32]| -> Result<(), crate::ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: vec![super::container::SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    };
+
+    let vcc_loop = [
+        0xD765_0000, // v_mbcnt_lo_u32_b32 v0, -1, 0
+        0x0001_00C1,
+        0x7E0C_02F2, // v_mov_b32 v6, 1.0
+        0x7E0A_0306, // v_mov_b32 v5, v6
+        // loop:
+        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        0xD8D4_80B1,
+        0x0100_0005, // ds_swizzle_b32 v1, v5 offset:0x80B1
+        0xBF87_FFFC, // s_cbranch_vccnz -4 -> back to v_cmp_eq_u32
+        0x7E12_0280,
+        0xF800_0941,
+        0x0000_0009,
+        0xF800_08CF,
+        0x0606_0501,
+        S_ENDPGM,
+    ];
+    assert!(
+        matches!(
+            try_loop_mesh(&vcc_loop),
+            Err(crate::ShaderError::Unsupported {
+                what: "a ds_swizzle source check where not every lane runs",
+                ..
+            })
+        ),
+        "vccnz loop must be rejected"
+    );
+
+    let widening_exec_loop = [
+        0xD765_0000,
+        0x0001_00C1,
+        0x7E0C_02F2,
+        0x7E0A_0306,
+        0xBE88_037E, // s_mov_b32 s8, exec_lo (saved outside loop)
+        // loop:
+        0xBEFE_0308, // s_mov_b32 exec_lo, s8 (widens EXEC back to exited lanes!)
+        0xD8D4_80B1,
+        0x0100_0005, // ds_swizzle_b32 v1, v5 offset:0x80B1
+        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+        0xBF89_FFFA, // s_cbranch_execnz -6 -> back to s_mov_b32 exec_lo, s8
+        0x7E12_0280,
+        0xF800_0941,
+        0x0000_0009,
+        0xF800_08CF,
+        0x0606_0501,
+        S_ENDPGM,
+    ];
+    assert!(
+        matches!(
+            try_loop_mesh(&widening_exec_loop),
+            Err(crate::ShaderError::Unsupported {
+                what: "a ds_swizzle source check where not every lane runs",
+                ..
+            })
+        ),
+        "exec-widening loop must be rejected"
+    );
+
+    let monotone_exec_loop = [
+        0xD765_0000,
+        0x0001_00C1,
+        0x7E0C_02F2,
+        0x7E0A_0306,
+        0xBE88_037E, // s_mov_b32 s8, exec_lo
+        // loop:
+        0xD8D4_80B1,
+        0x0100_0005, // ds_swizzle_b32 v1, v5 offset:0x80B1
+        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo (monotone narrowing)
+        0xBF89_FFFB, // s_cbranch_execnz -5 -> back to ds_swizzle_b32
+        0xBEFE_0308, // restore exec_lo after loop
+        0x7E12_0280,
+        0xF800_0941,
+        0x0000_0009,
+        0xF800_08CF,
+        0x0606_0501,
+        S_ENDPGM,
+    ];
+    try_loop_mesh(&monotone_exec_loop)
+        .unwrap_or_else(|e| panic!("monotone execnz loop should lower cleanly: {e}"));
+}

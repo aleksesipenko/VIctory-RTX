@@ -574,8 +574,8 @@ pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// The draws dropped since [`take_dropped`].
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+/// Total draws, mesh dispatches and dispatches dropped (no host pipeline)
+/// since the start of the run.
 pub(crate) fn dropped_now() -> u64 {
     DROPPED.load(Ordering::Relaxed)
 }
@@ -583,7 +583,8 @@ pub(crate) fn dropped_now() -> u64 {
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    crate::host::take_delta(&DROPPED, &TAKEN)
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
