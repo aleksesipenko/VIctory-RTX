@@ -577,6 +577,28 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    if rt_selected(c)
+        && let crate::native::StageIo::Cs(cs) = native.io
+        && let Some(q) = rayquery_lift::entry::peel(p, st, res, cs.threads.iter().product())
+    {
+        let again = (|| {
+            let st = structure::structure(&q)?;
+            let io = io::raise(&q, native)?;
+            let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
+            emit_any(c, native, &q, &st, &io, &res)
+        })();
+        if let Ok(shader) = again
+            && Container::parse(&shader.dxil).is_ok_and(|c| {
+                c.part(FourCC::SFI0).is_some_and(|part| {
+                    part.data
+                        .get(..8)
+                        .is_some_and(|v| u64::from_le_bytes(v.try_into().unwrap()) & 0x10_0000 != 0)
+                })
+            })
+        {
+            return Ok(shader);
+        }
+    }
     let r = emit_any(c, native, p, st, io, res);
     if r.is_ok() && !permutes_outside_sections(p) {
         return r;

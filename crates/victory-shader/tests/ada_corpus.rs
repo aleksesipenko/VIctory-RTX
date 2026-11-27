@@ -96,8 +96,9 @@ fn ada_trace_corpus() {
             lifted += usize::from(rt);
             paired += usize::from(pair);
             eprintln!(
-                "{id} wave64={} threads={guest}/{threads} paired={pair} lifted={rt} shader={hash}",
-                native.wave64
+                "{id} wave64={} threads={guest}/{threads} paired={pair} lifted={rt} shader={hash} dxil={}",
+                native.wave64,
+                blake3::hash(&shader.dxil)
             );
             // The validator signs in place. Give the driver the original bytes
             // that a normal translation would dispatch.

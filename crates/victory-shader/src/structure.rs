@@ -142,6 +142,23 @@ impl Bools {
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
 
+    /// A mask branch can be uniform among the lanes reaching it even when
+    /// its BDD also contains EXEC. Check both valuations of the same SCC.
+    pub(crate) fn uniform_on(&self, value: Bool, reach: Bool) -> bool {
+        let support = self.support(value);
+        if support.iter().all(|a| matches!(a, Atom::Uniform(_))) {
+            return true;
+        }
+        support.into_iter().filter(|a| matches!(a, Atom::Uniform(_))).any(|a| {
+            let v = self.ids[&a];
+            let Some(&scc) = self.unique.get(&(v, Bool::FALSE, Bool::TRUE)) else { return false };
+            [true, false].into_iter().any(|sign| {
+                !self.meet(&[(reach, true), (value, true), (scc, !sign)])
+                    && !self.meet(&[(reach, true), (value, false), (scc, sign)])
+            })
+        })
+    }
+
     fn vars(&self, b: Bool) -> Vec<u32> {
         let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {

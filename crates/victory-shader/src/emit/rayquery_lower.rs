@@ -16,6 +16,10 @@ pub(super) struct LiftPlan {
     pub(super) skip_insts: HashSet<Site>,
     pub(super) anyhit_tails: HashMap<usize, usize>,
     pub(super) dead_lds: bool,
+    guest_metadata_fallback: bool,
+    pub(super) dead_exit_masks: HashSet<(usize, Value)>,
+    inactive: HashMap<Value, Value>,
+    timeouts: HashMap<Site, usize>,
     pub(super) counted_pair: bool,
 }
 
@@ -28,47 +32,114 @@ impl LiftPlan {
     }
 
     pub(super) fn recognize(x: &Parts, counted: bool) -> Self {
+        if x.res.bvh.is_empty() {
+            return Self::software(PAIRED.get() && counted);
+        }
         let scalar = x.res.scalar.iter().copied().collect();
         let loops = lift::find_ray_loops(x.p, x.st, x.res, &scalar);
-        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
-            let mut kinds = [0; 3];
-            for rl in &loops {
-                kinds[match rl.kind {
-                    RayLoopKind::OpaqueOnly => 0,
-                    RayLoopKind::FrontBackTrack { .. } => 1,
-                    RayLoopKind::AnyHit(_) => 2,
-                }] += 1;
-            }
-            eprintln!(
-                "RayQuery matched opaque/front-back/AnyHit={kinds:?} paired={}",
-                PAIRED.get()
-            );
+        let all = Self::admit(x, loops, counted);
+        if !all.entries.is_empty() {
+            return all;
         }
-        Self::admit(x, loops, counted)
+        let mut plan = all;
+        lift::isolated_ray_loops(x.p, x.st, x.res, &scalar, |region| {
+            let candidate = Self::admit_impl(x, region, counted, true);
+            if candidate.entries.is_empty() {
+                return false;
+            }
+            plan = candidate;
+            true
+        });
+        plan
     }
 
     fn admit(x: &Parts, loops: Vec<RayLoop>, counted: bool) -> Self {
+        Self::admit_impl(x, loops, counted, false)
+    }
+    fn admit_impl(x: &Parts, loops: Vec<RayLoop>, counted: bool, isolated: bool) -> Self {
         // #854. A retained guest AnyHit CFG cannot be entered independently by
         // both virtual lanes. A wave-wide outer branch can also bring an inactive
         // lane to a trace. Keep the complete paired software program in these
         // cases, before substituting metadata, LDS writes or loop tails.
-        let widened_outer = x.st.wide.iter().any(|b| {
+        let mut fast_edges = Vec::new();
+        for r in &loops {
+            let Some((guard, pre)) = r.shared_entry else {
+                continue;
+            };
+            let Some(edges) = guard.fast_edges(x.p, pre, r.entry_block) else {
+                return Self::software(PAIRED.get() && counted);
+            };
+            for (b, next) in edges {
+                let uniform = match x.st.exits[b] {
+                    LaneExit::Jump(s) => s == next,
+                    LaneExit::Branch { when, .. } => {
+                        x.st.bools
+                            .support(when)
+                            .iter()
+                            .all(|atom| matches!(atom, crate::structure::Atom::Uniform(_)))
+                    }
+                    _ => false,
+                };
+                if !uniform {
+                    return Self::software(PAIRED.get() && counted);
+                }
+                fast_edges.push((b, next));
+            }
+        }
+        let paired = PAIRED.get();
+        let widened = x.st.wide.iter().any(|b| {
             !loops
                 .iter()
-                .any(|rl| rl.entry_block == *b || rl.skipped_blocks.contains(b))
+                .any(|r| r.entry_block == *b || r.skipped_blocks.contains(b))
         });
-        let paired_unsafe = PAIRED.get() && loops.iter().any(|rl| !paired_safe(x.p, rl));
-        if widened_outer || paired_unsafe {
+        let mut inactive = HashMap::new();
+        if (widened && !paired)
+            || paired
+                && loops
+                    .iter()
+                    .any(|r| !paired_safe(x, r, widened, &mut inactive))
+        {
             if !loops.is_empty() && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
                 eprintln!(
                     "Wave64: preserving software traversal and its guest EXEC/AnyHit control flow"
                 );
             }
-            return Self::software(PAIRED.get() && counted);
+            return Self::software(paired && counted);
         }
         // A shared guest metadata path after a software traversal must keep
         // reading the guest BVH. A previous hardware query can still be valid.
-        if loops.iter().any(|rl| !rl.committed_meta_loads.is_empty())
+        let kept_inactive = isolated
+            && !paired
+            && loops.len() == 1
+            && !every_entry_lane_traces(x, &loops[0])
+            && inactive_outputs(x, &loops[0]).is_some_and(|values| {
+                inactive.extend(values);
+                true
+            });
+        let guest_fallback =
+            isolated && loops.len() == 1 && !loops[0].committed_meta_loads.is_empty();
+        if loops.iter().any(|r| {
+            r.outputs
+                .iter()
+                .any(|o| o.output == RayOutput::CompletedWatchdog)
+                && !every_entry_lane_traces(x, r)
+                && !kept_inactive
+        }) {
+            return Self::software(paired && counted);
+        }
+        if loops.iter().any(|r| {
+            !r.completed_timeouts.is_empty()
+                && !(isolated
+                    && loops.len() == 1
+                    && (every_entry_lane_traces(x, r) || kept_inactive))
+        }) {
+            return Self::software(paired && counted);
+        }
+        if guest_fallback && !isolated_metadata_safe(x, &loops[0], kept_inactive) {
+            return Self::software(PAIRED.get() && counted);
+        }
+        if !guest_fallback
+            && loops.iter().any(|rl| !rl.committed_meta_loads.is_empty())
             && x.res.bvh.iter().any(|&((b, _), _)| {
                 !loops
                     .iter()
@@ -78,19 +149,83 @@ impl LiftPlan {
             if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
                 eprintln!("RayQuery declined: guest and hardware traversal may share metadata");
             }
+
             return Self::software(PAIRED.get() && counted);
         }
         let single_wave = matches!(x.native.io, StageIo::Cs(cs)
             if cs.threads.iter().product::<u32>() <= if PAIRED.get() { 64 } else { 32 });
-        let mut plan = Self::new(x.p, loops, single_wave);
+        // Once a whole-wave outer branch has permanently bypassed this
+        // non-reentrant version, its sibling's private traversal is disjoint.
+        if isolated
+            && single_wave
+            && !fast_edges.is_empty()
+            && let [r] = loops.as_slice()
+        {
+            let mut before = HashSet::new();
+            let mut work = vec![r.entry_block];
+            while let Some(b) = work.pop() {
+                if before.insert(b) {
+                    work.extend(&x.p.blocks[b].preds);
+                }
+            }
+            let mut after = HashSet::new();
+            let mut work = vec![r.exit_block];
+            while let Some(b) = work.pop() {
+                if after.insert(b) {
+                    work.extend(x.p.blocks[b].exit.successors());
+                }
+            }
+            for &b in &before {
+                if after.contains(&b)
+                    || r.skipped_blocks.contains(&b)
+                    || matches!(&r.kind, RayLoopKind::AnyHit(ah) if ah.body_blocks.contains(&b))
+                    || b == r.entry_block
+                    || fast_edges.iter().any(|(p, _)| *p == b)
+                {
+                    continue;
+                }
+                let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = x.st.exits[b]
+                else {
+                    continue;
+                };
+                if before.contains(&taken) != before.contains(&not_taken)
+                    && x.st.bools.uniform_on(when, x.st.reach[b])
+                {
+                    fast_edges.push((
+                        b,
+                        if before.contains(&taken) {
+                            taken
+                        } else {
+                            not_taken
+                        },
+                    ));
+                }
+            }
+        }
+        let mut plan = Self::new(x.p, loops, single_wave, &fast_edges);
         plan.counted_pair = PAIRED.get() && counted;
+        plan.guest_metadata_fallback = guest_fallback;
+        plan.inactive = inactive;
         plan
     }
 
-    fn new(p: &Program, loops: Vec<RayLoop>, single_wave: bool) -> Self {
+    fn new(
+        p: &Program,
+        loops: Vec<RayLoop>,
+        single_wave: bool,
+        fast_edges: &[(usize, usize)],
+    ) -> Self {
         let mut plan = Self::default();
         for (idx, rl) in loops.iter().enumerate() {
             plan.entries.insert(rl.entry_block, idx);
+            plan.dead_exit_masks
+                .extend(rl.dead_exit_masks.iter().map(|&phi| (rl.exit_pred, phi)));
+            plan.timeouts
+                .extend(rl.completed_timeouts.iter().map(|&s| (s, rl.rq_group)));
             plan.skipped.extend(&rl.skipped_blocks);
             for &(site, kind) in &rl.committed_meta_loads {
                 plan.meta.insert(
@@ -118,7 +253,7 @@ impl LiftPlan {
                 }
             }
         }
-        match dead_bvh_lds_writes(p, &plan.entries, &plan.skipped, single_wave) {
+        match dead_bvh_lds_writes(p, &plan.entries, &plan.skipped, single_wave, fast_edges) {
             Ok(Some(dead)) => {
                 plan.dead_lds = true;
                 plan.skip_insts.extend(dead);
@@ -135,75 +270,343 @@ impl LiftPlan {
         plan
     }
 
+    pub(super) fn report_emitted(&self, dxil: &[u8]) {
+        if self.loops.is_empty() || std::env::var_os("VICTORY_WAVE_WHY").is_none() {
+            return;
+        }
+        let mut kinds = [0; 3];
+        for region in &self.loops {
+            kinds[match region.kind {
+                RayLoopKind::OpaqueOnly => 0,
+                RayLoopKind::FrontBackTrack { .. } => 1,
+                RayLoopKind::AnyHit(_) => 2,
+            }] += 1;
+        }
+        eprintln!(
+            "RayQuery emitted opaque/front-back/AnyHit={kinds:?} dxil={}",
+            blake3::hash(dxil)
+        );
+    }
+
     pub(super) fn removed(&self, b: usize) -> bool {
         self.entries.contains_key(&b) || self.skipped.contains(&b)
     }
 }
 
-fn paired_safe(p: &Program, region: &RayLoop) -> bool {
+/// Prove that a lane missing at entry cannot acquire guest EXEC anywhere
+/// inside this traversal. Such a lane retains its own incoming VGPR words;
+/// the query-valid bit selects the guest metadata path after reconvergence.
+fn inactive_outputs(x: &Parts, r: &RayLoop) -> Option<Vec<(Value, Value)>> {
+    if (r.template == lift::RayTemplate::Bvh32SharedTlas && r.shared_entry.is_none())
+        || x.p.wave64
+        || r.active_ray_mask.is_some()
+        || !x.st.wide.is_empty()
+    {
+        return None;
+    }
+    let p = x.p;
+    let entry = entry_value(p, r, Reg::S(EXEC))?;
+    let incoming = entry_exec(p, x.st, r)?;
+    let mut blocks = r.skipped_blocks.clone();
+    blocks.push(r.entry_block);
+    if let RayLoopKind::AnyHit(ah) = &r.kind {
+        blocks.extend(&ah.body_blocks);
+    }
+    let mut regs = HashMap::new();
+    let mut defs = HashMap::new();
+    let mut phis = HashMap::new();
+    let mut execs = Vec::new();
+    let mut lane_writes = HashSet::new();
+    for &b in &blocks {
+        for phi in &p.blocks[b].phis {
+            regs.insert(phi.value, phi.reg);
+            phis.insert(phi.value, phi.args.as_slice());
+        }
+        for i in &p.blocks[b].insts {
+            if let Some(v) = i.write(Reg::S(EXEC)) {
+                execs.push(v);
+            }
+            if i.name() == "v_writelane_b32" {
+                lane_writes.insert(i.writes.first()?.0);
+            }
+            for &(reg, v) in &i.writes {
+                regs.insert(v, reg);
+                defs.insert(v, i);
+            }
+        }
+    }
+    // Greatest fixed point for "subset of entry EXEC". Cyclic PHIs also
+    // require all external seeds to satisfy the invariant on iteration zero.
+    let mut proven: HashSet<_> = regs
+        .keys()
+        .copied()
+        .filter(|v| matches!(regs[v], Reg::S(_)))
+        .collect();
+    loop {
+        let valid = |v: Value| {
+            v == entry
+                || proven.contains(&v)
+                || !regs.contains_key(&v)
+                    && x.st
+                        .masks
+                        .get(&v)
+                        .is_some_and(|&m| !x.st.bools.meet(&[(m, true), (incoming, false)]))
+        };
+        let remove: Vec<_> = proven
+            .iter()
+            .copied()
+            .filter(|&v| {
+                if let Some(args) = phis.get(&v) {
+                    return !args.iter().copied().all(valid);
+                }
+                let Some(&i) = defs.get(&v) else {
+                    return true;
+                };
+                let src = |o: &crate::gfx10::Operand| match *o {
+                    crate::gfx10::Operand::Scalar { code, .. } => {
+                        i.read(Reg::S(code)).is_some_and(valid)
+                    }
+                    crate::gfx10::Operand::Const(128) | crate::gfx10::Operand::Literal(0) => true,
+                    _ => false,
+                };
+                let ok = match (&i.fields, i.name()) {
+                    (Fields::Sop { src: ops, .. }, "s_mov_b32" | "s_andn2_b32") => {
+                        ops.first().is_some_and(src)
+                    }
+                    (Fields::Sop { src: ops, .. }, "s_and_b32") => ops.iter().any(src),
+                    (Fields::Sop { .. }, "s_and_saveexec_b32") => {
+                        i.read(Reg::S(EXEC)).is_some_and(valid)
+                    }
+                    (Fields::Valu(_), name) if name.starts_with("v_cmp") => {
+                        i.read(Reg::S(EXEC)).is_some_and(valid)
+                    }
+                    _ => false,
+                };
+                !ok
+            })
+            .collect();
+        if remove.is_empty() {
+            if !execs.iter().all(|v| valid(*v)) {
+                return None;
+            }
+            break;
+        }
+        for v in remove {
+            proven.remove(&v);
+        }
+    }
+    let mut after = HashSet::new();
+    let mut todo = vec![r.exit_block];
+    while let Some(b) = todo.pop() {
+        if after.insert(b) {
+            todo.extend(p.blocks[b].exit.successors());
+        }
+    }
+    let cross_lane_use = |reg: Reg| {
+        after.iter().any(|&b| {
+            p.blocks[b]
+                .insts
+                .iter()
+                .any(|i| lift::reads_across_lanes(i) && i.read(reg).is_some())
+        })
+    };
+    let mut inactive = Vec::new();
+    for out in &r.outputs {
+        let reg = regs.get(&out.value)?;
+        if out.output == RayOutput::Zero && lane_writes.contains(reg) && !cross_lane_use(*reg) {
+            // The live-out proof established constant zero or absence of any
+            // observable post-loop use, including the WRITELANE destination.
+            continue;
+        }
+        if matches!(reg, Reg::V(_)) && !lane_writes.contains(reg) {
+            inactive.push((out.value, entry_value(p, r, *reg)?));
+        } else {
+            // Shared scalar words and WRITELANE results need an independent
+            // value proof. A per-lane snapshot cannot reconstruct those.
+
+            return None;
+        }
+    }
+    Some(inactive)
+}
+
+fn every_entry_lane_traces(x: &Parts, r: &RayLoop) -> bool {
+    // Untouched paths still execute the guest load. A sparse/inactive lane
+    // may retain a guest pointer in a removed region. Only specialize loads
+    // when every guest lane reaching the lifted region traces.
+    let reach = x.st.reach[r.entry_block];
+    let Some(exec) = entry_exec(x.p, x.st, r) else {
+        return false;
+    };
+    let sparse = match r.active_ray_mask {
+        Some(v) => x.st.masks.get(&v).copied(),
+        None => Some(Bool::TRUE),
+    };
+    !PAIRED.get()
+        && !x.st.bools.meet(&[(reach, true), (exec, false)])
+        && sparse.is_some_and(|mask| !x.st.bools.meet(&[(reach, true), (mask, false)]))
+}
+
+fn isolated_metadata_safe(x: &Parts, r: &RayLoop, kept_inactive: bool) -> bool {
+    if !kept_inactive && !every_entry_lane_traces(x, r) {
+        return false;
+    }
+    // An untouched traversal could have produced a new pointer between the
+    // query and a getter. Earlier and bypassed software traversals retain
+    // their real pointers and execute the original load.
+    let mut before = HashSet::new();
+    let mut todo = Vec::new();
+    for &((b, i), _) in &r.committed_meta_loads {
+        if !matches!(x.p.blocks[b].insts[i].fields, Fields::Flat { .. }) {
+            return false;
+        }
+        todo.push(b);
+    }
+    let mut after = HashSet::new();
+    let mut work = vec![r.exit_block];
+    while let Some(b) = work.pop() {
+        if after.insert(b) {
+            work.extend(x.p.blocks[b].exit.successors())
+        }
+    }
+    while let Some(b) = todo.pop() {
+        if after.contains(&b) && before.insert(b) {
+            todo.extend(&x.p.blocks[b].preds)
+        }
+    }
+    !x.res.bvh.iter().any(|&((b, _), _)| before.contains(&b))
+}
+
+fn paired_safe(
+    x: &Parts,
+    region: &RayLoop,
+    widened: bool,
+    inactive: &mut HashMap<Value, Value>,
+) -> bool {
     if matches!(region.kind, RayLoopKind::AnyHit(_)) {
         return false;
     }
-    // A narrowing (or widening) of EXEC *inside* the removed CFG may gate
-    // the first BVH instruction independently of entry EXEC. Preserve this
-    // paired software program until that inner mask has an exact lowering.
-    let mut blocks = std::iter::once(&region.entry_block).chain(&region.skipped_blocks);
-    !blocks.any(|&b| {
-        p.blocks[b].insts.iter().any(|inst| {
-            inst.write(Reg::S(EXEC)).is_some()
-                || inst.write(Reg::S(EXEC + 1)).is_some()
-                || (region.template == lift::RayTemplate::Bvh32SharedTlas
-                    && matches!(inst.name(), "s_and_b32" | "s_and_b64")
-                    && inst
-                        .reads
-                        .iter()
-                        .any(|(reg, _)| matches!(reg, Reg::S(n) if *n == EXEC || *n == EXEC + 1)))
+    let p = x.p;
+    let h = region.entry_block;
+    let first = (region.template == lift::RayTemplate::Bvh64)
+        .then(|| {
+            p.blocks[h]
+                .insts
+                .iter()
+                .position(|i| i.name() == "image_bvh64_intersect_ray")
         })
-    })
+        .flatten();
+    if widened && first.is_none() {
+        return false;
+    }
+    let Some(incoming) = entry_exec(p, x.st, region) else {
+        return false;
+    };
+    let mut save_inactive = widened;
+    let blocks = || std::iter::once(h).chain(region.skipped_blocks.iter().copied());
+    for b in blocks() {
+        for (j, i) in p.blocks[b].insts.iter().enumerate() {
+            if region.template == lift::RayTemplate::Bvh32SharedTlas
+                && matches!(i.name(), "s_and_b32" | "s_and_b64")
+                && i.reads
+                    .iter()
+                    .any(|(r, _)| matches!(r,Reg::S(n) if *n==EXEC||*n==EXEC+1))
+            {
+                return false;
+            }
+            let (lo, hi) = (i.write(Reg::S(EXEC)), i.write(Reg::S(EXEC + 1)));
+            if lo.is_none() && hi.is_none() {
+                continue;
+            }
+            if first.is_none_or(|pos| b == h && j < pos) {
+                return false;
+            }
+            save_inactive = true;
+            // A disabled lane must stay disabled throughout the removed CFG.
+            // CMPX and AND_SAVEEXEC only intersect the current EXEC.
+            if incoming != Bool::TRUE
+                && !i.name().starts_with("v_cmpx_")
+                && i.name() != "s_and_saveexec_b64"
+                && !lo
+                    .zip(hi)
+                    .and_then(|(l, r)| x.st.mask_bits(l, Some(r)))
+                    .is_some_and(|m| !x.st.bools.meet(&[(m, true), (incoming, false)]))
+            {
+                return false;
+            }
+        }
+    }
+    if save_inactive && incoming != Bool::TRUE {
+        // WRITELANE ignores EXEC. Scalar live-outs also need a wave-wide proof.
+        let mut registers = HashMap::new();
+        for b in blocks() {
+            for ph in &p.blocks[b].phis {
+                registers.insert(ph.value, ph.reg);
+            }
+            for i in &p.blocks[b].insts {
+                if i.name() == "v_writelane_b32" {
+                    return false;
+                }
+                registers.extend(i.writes.iter().map(|&(r, v)| (v, r)));
+            }
+        }
+        for out in &region.outputs {
+            let Some(&reg @ Reg::V(_)) = registers.get(&out.value) else {
+                return false;
+            };
+            let Some(old) = entry_value(p, region, reg) else {
+                return false;
+            };
+            inactive.insert(out.value, old);
+        }
+    }
+    true
 }
 
-/// EXEC on the edges entering the guest loop, before its own back-edge masks.
-/// A lane may be disabled even when the preheader takes an unconditional jump.
-fn entry_exec(p: &Program, st: &Structured, rl: &RayLoop) -> Option<Bool> {
+/// Read a register on external edges only, before any loop backedge.
+fn entry_value(p: &Program, rl: &RayLoop, reg: Reg) -> Option<Value> {
     let internal = |b: usize| {
         b == rl.entry_block
             || rl.skipped_blocks.contains(&b)
             || matches!(&rl.kind, RayLoopKind::AnyHit(ah) if ah.body_blocks.contains(&b))
     };
-    let before = |reg: Reg| {
-        let initial = || p.inputs.iter().find(|(r, _)| *r == reg).map(|&(_, v)| v);
-        let mut value = if rl.entry_block == 0 { initial() } else { None };
-        let mut work: Vec<_> = p.blocks[rl.entry_block]
-            .preds
-            .iter()
-            .copied()
-            .filter(|&b| !internal(b))
-            .collect();
-        let mut seen = HashSet::new();
-        while let Some(b) = work.pop() {
-            if !seen.insert(b) {
-                continue;
-            }
-            let bb = &p.blocks[b];
-            let def = bb
-                .insts
-                .iter()
-                .rev()
-                .find_map(|i| i.write(reg))
-                .or_else(|| bb.phis.iter().find(|ph| ph.reg == reg).map(|ph| ph.value));
-            if let Some(v) = def.or_else(|| (b == 0).then(initial).flatten()) {
-                if value.replace(v).is_some_and(|other| other != v) {
-                    return None;
-                }
-            } else {
-                work.extend(&bb.preds);
-            }
+
+    let initial = || p.inputs.iter().find(|(r, _)| *r == reg).map(|&(_, v)| v);
+    let mut value = if rl.entry_block == 0 { initial() } else { None };
+    let mut work: Vec<_> = p.blocks[rl.entry_block]
+        .preds
+        .iter()
+        .copied()
+        .filter(|&b| !internal(b))
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
         }
-        value
-    };
-    let lo = before(Reg::S(EXEC))?;
+        let bb = &p.blocks[b];
+        let def = bb
+            .insts
+            .iter()
+            .rev()
+            .find_map(|i| i.write(reg))
+            .or_else(|| bb.phis.iter().find(|ph| ph.reg == reg).map(|ph| ph.value));
+        if let Some(v) = def.or_else(|| (b == 0).then(initial).flatten()) {
+            if value.replace(v).is_some_and(|other| other != v) {
+                return None;
+            }
+        } else {
+            work.extend(&bb.preds);
+        }
+    }
+    value
+}
+
+/// EXEC on the edges entering the guest loop, before its own back-edge masks.
+fn entry_exec(p: &Program, st: &Structured, rl: &RayLoop) -> Option<Bool> {
+    let lo = entry_value(p, rl, Reg::S(EXEC))?;
     let hi = if p.wave64 {
-        Some(before(Reg::S(EXEC + 1))?)
+        Some(entry_value(p, rl, Reg::S(EXEC + 1))?)
     } else {
         None
     };
@@ -248,6 +651,7 @@ fn dead_bvh_lds_writes(
     ray_entries: &HashMap<usize, usize>,
     ray_skipped: &HashSet<usize>,
     single_wave: bool,
+    fast_edges: &[(usize, usize)],
 ) -> Result<Option<HashSet<Site>>, &'static str> {
     if ray_entries.is_empty() {
         return Ok(None);
@@ -289,9 +693,9 @@ fn dead_bvh_lds_writes(
         }
     }
     if !writes.is_empty() && !readers.is_empty() {
-        // With one physical wave, a reader necessarily completed before *all*
-        // removed stores if it dominates them and cannot be reached from any
-        // store. Multiple waves may progress independently.
+        // Independently scheduled waves can observe the removed stores in any
+        // order. Within one wave, a reader must finish before the store and
+        // be unreachable from it, including on the next iteration.
         if !single_wave {
             return Err("shared LDS across waves");
         }
@@ -308,15 +712,83 @@ fn dead_bvh_lds_writes(
                 work.extend(p.blocks[b].exit.successors());
             }
         }
-        for (&reader, &op) in &readers {
-            if later.contains(&reader)
-                || writes.iter().any(|&b| {
-                    let mut at = b;
-                    while at != reader && at != 0 {
-                        at = dom[at];
+        // A single wave takes the scalar root/work decision together. Check
+        // the original memory ordering on that fast path; the slow path alone
+        // executes its guest copy. A reentrant dispatch cannot use this fact.
+        let mut possible = HashSet::new();
+        let successors = |b: usize| {
+            fast_edges
+                .iter()
+                .find(|(guard, _)| *guard == b)
+                .map_or_else(|| p.blocks[b].exit.successors(), |&(_, next)| vec![next])
+        };
+        if !fast_edges.is_empty() {
+            if ray_entries.len() != 1 {
+                return Err("multiple shared LDS versions");
+            }
+            let guards: HashSet<_> = fast_edges.iter().map(|&(b, _)| b).collect();
+            let mut slow_seen = HashSet::new();
+            let mut slow_work: Vec<_> = fast_edges
+                .iter()
+                .filter_map(|&(b, chosen)| match p.blocks[b].exit {
+                    Exit::Branch { taken, not_taken } => {
+                        Some(if taken == chosen { not_taken } else { taken })
                     }
-                    at != reader
+                    _ => None,
                 })
+                .collect();
+            while let Some(b) = slow_work.pop() {
+                if slow_seen.insert(b) {
+                    slow_work.extend(p.blocks[b].exit.successors());
+                }
+            }
+            if !guards.is_disjoint(&later) || !guards.is_disjoint(&slow_seen) {
+                return Err("reentrant shared LDS version");
+            }
+            let mut work = vec![0];
+            while let Some(b) = work.pop() {
+                if possible.insert(b) {
+                    work.extend(successors(b));
+                }
+            }
+        }
+        for (&reader, &op) in &readers {
+            if !fast_edges.is_empty() && !possible.contains(&reader) {
+                continue;
+            }
+
+            if later.contains(&reader)
+                || !PAIRED.get()
+                    && writes.iter().any(|&b| {
+                        let mut joins = HashSet::new();
+                        let mut at = b;
+                        loop {
+                            joins.insert(at);
+                            if at == 0 {
+                                break;
+                            }
+                            if dom[at] == usize::MAX || dom[at] == at {
+                                return true;
+                            }
+                            at = dom[at];
+                        }
+                        // An optional earlier reader can rejoin the wave before a
+                        // later traversal. Every continuation of this reader must
+                        // pass a dominator of the store (including the reader itself).
+                        let mut seen = HashSet::new();
+                        let mut work = vec![reader];
+                        while let Some(at) = work.pop() {
+                            if joins.contains(&at) || !seen.insert(at) {
+                                continue;
+                            }
+                            let succ = successors(at);
+                            if succ.is_empty() {
+                                return true;
+                            }
+                            work.extend(succ);
+                        }
+                        false
+                    })
             {
                 return Err(op);
             }
@@ -469,7 +941,17 @@ impl Lower<'_> {
                 }
             }
         }
+        let mut inactive = HashMap::new();
+        for out in &rl.outputs {
+            if let Some(&old) = self.lift.inactive.get(&out.value) {
+                inactive.insert(
+                    out.value,
+                    self.i32_of(old).map_err(|w| unsupported(offset, w))?,
+                );
+            }
+        }
         let inputs = ResolvedRayInputs {
+            inactive,
             rq: q.rq,
             rq_opaque: q.opaque,
             tlas,
@@ -571,7 +1053,16 @@ impl Lower<'_> {
         }
         Ok(())
     }
-    fn query_valid(&mut self, block: usize, rq: RayQuery) -> V {
+    pub(super) fn completed_timeout(&mut self, site: Site, guest: V) -> V {
+        let Some(&group) = self.lift.timeouts.get(&site) else {
+            return guest;
+        };
+        let rq = self.rays.groups[group][usize::from(self.upper)].rq;
+        let traced = self.query_flag(self.cur, rq);
+        let no = self.s.m.bool(false);
+        self.s.m.select(self.cur, traced, no, guest)
+    }
+    fn query_flag(&mut self, block: usize, rq: RayQuery) -> V {
         if block == 0 {
             return self.s.m.bool(false);
         }
@@ -590,7 +1081,7 @@ impl Lower<'_> {
         while let Some((b, rq, phi)) = self.rays.valid_phis.pop() {
             let incoming = preds[b]
                 .iter()
-                .map(|&p| (self.query_valid(p, rq), p))
+                .map(|&p| (self.query_flag(p, rq), p))
                 .collect();
             self.s.m.set_phi(phi, incoming);
         }
@@ -602,6 +1093,48 @@ impl Lower<'_> {
         i: usize,
         meta: RayMetaLoad,
     ) -> Result<(), Stop> {
+        if meta.candidate || !self.lift.guest_metadata_fallback {
+            return self.native_metadata(b, i, meta);
+        }
+        let inst = &self.x.p.blocks[b].insts[i];
+        let q = self.rays.groups[meta.loop_idx][usize::from(self.upper)];
+        let traced = self.query_flag(self.cur, q.rq);
+        let (guest, native, done) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s
+            .m
+            .terminate(self.cur, Term::CondBr(traced, native, guest));
+        self.cur = guest;
+        self.flat(inst, b, i)
+            .map_err(|w| unsupported(inst.machine.offset, w))?;
+        let words = |l: &mut Self| {
+            inst.writes
+                .iter()
+                .map(|&(_, v)| l.i32_of(v).map_err(|w| unsupported(inst.machine.offset, w)))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let guest_words = words(self)?;
+        let from_guest = self.cur;
+        self.s.m.terminate(from_guest, Term::Br(done));
+        self.cur = native;
+        self.native_metadata(b, i, meta)?;
+        let native_words = words(self)?;
+        let from_native = self.cur;
+        self.s.m.terminate(from_native, Term::Br(done));
+        self.cur = done;
+        for ((&(_, v), g), n) in inst.writes.iter().zip(guest_words).zip(native_words) {
+            let phi = self.s.m.phi(done, self.s.t.i32);
+            self.s
+                .m
+                .set_phi(phi, vec![(g, from_guest), (n, from_native)]);
+            self.vals.insert(v, Val::I32(phi));
+        }
+        Ok(())
+    }
+    fn native_metadata(&mut self, b: usize, i: usize, meta: RayMetaLoad) -> Result<(), Stop> {
         let inst = &self.x.p.blocks[b].insts[i];
         let guard = self
             .memory_guard(b, i)
@@ -632,7 +1165,7 @@ impl Lower<'_> {
             let can_read = if meta.candidate {
                 guard
             } else {
-                let valid = self.query_valid(self.cur, q.rq);
+                let valid = self.query_flag(self.cur, q.rq);
                 Some(if let Some(g) = guard {
                     self.s.m.bin(self.cur, Bin::And, valid, g)
                 } else {
@@ -712,23 +1245,23 @@ mod tests {
         let entries = HashMap::from([(1, 0)]);
         let skipped = HashSet::new();
         assert_eq!(
-            dead_bvh_lds_writes(&make(&words), &entries, &skipped, false),
+            dead_bvh_lds_writes(&make(&words), &entries, &skipped, false, &[]),
             Ok(Some(HashSet::from([(0, 0)])))
         );
         words.splice(2..2, [0xd8d8_0000, 0x0200_0000]); // add a read outside the lifted region
         assert_eq!(
-            dead_bvh_lds_writes(&make(&words), &entries, &skipped, false),
+            dead_bvh_lds_writes(&make(&words), &entries, &skipped, false, &[]),
             Ok(None)
         );
         // The same externally visible read also observes a traversal store:
         // software must execute the region, even if the value is read by another lane.
         words.splice(5..5, [0xd834_0000, 0x100]);
         assert_eq!(
-            dead_bvh_lds_writes(&make(&words), &entries, &skipped, false),
+            dead_bvh_lds_writes(&make(&words), &entries, &skipped, false, &[]),
             Err("shared LDS across waves")
         );
         assert_eq!(
-            dead_bvh_lds_writes(&make(&words), &entries, &skipped, true),
+            dead_bvh_lds_writes(&make(&words), &entries, &skipped, true, &[]),
             Ok(None)
         );
         // A read after the store remains observable even in one physical wave.
@@ -737,7 +1270,7 @@ mod tests {
             [0xbf82_0000, 0xd8d8_0000, 0x0200_0000],
         );
         assert_eq!(
-            dead_bvh_lds_writes(&make(&words), &entries, &skipped, true),
+            dead_bvh_lds_writes(&make(&words), &entries, &skipped, true, &[]),
             Err("ds_read_b32")
         );
     }
